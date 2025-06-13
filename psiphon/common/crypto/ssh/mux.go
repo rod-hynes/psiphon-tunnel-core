@@ -5,12 +5,16 @@
 package ssh
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 )
 
 // debugMux, if set, causes messages in the connection protocol to be
@@ -104,6 +108,45 @@ type mux struct {
 var globalOff uint32
 
 func (m *mux) Wait() error {
+
+	// [Psiphon]
+	//
+	// goroutine profile dumps from hanging shutdowns show that the mux.loop
+	// termination can be blocked either in onePacket or in the channel close
+	// loop, in both cases while due to channel writes blocked in
+	// handshakeTransport.writePacket, at handshakeTransport.writeCond.Wait,
+	// awaiting the completion of a new KEX -- which may be required once
+	// writeBytesLeft has been exhausted. At this point, when closing the ssh
+	// client, the underlying network connection has been closed and the KEX
+	// will never complete.
+	//
+	// As a workaround for scenarios where handshakeTransport.kexLoop may
+	// never call writeCond.Broadcast and unblock the channel writes, call
+	// Broadcast here. It's called repeatedly, until all channels have
+	// closed, since channels may enter the write-blocked state at any time
+	// concurrent with the mux.Close call.
+	//
+	// It's expected that the unblocked channel writes will go on to fail,
+	// assuming the underlying network connection is indeed closed; otherwise
+	// there's a chance that blocked channel writes will proceed under the
+	// previous KEX.
+	//
+	// Possibly related upstream x/crypto/ssh change:
+	// https://github.com/golang/crypto/commit/7292932d45d55c7199324ab0027cc86e8198aa22.
+	//
+	broadcastCtx, stopBroadcast := context.WithCancel(context.Background())
+	defer stopBroadcast()
+	go func() {
+		h, ok := m.conn.(*handshakeTransport)
+		if !ok {
+			return
+		}
+		for broadcastCtx.Err() == nil {
+			h.writeCond.Broadcast()
+			common.SleepWithContext(broadcastCtx, 10*time.Millisecond)
+		}
+	}()
+
 	m.errCond.L.Lock()
 	defer m.errCond.L.Unlock()
 	for m.err == nil {
@@ -188,29 +231,6 @@ func (m *mux) loop() {
 	var err error
 	for err == nil {
 		err = m.onePacket()
-	}
-
-	// [Psiphon]
-	//
-	// goroutine profile dumps from hanging shutdowns show that the mux.loop
-	// termination can be blocked in the channel.close loop below, while
-	// other goroutines calling channel write are blocked in
-	// handshakeTransport.writePacket, at handshakeTransport.writeCond.Wait,
-	// awaiting the completion of a new KEX -- which may be required once
-	// writeBytesLeft has been exhausted. At this point, when closing the ssh
-	// client, the underlying network connection has been closed and the KEX
-	// will never complete. As a workaround for scenarios where
-	// handshakeTransport.kexLoop may never call writeCond.Broadcast and
-	// unblock the channel writes, call Broadcast here. It's expected that
-	// the unblocked channel writes will go on to fail, assuming the
-	// underlying network connection is indeed closed; otherwise there's a
-	// chance that blocked channel writes will proceed under the previous KEX.
-	//
-	// Possibly related upstream x/crypto/ssh change:
-	// https://github.com/golang/crypto/commit/7292932d45d55c7199324ab0027cc86e8198aa22.
-
-	if h, ok := m.conn.(*handshakeTransport); ok {
-		h.writeCond.Broadcast()
 	}
 
 	for _, ch := range m.chanList.dropAll() {
