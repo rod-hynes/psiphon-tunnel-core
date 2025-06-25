@@ -133,6 +133,11 @@ type handshakeTransport struct {
 	// strictMode indicates if the other side of the handshake indicated
 	// that we should be following the strict KEX protocol restrictions.
 	strictMode bool
+
+	// [Psiphon]
+	// Unblocks readLoop blocked on sending to incoming channel.
+	doSignalCloseReadLoop sync.Once
+	signalCloseReadLoop   chan struct{}
 }
 
 type pendingKex struct {
@@ -149,6 +154,9 @@ func newHandshakeTransport(conn keyingTransport, config *Config, clientVersion, 
 		requestKex:    make(chan struct{}, 1),
 		startKex:      make(chan *pendingKex),
 		kexLoopDone:   make(chan struct{}),
+
+		// [Psiphon]
+		signalCloseReadLoop: make(chan struct{}),
 
 		config: config,
 	}
@@ -249,7 +257,21 @@ func (t *handshakeTransport) readLoop() {
 		if !(t.sessionID == nil && t.strictMode) && (p[0] == msgIgnore || p[0] == msgDebug) {
 			continue
 		}
-		t.incoming <- p
+
+		// [Psiphon]
+		// Add a closed signal case to interrupt readLoop when blocked on
+		// sending to incoming.
+		closed := false
+		select {
+		case t.incoming <- p:
+		case <-t.signalCloseReadLoop:
+			closed = true
+		}
+		if closed {
+			t.readError = io.EOF
+			close(t.incoming)
+			break
+		}
 	}
 
 	// Stop writers too.
@@ -1023,6 +1045,18 @@ func (t *handshakeTransport) Close() error {
 	// Close the connection. This should cause the readLoop goroutine to wake up
 	// and close t.startKex, which will shut down kexLoop if running.
 	err := t.conn.Close()
+
+	// [Psiphon]
+	// Interrupt readLoop if blocked on sending to t.incoming.
+	t.doSignalCloseReadLoop.Do(func() { close(t.signalCloseReadLoop) })
+
+	// [Psiphon]
+	// Interrupt writePacket if blocked on t.writeCond.Wait awaiting a KEX.
+	// Call recordWriteError to ensure t.writeError is set, if not already;
+	// and unconditionally Broadcast as well, in case the condition in
+	// recordWriteError skips that.
+	t.recordWriteError(io.EOF)
+	t.writeCond.Broadcast()
 
 	// Wait for the kexLoop goroutine to complete.
 	// At that point we know that the readLoop goroutine is complete too,
