@@ -695,6 +695,9 @@ func init() {
 		{74, "tls_ossh_sni_server_name", nil},
 		{75, "tls_ossh_transformed_host_name", intConverter},
 
+		{169, "replay_ignored_change", intConverter},
+		{170, "dsl_prioritized", intConverter},
+
 		// Specs: server.inproxyDialParams
 
 		{76, "inproxy_connection_id", unpaddedBase64Converter},
@@ -838,7 +841,7 @@ func init() {
 
 		{168, "psiphon_api_response_version", intConverter},
 
-		// Next key value = 169
+		// Next key value = 171
 	}
 
 	for _, spec := range packedAPIParameterSpecs {

@@ -97,7 +97,6 @@ message ServerTunnel {
     optional int64 total_port_forward_count_udp = 169;
     optional int64 total_udpgw_channel_count = 170;
 
-    // Post-handshake random stream fields
     optional int64 random_stream_count = 171;
     optional int64 random_stream_upstream_bytes = 172;
     optional int64 random_stream_received_upstream_bytes = 173;
@@ -112,13 +111,11 @@ message ServerTunnel {
     optional int64 dest_bytes_up_udp = 180;
     optional int64 dest_bytes_down_udp = 181;
 
-    // Additional transport and server entry fields
     optional string relayed_steering_ip = 182;
     optional int64 request_check_server_entry_tags = 183;
     optional int64 checked_server_entry_tags = 184;
     optional int64 invalid_server_entry_tags = 185;
 
-    // Protocol Overhead
     optional int64 ssh_protocol_bytes = 186;
     optional int64 ssh_protocol_bytes_overhead = 187;
 }

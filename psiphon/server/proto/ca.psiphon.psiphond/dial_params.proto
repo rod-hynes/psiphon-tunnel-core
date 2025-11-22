@@ -102,4 +102,7 @@ message DialParams {
     optional int64 established_tunnels_count = 80;
     optional double network_latency_multiplier = 81;
     optional string seed_transform = 82;
+
+    optional bool replay_ignored_change = 83;
+    optional bool dsl_prioritized = 84;
 }
