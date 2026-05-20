@@ -48,6 +48,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/push"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/regen"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/resolver"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tactics"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
@@ -1865,12 +1866,13 @@ func (controller *Controller) dialLightProxy(
 		p := controller.config.GetParameters().Get()
 		tlsProfile, _, randomizedTLSProfileSeed, err := SelectTLSProfile(false, true, false, "", p)
 		if err != nil {
+			p.Close()
 			return nil, errors.Trace(err)
 		}
-		sni := lightClient.GetRecommendedSNI()
-		if sni == "" ||
-			!p.WeightedCoinFlip(parameters.LightProxyUseRecommendedSNIProbability) {
-			sni = selectHostName(protocol.TUNNEL_PROTOCOL_TLS_OBFUSCATED_SSH, p)
+		sni, err := selectLightProxySNI(lightClient, p)
+		if err != nil {
+			p.Close()
+			return nil, errors.Trace(err)
 		}
 		p.Close()
 
@@ -1906,6 +1908,34 @@ func (controller *Controller) dialLightProxy(
 	controller.lightProxyReplay.Store(replay)
 
 	return conn, nil
+}
+
+func selectLightProxySNI(
+	lightClient *light.Client,
+	p parameters.ParametersAccessor) (string, error) {
+
+	if p.WeightedCoinFlip(parameters.LightProxyCustomHostNameProbability) {
+		regexStrings := p.RegexStrings(parameters.LightProxyCustomHostNameRegexes)
+		if len(regexStrings) > 0 {
+			choice := prng.Intn(len(regexStrings))
+			sni, err := regen.GenerateString(regexStrings[choice])
+			if err != nil {
+				return "", errors.Trace(err)
+			}
+			return sni, nil
+		}
+	}
+
+	regex := lightClient.GetRecommendedSNIRegex()
+	if regex != "" {
+		sni, err := regen.GenerateString(regex)
+		if err != nil {
+			return "", errors.Trace(err)
+		}
+		return sni, nil
+	}
+
+	return lightClient.GetRecommendedSNI(), nil
 }
 
 type lightProxyDialResult struct {
