@@ -381,6 +381,20 @@ func AppResumed() {
 	}
 }
 
+// DropPacketTunnelTraffic toggles packet tunnel mode traffic dropping.
+func DropPacketTunnelTraffic(drop bool) {
+
+	// If no Controller is started, or if PacketTunnelTunFileDescriptor is not
+	// set, this is a no-op.
+
+	controllerMutex.Lock()
+	defer controllerMutex.Unlock()
+
+	if controller != nil {
+		controller.DropPacketTunnelTraffic(drop)
+	}
+}
+
 // SetDynamicConfig overrides the sponsor ID and authorizations fields set in
 // the config passed to Start. SetDynamicConfig has no effect if no Controller
 // is started.
