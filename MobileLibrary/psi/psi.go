@@ -194,6 +194,13 @@ var controllerCtx context.Context
 var stopController context.CancelFunc
 var controllerWaitGroup *sync.WaitGroup
 
+// pendingDropPacketTunnelTraffic latches the most recent
+// DropPacketTunnelTraffic value so that it can be applied to the Controller
+// once it is started, including when DropPacketTunnelTraffic is called before
+// Start. The latched value persists across Stop/Start cycles until changed.
+// Access is guarded by controllerMutex.
+var pendingDropPacketTunnelTraffic bool
+
 func Start(
 	configJson string,
 	embeddedServerEntryList string,
@@ -317,6 +324,11 @@ func Start(
 		return errors.Trace(err)
 	}
 
+	// Apply any packet tunnel traffic dropping state that was set, including
+	// before the Controller was started. This is a no-op unless the
+	// PacketTunnelTunFileDescriptor is set.
+	controller.DropPacketTunnelTraffic(pendingDropPacketTunnelTraffic)
+
 	controllerWaitGroup = new(sync.WaitGroup)
 	controllerWaitGroup.Add(1)
 	go func() {
@@ -382,13 +394,18 @@ func AppResumed() {
 }
 
 // DropPacketTunnelTraffic toggles packet tunnel mode traffic dropping.
+//
+// The value is latched, so DropPacketTunnelTraffic may be called before Start,
+// in which case it is applied to the Controller once it is started. The latched
+// value persists across Stop/Start cycles until changed.
+//
+// If PacketTunnelTunFileDescriptor is not set, this has no effect.
 func DropPacketTunnelTraffic(drop bool) {
-
-	// If no Controller is started, or if PacketTunnelTunFileDescriptor is not
-	// set, this is a no-op.
 
 	controllerMutex.Lock()
 	defer controllerMutex.Unlock()
+
+	pendingDropPacketTunnelTraffic = drop
 
 	if controller != nil {
 		controller.DropPacketTunnelTraffic(drop)
