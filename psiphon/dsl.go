@@ -21,7 +21,6 @@ package psiphon
 
 import (
 	"context"
-	"encoding/base64"
 	"sync/atomic"
 	"time"
 
@@ -446,43 +445,6 @@ func isDSLAccessTokenRegistrationEnabled(config *Config) bool {
 	enabled := !p.Bool(parameters.DSLAccessTokenDisableRegistration)
 	p.Close()
 	return enabled
-}
-
-// GetDSLAccessToken returns the persisted opaque DSL access token as unpadded
-// Base64URL text. An empty string is returned when no token has been
-// registered, or when retrieval fails; retrieval failures are logged to
-// diagnostics. A DSLAccessTokenAvailable notice indicates that a token is
-// available.
-func (controller *Controller) GetDSLAccessToken() string {
-
-	if !isDSLAccessTokenRegistrationEnabled(controller.config) {
-		return ""
-	}
-
-	token, err := getPersistedDSLAccessToken()
-	if err != nil {
-		NoticeWarning("GetDSLAccessToken failed: %v", errors.Trace(err))
-		return ""
-	}
-
-	if len(token) == 0 {
-		return ""
-	}
-
-	return base64.RawURLEncoding.EncodeToString(token)
-}
-
-// announcePersistedDSLAccessToken emits a DSLAccessTokenAvailable notice when
-// a previously registered DSL access token is available to the host application.
-func (controller *Controller) announcePersistedDSLAccessToken() {
-
-	token := controller.GetDSLAccessToken()
-
-	if len(token) == 0 {
-		return
-	}
-
-	NoticeDSLAccessTokenAvailable()
 }
 
 var disableDSLFetches atomic.Bool

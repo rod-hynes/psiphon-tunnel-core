@@ -173,6 +173,8 @@ const (
 	PsiphonAPIPersistentStatsMaxCount                  = "PsiphonAPIPersistentStatsMaxCount"
 	PsiphonAPIConnectedRequestPeriod                   = "PsiphonAPIConnectedRequestPeriod"
 	PsiphonAPIConnectedRequestRetryPeriod              = "PsiphonAPIConnectedRequestRetryPeriod"
+	PsiphonAPIClientEventReportLimit                   = "PsiphonAPIClientEventReportLimit"
+	PsiphonAPIClientEventLengthLimit                   = "PsiphonAPIClientEventLengthLimit"
 	FetchSplitTunnelRoutesTimeout                      = "FetchSplitTunnelRoutesTimeout"
 	SplitTunnelRoutesURLFormat                         = "SplitTunnelRoutesURLFormat"
 	SplitTunnelRoutesSignaturePublicKey                = "SplitTunnelRoutesSignaturePublicKey"
@@ -774,6 +776,11 @@ var defaultParameters = map[string]struct {
 	PsiphonAPIStatusRequestPaddingMaxBytes: {value: 256, minimum: 0},
 
 	PsiphonAPIConnectedRequestRetryPeriod: {value: 5 * time.Second, minimum: 1 * time.Millisecond},
+
+	// Report limit must not exceed the server.CLIENT_EVENTS_MAX_COUNT_PER_TUNNEL.
+	// Length limit must not exceed the server.CLIENT_EVENTS_MAX_LENGTH.
+	PsiphonAPIClientEventReportLimit: {value: 128, minimum: 0},
+	PsiphonAPIClientEventLengthLimit: {value: 64, minimum: 0},
 
 	// FetchSplitTunnelRoutesTimeout, SplitTunnelRoutesURLFormat,
 	// SplitTunnelRoutesSignaturePublicKey and SplitTunnelDNSServer are obsoleted
