@@ -198,6 +198,7 @@ func TestServerEntryExchange(t *testing.T) {
 				nil,
 				canReplay,
 				selectProtocol,
+				nil,
 				serverEntry,
 				nil,
 				nil,

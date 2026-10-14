@@ -228,6 +228,10 @@ func tryDatastoreOpenDB(
 		datastoreDialParametersBucket,
 		datastoreNetworkReplayParametersBucket,
 		datastoreDSLOSLStatesBucket,
+		datastoreCommonLightTunnelProxyEntriesBucket,
+	}
+	for _, bucket := range datastoreCommonLightTunnelProxyEntryIndexBuckets {
+		requiredBuckets = append(requiredBuckets, bucket)
 	}
 
 	// Cleanup obsolete buckets.

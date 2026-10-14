@@ -514,7 +514,7 @@ func (p *Proxy) runProxySupervisor(ctx context.Context) {
 	// released slots.
 	//
 	// Limit transitions are soft: in-flight announcements and ongoing
-	// client connections are not interrupted or rethrottled.
+	// client connections are not interrupted.
 	//
 	// A polling approach is used, since it's simpler than signalling on the
 	// above change cases, and limit transitions are already soft.

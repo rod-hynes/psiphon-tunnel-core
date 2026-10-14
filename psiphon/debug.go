@@ -30,9 +30,9 @@ func GetAllowOverlappingPersonalCompartmentIDs() bool {
 }
 
 // SetAllowOverlappingPersonalCompartmentIDs configures whether to allow
-// overlapping personal compartment IDs in InproxyProxyPersonalCompartmentIDs
-// and InproxyClientPersonalCompartmentIDs. Overlapping IDs are not allowed
-// in order to prevent a client matching its own proxy.
+// overlapping personal compartment IDs in ProxyPersonalCompartmentID and
+// either InproxyClientPersonalCompartmentID or LightProxyEntry. Overlapping IDs
+// are not allowed in order to prevent a client matching its own proxy.
 // SetAllowOverlappingPersonalCompartmentIDs is for end-to-end testing on a
 // single host, and should be used only for testing purposes.
 func SetAllowOverlappingPersonalCompartmentIDs(allow bool) {

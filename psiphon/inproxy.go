@@ -67,8 +67,9 @@ import (
 // broker client, is instantiated when the active network ID changes, using
 // tactics for the new network.
 type InproxyBrokerClientManager struct {
-	config  *Config
-	isProxy bool
+	config                 *Config
+	isProxy                bool
+	proxySessionPrivateKey inproxy.SessionPrivateKey
 
 	tlsCache utls.ClientSessionCache
 
@@ -82,13 +83,20 @@ type InproxyBrokerClientManager struct {
 // NewInproxyBrokerClientManager does not perform any network operations; the
 // managed InproxyBrokerClientInstance is initialized when used for a round
 // trip.
+//
+// When isProxy is true, a nonzero proxySessionPrivateKey overrides
+// config.ProxySessionPrivateKey.
 func NewInproxyBrokerClientManager(
-	config *Config, isProxy bool, tlsCache utls.ClientSessionCache) *InproxyBrokerClientManager {
+	config *Config,
+	isProxy bool,
+	tlsCache utls.ClientSessionCache,
+	proxySessionPrivateKey inproxy.SessionPrivateKey) *InproxyBrokerClientManager {
 
 	b := &InproxyBrokerClientManager{
-		config:   config,
-		isProxy:  isProxy,
-		tlsCache: tlsCache,
+		config:                 config,
+		isProxy:                isProxy,
+		proxySessionPrivateKey: proxySessionPrivateKey,
+		tlsCache:               tlsCache,
 	}
 
 	// b.brokerClientInstance is initialized on demand, when getBrokerClient
@@ -562,8 +570,10 @@ func NewInproxyBrokerClientInstance(
 	// to use a long-lived key pair for proxied traffic attribution.
 
 	var brokerClientPrivateKey inproxy.SessionPrivateKey
-	if isProxy && config.InproxyProxySessionPrivateKey != "" {
-		brokerClientPrivateKey, err = inproxy.SessionPrivateKeyFromString(config.InproxyProxySessionPrivateKey)
+	if isProxy && !brokerClientManager.proxySessionPrivateKey.IsZero() {
+		brokerClientPrivateKey = brokerClientManager.proxySessionPrivateKey
+	} else if isProxy && config.ProxySessionPrivateKey != "" {
+		brokerClientPrivateKey, err = inproxy.SessionPrivateKeyFromString(config.ProxySessionPrivateKey)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -786,8 +796,8 @@ func prepareInproxyCompartmentIDs(
 	//   compartment ID
 
 	var configPersonalCompartmentIDs []string
-	if isProxy && len(config.InproxyProxyPersonalCompartmentID) > 0 {
-		configPersonalCompartmentIDs = []string{config.InproxyProxyPersonalCompartmentID}
+	if isProxy && len(config.ProxyPersonalCompartmentID) > 0 {
+		configPersonalCompartmentIDs = []string{config.ProxyPersonalCompartmentID}
 	} else if !isProxy && len(config.InproxyClientPersonalCompartmentID) > 0 {
 		configPersonalCompartmentIDs = []string{config.InproxyClientPersonalCompartmentID}
 	}

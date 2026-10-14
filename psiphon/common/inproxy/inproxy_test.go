@@ -759,6 +759,7 @@ func runTestInproxy(doMustUpgrade bool) error {
 					GetQUICMaxPacketSizeAdjustment(),
 					false,
 					false,
+					"",
 					common.WrapClientSessionCache(tls.NewLRUClientSessionCache(0), ""),
 				)
 				if err != nil {
@@ -1382,10 +1383,13 @@ func newQuicEchoServer() (*quicEchoServer, error) {
 		nil,
 		nil,
 		"127.0.0.1:0",
+		nil,
 		true,
 		GetQUICMaxPacketSizeAdjustment(),
 		obfuscationKey,
-		false)
+		nil,
+		false,
+		true)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}

@@ -26,6 +26,7 @@ package psiphon
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	std_errors "errors"
 	"fmt"
@@ -36,6 +37,7 @@ import (
 	"net/url"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,8 +45,10 @@ import (
 
 	tls "github.com/Psiphon-Labs/psiphon-tls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/buildinfo"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/light"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
@@ -127,10 +131,17 @@ type Controller struct {
 	currentNetworkCtx        context.Context
 	currentNetworkCancelFunc context.CancelCauseFunc
 
-	signalLightProxyTestFetch chan struct{}
+	signalLightFallbackProxyTestFetch chan struct{}
 
-	clientEventMutex       sync.Mutex
-	lightProxyClientEvents []string
+	clientEventMutex               sync.Mutex
+	lightFallbackProxyClientEvents []string
+
+	proxyLimits            *common.ProxyLimits
+	proxySessionPrivateKey inproxy.SessionPrivateKey
+
+	lightProxyMutex  sync.Mutex
+	lightProxyCancel context.CancelFunc
+	lightProxyResult chan error
 }
 
 // NewController initializes a new controller.
@@ -138,6 +149,30 @@ func NewController(config *Config) (controller *Controller, err error) {
 
 	if !config.IsCommitted() {
 		return nil, errors.TraceNew("uncommitted config")
+	}
+
+	var proxyLimits *common.ProxyLimits
+	if config.InproxyEnableProxy || config.EnableRunningLightProxy {
+		proxyLimits = config.ProxyLimits
+		if proxyLimits == nil {
+			proxyLimits, err = common.NewProxyLimits(config.getProxyLimitsConfig())
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+		}
+	}
+
+	var proxySessionPrivateKey inproxy.SessionPrivateKey
+	if config.InproxyEnableProxy || config.EnableRunningLightProxy {
+		if config.ProxySessionPrivateKey != "" {
+			proxySessionPrivateKey, err = inproxy.SessionPrivateKeyFromString(
+				config.ProxySessionPrivateKey)
+		} else {
+			proxySessionPrivateKey, err = inproxy.GenerateSessionPrivateKey()
+		}
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
 	}
 
 	// Needed by regen, at least
@@ -209,6 +244,8 @@ func NewController(config *Config) (controller *Controller, err error) {
 
 		tlsClientSessionCache:     utls.NewLRUClientSessionCache(0),
 		quicTLSClientSessionCache: tls.NewLRUClientSessionCache(0),
+		proxyLimits:               proxyLimits,
+		proxySessionPrivateKey:    proxySessionPrivateKey,
 	}
 
 	// Initialize the current network context. This context represents the
@@ -271,14 +308,14 @@ func NewController(config *Config) (controller *Controller, err error) {
 		controller.packetTunnelTransport = packetTunnelTransport
 	}
 
-	// As a failsafe, clear any light proxy state stored by a previous
+	// As a failsafe, clear any fallback light proxy state stored by a previous
 	// Controller sharing this Config.
-	config.ClearLightProxy()
+	config.ClearLightFallbackProxyClient()
 
 	if config.EnableLightProxyFallback {
 
 		if config.LightProxyTestFetchAddress != "" {
-			controller.signalLightProxyTestFetch = make(chan struct{}, 1)
+			controller.signalLightFallbackProxyTestFetch = make(chan struct{}, 1)
 		}
 
 		var err error
@@ -288,19 +325,19 @@ func NewController(config *Config) (controller *Controller, err error) {
 			// Any TTL in the light proxy entry is ignored. When
 			// LightProxyEntry is configured, this entry is always chosen.
 
-			err = initLightProxy(
+			err = initLightFallbackProxyClient(
 				controller,
 				config.LightProxyEntry,
 				config.LightProxyEntryTracker)
 		} else {
 
-			// LoadLightProxy will enforce the light proxy entry TTL, if any,
+			// LoadLightFallbackProxy will enforce the light proxy entry TTL, if any,
 			// and will not return an expired light proxy. After this point,
 			// the TTL is not enforced in the middle of the session.
 
-			lightProxy := LoadLightProxy()
+			lightProxy := LoadLightFallbackProxy()
 			if lightProxy != nil {
-				err = initLightProxy(
+				err = initLightFallbackProxyClient(
 					controller,
 					lightProxy.LightProxyEntry,
 					lightProxy.LightProxyEntryTracker)
@@ -315,14 +352,7 @@ func NewController(config *Config) (controller *Controller, err error) {
 	}
 
 	if config.EnablePersonalLightProxyTunnels {
-
-		err = initLightProxy(
-			controller,
-			config.LightProxyEntry,
-			config.LightProxyEntryTracker)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
+		NoticeLightProxyAvailable()
 	}
 
 	// Initialize shared in-proxy broker clients to be used for all in-proxy
@@ -355,17 +385,23 @@ func NewController(config *Config) (controller *Controller, err error) {
 	var tacticAppliedReceivers []TacticsAppliedReceiver
 
 	isProxy := false
-	controller.inproxyClientBrokerClientManager = NewInproxyBrokerClientManager(config, isProxy, controller.tlsClientSessionCache)
+	controller.inproxyClientBrokerClientManager = NewInproxyBrokerClientManager(
+		config, isProxy, controller.tlsClientSessionCache, inproxy.SessionPrivateKey{})
 	tacticAppliedReceivers = append(tacticAppliedReceivers, controller.inproxyClientBrokerClientManager)
 	controller.inproxyNATStateManager = NewInproxyNATStateManager(config)
 	tacticAppliedReceivers = append(tacticAppliedReceivers, controller.inproxyNATStateManager)
 
 	if config.InproxyEnableProxy {
 		isProxy = true
-		controller.inproxyProxyBrokerClientManager = NewInproxyBrokerClientManager(config, isProxy, controller.tlsClientSessionCache)
+		controller.inproxyProxyBrokerClientManager = NewInproxyBrokerClientManager(
+			config, isProxy, controller.tlsClientSessionCache, controller.proxySessionPrivateKey)
 		tacticAppliedReceivers = append(tacticAppliedReceivers, controller.inproxyProxyBrokerClientManager)
 		controller.inproxyProxyAnnouncementLimits = newInproxyProxyAnnouncementLimits(config)
 		tacticAppliedReceivers = append(tacticAppliedReceivers, controller.inproxyProxyAnnouncementLimits)
+	}
+
+	if config.EnableRunningLightProxy {
+		tacticAppliedReceivers = append(tacticAppliedReceivers, controller)
 	}
 
 	controller.config.SetTacticsAppliedReceivers(tacticAppliedReceivers)
@@ -397,10 +433,17 @@ func (controller *Controller) Run(ctx context.Context) {
 	controller.announcePersistedDSLAccessToken()
 
 	runCtx, stopRunning := context.WithCancel(ctx)
-	defer stopRunning()
+	defer func() {
+		stopRunning()
+		if controller.config.EnableRunningLightProxy {
+			_ = controller.StopLightProxy()
+		}
+	}()
 
+	controller.lightProxyMutex.Lock()
 	controller.runCtx = runCtx
 	controller.stopRunning = stopRunning
+	controller.lightProxyMutex.Unlock()
 
 	// Start components
 
@@ -499,7 +542,7 @@ func (controller *Controller) Run(ctx context.Context) {
 
 		if controller.config.LightProxyTestFetchAddress != "" {
 			controller.runWaitGroup.Add(1)
-			go controller.lightProxyTestFetcher()
+			go controller.lightFallbackProxyTestFetcher()
 		}
 
 		if controller.packetTunnelClient != nil {
@@ -554,6 +597,12 @@ func (controller *Controller) Run(ctx context.Context) {
 	if controller.config.InproxyEnableProxy {
 		controller.runWaitGroup.Add(1)
 		go controller.runInproxyProxy()
+	} else if controller.config.EnableRunningLightProxy &&
+		controller.config.DisableTunnels &&
+		!controller.config.DisableTactics {
+
+		controller.runWaitGroup.Add(1)
+		go controller.runLightProxyTactics()
 	}
 
 	// Wait while running
@@ -585,6 +634,10 @@ func (controller *Controller) Run(ctx context.Context) {
 	}()
 
 	// Shutdown
+
+	if controller.config.EnableRunningLightProxy {
+		_ = controller.StopLightProxy()
+	}
 
 	if controller.packetTunnelClient != nil {
 		controller.packetTunnelClient.Stop()
@@ -630,6 +683,372 @@ func (controller *Controller) DropPacketTunnelTraffic(drop bool) {
 // next tunnel connection.
 func (controller *Controller) SetDynamicConfig(sponsorID string, authorizations []string) {
 	controller.config.SetDynamicConfig(sponsorID, authorizations)
+}
+
+// SetCommonProxyLimits updates common limits for the enabled proxies.
+// Active connections use the new rates and remain open. Calls fail if a
+// reduced schedule is configured or both client limits would be zero.
+func (controller *Controller) SetCommonProxyLimits(
+	maxClients int,
+	upstreamBytesPerSecond int,
+	downstreamBytesPerSecond int) error {
+
+	if controller.proxyLimits == nil {
+		return errors.TraceNew("proxy limits are not enabled")
+	}
+	if controller.config.InproxyEnableProxy &&
+		controller.config.splitInterface != nil && maxClients > 0 {
+
+		return errors.TraceNew(
+			"ProxyMaxCommonClients must be 0 for in-proxy split interface mode")
+	}
+
+	return errors.Trace(controller.proxyLimits.SetCommonLimits(
+		maxClients, upstreamBytesPerSecond, downstreamBytesPerSecond))
+}
+
+// SetPersonalProxyLimits updates personal limits for the enabled proxies.
+// Active connections use the new rates and remain open. Calls fail if a
+// reduced schedule is configured or both client limits would be zero.
+func (controller *Controller) SetPersonalProxyLimits(
+	maxClients int,
+	upstreamBytesPerSecond int,
+	downstreamBytesPerSecond int) error {
+
+	if controller.proxyLimits == nil {
+		return errors.TraceNew("proxy limits are not enabled")
+	}
+
+	return errors.Trace(controller.proxyLimits.SetPersonalLimits(
+		maxClients, upstreamBytesPerSecond, downstreamBytesPerSecond))
+}
+
+// GetLightProxyID returns the Curve25519 ID of the Light proxy hosted by
+// this Controller, for use in its proxy entries. EnableRunningLightProxy is
+// required. The ID is stable for this Controller.
+func (controller *Controller) GetLightProxyID() (string, error) {
+	if !controller.config.EnableRunningLightProxy {
+		return "", errors.TraceNew("running a Light proxy is not enabled")
+	}
+	proxyID, err := light.GetTunnelProxyID(controller.proxySessionPrivateKey)
+	return proxyID, errors.Trace(err)
+}
+
+// StartLightProxy starts the Light proxy and waits for its listeners to bind.
+// Empty listenAddresses uses the config's addresses.
+// EnableRunningLightProxy is required; stop an active proxy before restarting.
+// May be called before Run, but not after Run exits.
+func (controller *Controller) StartLightProxy(
+	listenAddresses []light.ProxyAddress) error {
+
+	if !controller.config.EnableRunningLightProxy {
+		return errors.TraceNew("running a Light proxy is not enabled")
+	}
+
+	// TODO: move notices outside locks or dispatch them asynchronously.
+	controller.lightProxyMutex.Lock()
+	defer controller.lightProxyMutex.Unlock()
+
+	if controller.runCtx != nil && controller.runCtx.Err() != nil {
+		return errors.TraceNew("controller is shutting down")
+	}
+
+	p := controller.config.GetParameters().Get()
+	allowProxy := p.Bool(parameters.LightTunnelAllowProxy)
+	p.Close()
+	if !allowProxy {
+		return errors.TraceNew("Light proxy is not allowed")
+	}
+
+	if controller.lightProxyResult != nil {
+		select {
+		case <-controller.lightProxyResult:
+			for range controller.lightProxyResult {
+			}
+			if controller.lightProxyCancel != nil {
+				controller.lightProxyCancel()
+			}
+			controller.lightProxyCancel = nil
+			controller.lightProxyResult = nil
+		default:
+			return errors.TraceNew("Light proxy is already running")
+		}
+	}
+
+	receiver := newLightProxyEventReceiver(controller.config)
+	proxy, err := controller.newLightProxy(
+		append([]light.ProxyAddress(nil), listenAddresses...), receiver)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go controller.runLightProxy(ctx, proxy, receiver, result)
+
+	select {
+	case <-receiver.started:
+		controller.lightProxyCancel = cancel
+		controller.lightProxyResult = result
+		return nil
+
+	case err := <-result:
+		cancel()
+		for range result {
+		}
+		return errors.Trace(err)
+	}
+}
+
+// StopLightProxy stops the Light proxy and waits for cleanup. It is a no-op
+// when stopped. EnableRunningLightProxy is required.
+func (controller *Controller) StopLightProxy() error {
+	if !controller.config.EnableRunningLightProxy {
+		return errors.TraceNew("running a Light proxy is not enabled")
+	}
+
+	// TODO: move notices outside locks or dispatch them asynchronously.
+	controller.lightProxyMutex.Lock()
+	defer controller.lightProxyMutex.Unlock()
+
+	if controller.lightProxyResult == nil {
+		return nil
+	}
+
+	if controller.lightProxyCancel != nil {
+		controller.lightProxyCancel()
+		controller.lightProxyCancel = nil
+	}
+	for range controller.lightProxyResult {
+	}
+	controller.lightProxyResult = nil
+	return nil
+}
+
+// TacticsApplied implements the TacticsAppliedReceiver interface. It is
+// called when tactics have changed and applies potentially changed parameters.
+func (controller *Controller) TacticsApplied() error {
+	controller.lightProxyMutex.Lock()
+
+	p := controller.config.GetParameters().Get()
+	allowProxy := p.Bool(parameters.LightTunnelAllowProxy)
+	p.Close()
+
+	var cancel context.CancelFunc
+	if !allowProxy {
+		cancel = controller.lightProxyCancel
+		controller.lightProxyCancel = nil
+	}
+	controller.lightProxyMutex.Unlock()
+
+	if cancel != nil {
+		cancel()
+		NoticeInfo("light proxy: not allowed")
+	}
+
+	return nil
+}
+
+func (controller *Controller) runLightProxy(
+	ctx context.Context,
+	proxy *light.Proxy,
+	receiver *lightProxyEventReceiver,
+	result chan<- error) {
+
+	err := proxy.Run(ctx)
+	if err != nil && ctx.Err() == nil {
+		var opErr *net.OpError
+		if std_errors.As(err, &opErr) &&
+			opErr.Op == "listen" && opErr.Addr != nil {
+
+			NoticeLightProxyListenError(
+				opErr.Addr.String(), err.Error())
+		} else {
+			NoticeWarning("light proxy failed: %v", errors.Trace(err))
+		}
+	}
+
+	// Send the result before the stopped notice to avoid an "already running"
+	// error if the app immediately restarts the proxy after receiving the notice.
+	// Close the channel after the final notices so StopLightProxy waits for
+	// their delivery and a restart cannot emit startup notices ahead of them.
+	result <- err
+	receiver.Stopped()
+	close(result)
+}
+
+// runLightProxyTactics fetches and refreshes tactics when the Controller only
+// hosts a Light proxy. Light proxies do not contact a broker, so this worker
+// schedules refreshes when tactics expire.
+func (controller *Controller) runLightProxyTactics() {
+	defer controller.runWaitGroup.Done()
+
+	// TODO: consider having the 2nd hop server deliver tactics to the Light proxy.
+
+	var retryPeriod time.Duration
+
+	for controller.runCtx.Err() == nil {
+		networkCtx := controller.getCurrentNetworkContext()
+		ctx, cancel := context.WithCancel(controller.runCtx)
+		unassociate := context.AfterFunc(networkCtx, cancel)
+
+		// GetTactics waits for network connectivity when a fetch is needed.
+		GetTactics(ctx, controller.config, true)
+
+		unassociate()
+		cancel()
+
+		if controller.runCtx.Err() != nil {
+			return
+		}
+		if networkCtx.Err() != nil {
+			retryPeriod = 0
+			continue
+		}
+
+		record, err := tactics.UseStoredTactics(
+			GetTacticsStorer(controller.config),
+			controller.config.GetNetworkID())
+		if err != nil {
+			NoticeWarning("get stored Light proxy tactics failed: %v", errors.Trace(err))
+		}
+
+		var timeout time.Duration
+		if record != nil {
+			retryPeriod = 0
+			timeout = time.Until(record.Expiry)
+		} else {
+			p := controller.config.GetParameters().Get()
+			if retryPeriod == 0 {
+				retryPeriod = p.Duration(parameters.TacticsRetryPeriod)
+			} else {
+				retryPeriod *= 2
+			}
+			retryPeriod = min(
+				retryPeriod, p.Duration(parameters.TacticsRetryPeriodMax))
+			timeout = prng.JitterDuration(
+				retryPeriod,
+				p.Float(parameters.TacticsRetryPeriodJitter))
+			p.Close()
+
+			controller.triggerFetches()
+		}
+
+		timer := time.NewTimer(timeout)
+		select {
+		case <-controller.runCtx.Done():
+			timer.Stop()
+			return
+		case <-networkCtx.Done():
+			retryPeriod = 0
+		case <-timer.C:
+		}
+		timer.Stop()
+	}
+}
+
+func (controller *Controller) newLightProxy(
+	listenAddresses []light.ProxyAddress,
+	eventReceiver light.ProxyEventReceiver) (*light.Proxy, error) {
+
+	config := controller.config
+	if !config.EnableRunningLightProxy {
+		return nil, errors.TraceNew("running a Light proxy is not enabled")
+	}
+
+	dialAuthorizationPublicKey, err :=
+		config.getLightProxyDialAuthorizationPublicKey()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	trustedProxyAuthorization, err :=
+		config.getLightProxyTrustedProxyAuthorization()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	proxyVersion, err := strconv.ParseInt(config.ClientVersion, 10, 64)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	// Match light.NewClient's handling of odd-length build revisions.
+	hexBuildRev := buildinfo.GetBuildInfo().BuildRev
+	if len(hexBuildRev)%2 == 1 {
+		hexBuildRev = hexBuildRev[:len(hexBuildRev)-1]
+	}
+	proxyBuildRev, err := hex.DecodeString(hexBuildRev)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	if len(listenAddresses) == 0 {
+		listenAddresses = config.LightProxyListenAddresses
+	}
+
+	dialConfig := &DialConfig{
+		DeviceBinder:    config.deviceBinder(),
+		IPv6Synthesizer: config.IPv6Synthesizer,
+		ResolveIP: func(_ context.Context, host string) ([]net.IP, error) {
+			// Authorized destinations are IP literals; no resolver is needed.
+			IP := net.ParseIP(host)
+			if IP == nil {
+				return nil, errors.TraceNew("expected tunnel destination IP")
+			}
+			return []net.IP{IP}, nil
+		},
+	}
+
+	// Limitation: timeout, per-IP limit, and report padding changes apply on
+	// the next start.
+	p := config.GetParameters().Get()
+	defer p.Close()
+
+	perIPRateLimitQuantity := p.Int(parameters.LightTunnelProxyPerIPRateLimitQuantity)
+	perIPMaxConcurrent := p.Int(parameters.LightTunnelProxyPerIPMaxConcurrent)
+	reportPaddingMinBytes := p.Int(parameters.LightTunnelProxyReportPaddingMinBytes)
+	reportPaddingMaxBytes := p.Int(parameters.LightTunnelProxyReportPaddingMaxBytes)
+
+	proxy, err := light.NewProxy(
+		&light.ProxyConfig{
+			DialAddresses:                config.LightProxyDialAddresses,
+			ListenAddresses:              listenAddresses,
+			ObfuscationKey:               config.LightProxyObfuscationKey,
+			TLSCertificate:               []byte(config.LightProxyTLSCertificate),
+			TLSPrivateKey:                []byte(config.LightProxyTLSPrivateKey),
+			PassthroughAddress:           config.LightProxyPassthroughAddress,
+			PreHeaderDeadlineMin:         p.Duration(parameters.LightTunnelProxyPreHeaderDeadlineMin).String(),
+			PreHeaderDeadlineMax:         p.Duration(parameters.LightTunnelProxyPreHeaderDeadlineMax).String(),
+			InactivityTimeout:            p.Duration(parameters.LightTunnelProxyRelayInactivityTimeout).String(),
+			UpstreamDialTimeout:          p.Duration(parameters.LightTunnelProxyUpstreamDialTimeout).String(),
+			PerIPRateLimitQuantity:       &perIPRateLimitQuantity,
+			PerIPRateLimitInterval:       p.Duration(parameters.LightTunnelProxyPerIPRateLimitInterval).String(),
+			PerIPMaxConcurrent:           &perIPMaxConcurrent,
+			SplitUpstreamInterfaceName:   config.splitInterfaceUpstreamInterfaceName(),
+			SplitDownstreamInterfaceName: config.splitInterfaceDownstreamInterfaceName(),
+			ProxyLimits:                  controller.proxyLimits,
+			GetCurrentNetworkContext:     controller.getCurrentNetworkContext,
+			EmitActivity:                 true, // Always collect diagnostic totals.
+			AllowBogons:                  config.LightProxyAllowBogons,
+
+			TunnelMode:                       true,
+			TunnelDialAuthorizationPublicKey: dialAuthorizationPublicKey,
+			TunnelProxyPrivateKey:            controller.proxySessionPrivateKey,
+			TunnelTrustedProxyAuthorization:  trustedProxyAuthorization,
+			TunnelProxyReportPaddingMinBytes: &reportPaddingMinBytes,
+			TunnelProxyReportPaddingMaxBytes: &reportPaddingMaxBytes,
+			ProxyPlatform:                    config.ClientPlatform,
+			ProxyVersion:                     proxyVersion,
+			ProxyBuildRev:                    proxyBuildRev,
+			ProxyTLSDialer: makeLightProxyTLSDialer(
+				config, dialConfig, controller.tlsClientSessionCache),
+			ProxyQUICDialer: makeLightProxyQUICDialer(
+				dialConfig, controller.quicTLSClientSessionCache),
+			PersonalCompartmentID: config.ProxyPersonalCompartmentID,
+		},
+		func(string) common.GeoIPData { return common.GeoIPData{} },
+		eventReceiver)
+	return proxy, errors.Trace(err)
 }
 
 // NetworkChanged initiates a reset of all open network connections, including
@@ -823,10 +1242,8 @@ func (controller *Controller) ImportPushPayload(payload []byte) bool {
 		lightProxyEntry := lightProxyEntries[prng.Intn(len(lightProxyEntries))]
 
 		// Push-imported light proxies are persisted for potential future
-		// use as fallbacks. In EnablePersonalLightProxyTunnels mode,
-		// initLightProxy is not called, and the light proxy in use remains
-		// config.LightProxyEntry.
-		ok := StoreLightProxy(&StoredLightProxy{
+		// use as fallbacks. Personal tunnels continue to use config.LightProxyEntry.
+		ok := StoreLightFallbackProxy(&StoredLightProxyEntry{
 			LightProxyEntry:        lightProxyEntry.ProxyEntry,
 			LightProxyEntryTracker: lightProxyEntry.ProxyEntryTracker,
 		})
@@ -839,7 +1256,7 @@ func (controller *Controller) ImportPushPayload(payload []byte) bool {
 				// replay parameters, when the pushed proxy entry is
 				// unchanged from the proxy entry currently in use, so that
 				// a proven-working replay selection isn't discarded.
-				lightProxyErr := initLightProxy(
+				lightProxyErr := initLightFallbackProxyClient(
 					controller,
 					lightProxyEntry.ProxyEntry,
 					lightProxyEntry.ProxyEntryTracker)
@@ -972,13 +1389,13 @@ func (controller *Controller) RecordClientEvent(event string) {
 	if isLightProxy {
 		remaining := limit
 		if tunnel != nil {
-			remaining -= tunnel.lightProxyClientEventReportedCount
+			remaining -= tunnel.lightFallbackProxyClientEventReportedCount
 		}
-		if len(controller.lightProxyClientEvents) >= remaining {
+		if len(controller.lightFallbackProxyClientEvents) >= remaining {
 			dropReason = "report limit reached"
 			return
 		}
-		controller.lightProxyClientEvents = append(controller.lightProxyClientEvents, event)
+		controller.lightFallbackProxyClientEvents = append(controller.lightFallbackProxyClientEvents, event)
 	} else {
 		remaining := limit - tunnel.clientEventReportedCount
 		if len(tunnel.clientEvents) >= remaining {
@@ -1908,39 +2325,39 @@ func (controller *Controller) getTunnelPoolSize() int {
 	return controller.tunnelPoolSize
 }
 
-func (controller *Controller) triggerLightProxyTestFetch() {
+func (controller *Controller) triggerLightFallbackProxyTestFetch() {
 
 	if controller.config.LightProxyTestFetchAddress == "" {
 		return
 	}
-	if controller.config.GetLightProxyClient() == nil {
+	if controller.config.GetLightFallbackProxyClient() == nil {
 		return
 	}
 
 	select {
-	case controller.signalLightProxyTestFetch <- struct{}{}:
+	case controller.signalLightFallbackProxyTestFetch <- struct{}{}:
 	default:
 	}
 }
 
-func (controller *Controller) lightProxyTestFetcher() {
+func (controller *Controller) lightFallbackProxyTestFetcher() {
 	defer controller.runWaitGroup.Done()
 
 	for {
 		select {
-		case <-controller.signalLightProxyTestFetch:
+		case <-controller.signalLightFallbackProxyTestFetch:
 		case <-controller.runCtx.Done():
 			NoticeInfo("exiting light proxy test fetcher")
 			return
 		}
 
-		_ = controller.lightProxyTestFetch()
+		_ = controller.lightFallbackProxyTestFetch()
 	}
 }
 
-func (controller *Controller) lightProxyTestFetch() (retErr error) {
+func (controller *Controller) lightFallbackProxyTestFetch() (retErr error) {
 
-	// Perform a test fetch through the light proxy. triggerLightProxyTestFetch
+	// Perform a test fetch through the light proxy. triggerLightFallbackProxyTestFetch
 	// is called when initially connecting or reconnecting, so there will often
 	// be no tunnel yet when controller.dial is called.
 	//
@@ -1998,7 +2415,7 @@ func (controller *Controller) lightProxyTestFetch() (retErr error) {
 
 	requestCtx, cancel := context.WithTimeout(
 		controller.runCtx,
-		controller.config.GetLightProxyDialTimeout()+requestTimeout)
+		controller.config.GetLightFallbackDialTimeout()+requestTimeout)
 	defer cancel()
 
 	request, err := http.NewRequestWithContext(
@@ -2057,18 +2474,18 @@ func (controller *Controller) dial(
 
 	// TODO: explicitly exclude udpgw port forwards from the light proxy path.
 
-	readInactiveThreshold := controller.config.GetLightProxyTunnelInactiveThreshold()
+	readInactiveThreshold := controller.config.GetLightFallbackTunnelInactiveThreshold()
 
 	tunnel := controller.getNextActiveTunnel(readInactiveThreshold)
 	if tunnel == nil {
 
 		if controller.config.EnableLightProxyFallback {
 
-			lightProxyClient := controller.config.GetLightProxyClient()
+			lightProxyClient := controller.config.GetLightFallbackProxyClient()
 			if lightProxyClient != nil {
 
 				limitDestinationAddresses :=
-					controller.config.GetLightProxyLimitDestinationAddresses()
+					controller.config.GetLightFallbackLimitDestinationAddresses()
 
 				if (limitDestinationAddresses == nil ||
 					limitDestinationAddresses.Len() == 0 ||
@@ -2082,11 +2499,11 @@ func (controller *Controller) dial(
 					// Launch SSH keep alive probes for any connected tunnels
 					// which are read inactive. If a tunnel is still live,
 					// its keep alive response may result in
-					// getNextActiveTunnel winning the race in dialLightProxyRace.
+					// getNextActiveTunnel winning the race in dialLightFallbackProxyRace.
 					controller.signalProbeInactiveTunnels(readInactiveThreshold)
 
 					var lightConn net.Conn
-					lightConn, tunnel, err = dialLightProxyRace(
+					lightConn, tunnel, err = dialLightFallbackProxyRace(
 						controller,
 						lightProxyClient,
 						remoteAddr,
@@ -2100,7 +2517,7 @@ func (controller *Controller) dial(
 					if lightConn != nil {
 						return lightConn, true, nil
 					}
-					// Drop through with tunnel returned from dialLightProxyRace.
+					// Drop through with tunnel returned from dialLightFallbackProxyRace.
 				}
 			}
 		}
@@ -2253,6 +2670,27 @@ func (controller *Controller) triggerFetches() {
 	}
 }
 
+type personalPairingProtocolFamily int
+
+const (
+	personalPairingProtocolNone personalPairingProtocolFamily = iota
+	personalPairingProtocolInproxy
+	personalPairingProtocolLight
+)
+
+func (p personalPairingProtocolFamily) matches(tunnelProtocol string) bool {
+	switch p {
+	case personalPairingProtocolNone:
+		return true
+	case personalPairingProtocolInproxy:
+		return protocol.TunnelProtocolUsesInproxy(tunnelProtocol)
+	case personalPairingProtocolLight:
+		return protocol.TunnelProtocolUsesLight(tunnelProtocol)
+	default:
+		return false
+	}
+}
+
 type protocolSelectionConstraints struct {
 	config                                    *Config
 	initialLimitTunnelProtocols               protocol.TunnelProtocols
@@ -2260,8 +2698,38 @@ type protocolSelectionConstraints struct {
 	limitTunnelProtocols                      protocol.TunnelProtocols
 	limitTunnelDialPortNumbers                protocol.TunnelProtocolPortLists
 	limitQUICVersions                         protocol.QUICVersions
+	lightIngressLimitQUICVersions             protocol.QUICVersions
+	lightEgressLimitQUICVersions              protocol.QUICVersions
 	replayCandidateCount                      int
 	inproxyClientDialRateLimiter              *rate.Limiter
+	nextPersonalPairingProtocolFamily         personalPairingProtocolFamily
+	commonLightTunnelProxyEntryIterator       *CommonLightTunnelProxyEntryIterator
+}
+
+func (p *protocolSelectionConstraints) initializeLightQUICLimits(
+	tactics parameters.ParametersAccessor) {
+
+	// Limitation: probabilistic ingress LimitQUICVersions are currently applied late,
+	// after selecting the tunnel protocol and common proxy entry. A limit allowing
+	// only gQUIC causes the candidate to be skipped, since Light requires IETF QUIC.
+	// Limits allowing only future versions unsupported by Light could do the same.
+	//
+	// TODO: if these skips become a problem, consider sampling the limit once per
+	// dial before protocol and proxy entry selection. Use any advertised QUIC
+	// capabilities to select a proxy supporting an allowed version, and reuse
+	// the limit when choosing a version supported by that proxy.
+	p.lightIngressLimitQUICVersions = nil
+	probability := tactics.Float(parameters.LightTunnelIngressLimitQUICVersionsProbability)
+	if probability < 0 {
+		probability = tactics.Float(parameters.LimitQUICVersionsProbability)
+	}
+	if probability >= 1 {
+		p.lightIngressLimitQUICVersions = tactics.QUICVersions(
+			parameters.LightTunnelIngressLimitQUICVersions,
+			parameters.LimitQUICVersions)
+	}
+	p.lightEgressLimitQUICVersions = tactics.QUICVersions(
+		parameters.LightTunnelEgressLimitQUICVersions)
 }
 
 func (p *protocolSelectionConstraints) hasInitialProtocols() bool {
@@ -2274,13 +2742,8 @@ func (p *protocolSelectionConstraints) isInitialCandidate(
 
 	return serverEntry.SupportsSSHAPIRequests() &&
 		p.hasInitialProtocols() &&
-		len(serverEntry.GetSupportedProtocols(
-			conditionallyEnabledComponents{},
-			p.config.TunnelDialsUseUpstreamProxy(),
-			p.initialLimitTunnelProtocols,
-			p.limitTunnelDialPortNumbers,
-			p.limitQUICVersions,
-			excludeIntensive)) > 0
+		len(p.filterLightProtocols(p.serverSupportedProtocols(
+			p.initialLimitTunnelProtocols, excludeIntensive, serverEntry))) > 0
 }
 
 func (p *protocolSelectionConstraints) isCandidate(
@@ -2288,13 +2751,8 @@ func (p *protocolSelectionConstraints) isCandidate(
 	serverEntry *protocol.ServerEntry) bool {
 
 	return serverEntry.SupportsSSHAPIRequests() &&
-		len(serverEntry.GetSupportedProtocols(
-			conditionallyEnabledComponents{},
-			p.config.TunnelDialsUseUpstreamProxy(),
-			p.limitTunnelProtocols,
-			p.limitTunnelDialPortNumbers,
-			p.limitQUICVersions,
-			excludeIntensive)) > 0
+		len(p.filterLightProtocols(p.serverSupportedProtocols(
+			p.limitTunnelProtocols, excludeIntensive, serverEntry))) > 0
 }
 
 // canReplay indicates whether replayProtocol may be replayed now. When
@@ -2313,9 +2771,17 @@ func (p *protocolSelectionConstraints) canReplay(
 		return false
 	}
 
+	// MakeDialParameters validates common Light replay against the proxy entry
+	// identified by ProxyEntryHash in the saved dial parameters.
+	if protocol.TunnelProtocolUsesLight(replayProtocol) &&
+		p.config.IsPersonalPairingMode() &&
+		!p.supportsLightProtocol(getLightTunnelIngressProtocol(replayProtocol)) {
+
+		return false
+	}
 	return common.Contains(
-		p.supportedProtocols(
-			connectTunnelCount, excludeIntensive, serverEntry),
+		p.serverSupportedProtocols(
+			p.getLimitTunnelProtocols(connectTunnelCount), excludeIntensive, serverEntry),
 		replayProtocol)
 }
 
@@ -2341,12 +2807,10 @@ func (p *protocolSelectionConstraints) canDefer(
 
 	// Check as if the initial limit phase were complete. excludeIntensive is
 	// false since the intensive dials to contend with are in the future.
-	deferredProtocols := p.supportedProtocols(initialLimit, false, serverEntry)
-
 	if replayProtocol != "" {
-		return common.Contains(deferredProtocols, replayProtocol)
+		return p.canReplay(initialLimit, false, false, serverEntry, replayProtocol)
 	}
-	return len(deferredProtocols) > 0
+	return len(p.supportedProtocols(initialLimit, false, serverEntry)) > 0
 }
 
 func (p *protocolSelectionConstraints) getLimitTunnelProtocols(
@@ -2368,34 +2832,169 @@ func (p *protocolSelectionConstraints) supportedProtocols(
 	excludeIntensive bool,
 	serverEntry *protocol.ServerEntry) protocol.TunnelProtocols {
 
-	return serverEntry.GetSupportedProtocols(
+	return p.filterLightProtocols(p.serverSupportedProtocols(
+		p.getLimitTunnelProtocols(connectTunnelCount), excludeIntensive, serverEntry))
+}
+
+func (p *protocolSelectionConstraints) serverSupportedProtocols(
+	limitTunnelProtocols protocol.TunnelProtocols,
+	excludeIntensive bool,
+	serverEntry *protocol.ServerEntry) protocol.TunnelProtocols {
+
+	candidateProtocols := serverEntry.GetSupportedProtocols(
 		conditionallyEnabledComponents{},
 		p.config.TunnelDialsUseUpstreamProxy(),
-		p.getLimitTunnelProtocols(connectTunnelCount),
+		limitTunnelProtocols,
 		p.limitTunnelDialPortNumbers,
 		p.limitQUICVersions,
 		excludeIntensive)
+
+	supportedProtocols := candidateProtocols[:0]
+	for _, tunnelProtocol := range candidateProtocols {
+		// Skip Light tunnel candidates when split tunneling is enabled.
+		//
+		// TODO: allow for trusted proxies and for personal pairing proxies, where the
+		// client trusts the proxy; in the latter case, the server can use the untrusted
+		// original client GeoIP data for split tunnel decisions.
+		if p.config.IsSplitTunnelEnabled() &&
+			protocol.TunnelProtocolUsesLight(tunnelProtocol) {
+
+			continue
+		}
+		if protocol.TunnelProtocolUsesLightQUICIngress(tunnelProtocol) &&
+			len(getLightQUICVersions(nil, p.lightIngressLimitQUICVersions)) == 0 {
+
+			continue
+		}
+		if protocol.TunnelProtocolUsesLightQUICEgress(tunnelProtocol) &&
+			len(getLightQUICVersions(serverEntry, p.lightEgressLimitQUICVersions)) == 0 {
+
+			continue
+		}
+		supportedProtocols = append(supportedProtocols, tunnelProtocol)
+	}
+	return supportedProtocols
+}
+
+func (p *protocolSelectionConstraints) filterLightProtocols(
+	protocols protocol.TunnelProtocols) protocol.TunnelProtocols {
+
+	filtered := protocols[:0]
+	for _, tunnelProtocol := range protocols {
+		if protocol.TunnelProtocolUsesLightTLSIngress(tunnelProtocol) &&
+			!p.supportsLightProtocol(light.LIGHT_PROTOCOL_TLS) {
+
+			continue
+		}
+		if protocol.TunnelProtocolUsesLightQUICIngress(tunnelProtocol) &&
+			!p.supportsLightProtocol(light.LIGHT_PROTOCOL_QUIC) {
+
+			continue
+		}
+		filtered = append(filtered, tunnelProtocol)
+	}
+	return filtered
+}
+
+func (p *protocolSelectionConstraints) supportsLightProtocol(ingressProtocol string) bool {
+
+	// Personal pairing uses only its configured Light proxy, never common entries.
+	if p.config.IsPersonalPairingMode() {
+		if !p.config.EnablePersonalLightProxyTunnels {
+			return false
+		}
+		return common.Contains(p.config.personalLightProxyProtocols, ingressProtocol)
+	}
+
+	// Common tunnel entries are independent of the configured fallback client.
+	if p.commonLightTunnelProxyEntryIterator == nil {
+		return false
+	}
+	return p.commonLightTunnelProxyEntryIterator.HasNext(ingressProtocol)
+}
+
+// selectPersonalPairingProtocolFamily chooses between Light and in-proxy
+// protocols in combined personal pairing mode. It chooses randomly on the first
+// selection if both are available. Each selection prefers the other family
+// next time, but uses the available family when only one is supported.
+func (p *protocolSelectionConstraints) selectPersonalPairingProtocolFamily(
+	connectTunnelCount int,
+	excludeIntensive bool,
+	serverEntry *protocol.ServerEntry) personalPairingProtocolFamily {
+
+	if !p.config.EnablePersonalLightProxyTunnels ||
+		!p.config.IsInproxyClientPersonalPairingMode() {
+		return personalPairingProtocolNone
+	}
+
+	candidateProtocols := p.supportedProtocols(
+		connectTunnelCount, excludeIntensive, serverEntry)
+	hasInproxy := candidateProtocols.HasInproxyTunnelProtocols()
+	hasLight := candidateProtocols.HasLightTunnelProtocols()
+
+	if !hasInproxy && !hasLight {
+		return personalPairingProtocolNone
+	}
+	if !hasLight {
+		p.nextPersonalPairingProtocolFamily = personalPairingProtocolLight
+		return personalPairingProtocolInproxy
+	}
+	if !hasInproxy {
+		p.nextPersonalPairingProtocolFamily = personalPairingProtocolInproxy
+		return personalPairingProtocolLight
+	}
+
+	if p.nextPersonalPairingProtocolFamily == personalPairingProtocolNone {
+		if prng.Intn(2) == 0 {
+			p.nextPersonalPairingProtocolFamily = personalPairingProtocolInproxy
+		} else {
+			p.nextPersonalPairingProtocolFamily = personalPairingProtocolLight
+		}
+	}
+
+	selected := p.nextPersonalPairingProtocolFamily
+	if selected == personalPairingProtocolInproxy {
+		p.nextPersonalPairingProtocolFamily = personalPairingProtocolLight
+	} else {
+		p.nextPersonalPairingProtocolFamily = personalPairingProtocolInproxy
+	}
+	return selected
 }
 
 func (p *protocolSelectionConstraints) selectProtocol(
 	connectTunnelCount int,
 	excludeIntensive bool,
+	selectedPersonalPairingProtocolFamily personalPairingProtocolFamily,
 	preferInproxy bool,
 	prioritizeTunnelProtocol string,
 	serverEntry *protocol.ServerEntry) (string, time.Duration, bool) {
 
-	candidateProtocols := p.supportedProtocols(
-		connectTunnelCount, excludeIntensive, serverEntry)
+	candidateProtocols := p.serverSupportedProtocols(
+		p.getLimitTunnelProtocols(connectTunnelCount), excludeIntensive, serverEntry)
+
+	switch selectedPersonalPairingProtocolFamily {
+	case personalPairingProtocolInproxy:
+		candidateProtocols = candidateProtocols.Intersection(
+			protocol.InproxyTunnelProtocols)
+	case personalPairingProtocolLight:
+		candidateProtocols = candidateProtocols.Intersection(
+			protocol.LightTunnelProtocols)
+	}
 
 	// Prefer selecting an in-proxy tunnel protocol when indicated, but fall
 	// back to other protocols when no in-proxy protocol is supported.
 	// Takes precedence over any DSL prioritize tunnel protocol hint.
 
-	if preferInproxy && candidateProtocols.HasInproxyTunnelProtocols() {
+	if selectedPersonalPairingProtocolFamily == personalPairingProtocolNone &&
+		preferInproxy &&
+		candidateProtocols.HasInproxyTunnelProtocols() {
+
 		NoticeInfo("in-proxy protocol preferred")
-		candidateProtocols = candidateProtocols.PruneNonInproxyTunnelProtocols()
+		candidateProtocols = candidateProtocols.Intersection(
+			protocol.InproxyTunnelProtocols)
 	}
 
+	candidateProtocols = p.filterLightProtocols(candidateProtocols)
 	if len(candidateProtocols) == 0 {
 		return "", 0, false
 	}
@@ -2431,10 +3030,13 @@ func (p *protocolSelectionConstraints) selectProtocol(
 	// application-level rate limiter, which will incur some overhead logging
 	// an event and returning a response.
 	//
-	// In personal pairing mode, or when protocol limits yield only in-proxy
-	// tunnel protocol candidates, no non-in-proxy protocol can be selected,
-	// so delay the dial. In other cases, skip the candidate and pick a
-	// non-in-proxy tunnel protocol.
+	// In personal pairing mode, delay a selected in-proxy dial. When protocol
+	// limits yield only in-proxy candidates, also delay the dial. In other
+	// cases, skip the candidate and pick a non-in-proxy tunnel protocol.
+	//
+	// Limitation: in combined personal pairing mode, a worker waits for a
+	// rate-limited in-proxy dial even when Light is available. It cannot save
+	// the in-proxy candidate for later and try Light in the meantime.
 	//
 	// Also delay, rather than skip, when preferring an in-proxy protocol.
 	// Note that in the prefer case, failure to meet requirements, such as
@@ -2539,7 +3141,7 @@ func (controller *Controller) startEstablishing() {
 
 	active, _ := controller.numTunnels()
 	if active == 0 && controller.config.LightProxyTestFetchAddress != "" {
-		controller.triggerLightProxyTestFetch()
+		controller.triggerLightFallbackProxyTestFetch()
 	}
 
 	// establishStartTime is used to calculate and report the client's tunnel
@@ -2716,33 +3318,47 @@ func (controller *Controller) launchEstablishing() {
 
 		replayCandidateCount: p.Int(parameters.ReplayCandidateCount),
 	}
+	controller.protocolSelectionConstraints.initializeLightQUICLimits(p)
 
-	// Adjust protocol limits for in-proxy personal proxy mode. In this mode,
-	// the client will make connections only through a proxy with the
-	// corresponding personal compartment ID, so non-in-proxy tunnel
+	// Adjust protocol limits for personal pairing mode. The client will make
+	// connections only through an in-proxy proxy with the corresponding personal
+	// compartment ID or through the configured Light proxy, so all other tunnel
 	// protocols are disabled.
 
-	if controller.config.IsInproxyClientPersonalPairingMode() {
+	if controller.config.IsPersonalPairingMode() {
+
+		var personalPairingTunnelProtocols protocol.TunnelProtocols
+		if controller.config.IsInproxyClientPersonalPairingMode() {
+			personalPairingTunnelProtocols = append(
+				personalPairingTunnelProtocols,
+				protocol.InproxyTunnelProtocols...)
+		}
+		if controller.config.EnablePersonalLightProxyTunnels {
+			personalPairingTunnelProtocols = append(
+				personalPairingTunnelProtocols,
+				protocol.LightTunnelProtocols...)
+		}
 
 		if len(controller.protocolSelectionConstraints.initialLimitTunnelProtocols) > 0 {
 			controller.protocolSelectionConstraints.initialLimitTunnelProtocols =
 				controller.protocolSelectionConstraints.
-					initialLimitTunnelProtocols.PruneNonInproxyTunnelProtocols()
+					initialLimitTunnelProtocols.Intersection(
+					personalPairingTunnelProtocols)
 		}
 
 		if len(controller.protocolSelectionConstraints.limitTunnelProtocols) > 0 {
 			controller.protocolSelectionConstraints.limitTunnelProtocols =
 				controller.protocolSelectionConstraints.
-					limitTunnelProtocols.PruneNonInproxyTunnelProtocols()
+					limitTunnelProtocols.Intersection(
+					personalPairingTunnelProtocols)
 		}
 
-		// This covers two cases: if there was no limitTunnelProtocols to
-		// start, then limit to any in-proxy tunnel protocol; or, if there
-		// was a limit but OnlyInproxyTunnelProtocols evaluates to an empty
-		// list, also set the limit to any in-proxy tunnel protocol.
+		// An empty limit would allow protocols outside personal pairing. Use all
+		// enabled personal pairing protocols if no limit was set or filtering
+		// removed every protocol.
 		if len(controller.protocolSelectionConstraints.limitTunnelProtocols) == 0 {
 			controller.protocolSelectionConstraints.limitTunnelProtocols =
-				protocol.InproxyTunnelProtocols
+				personalPairingTunnelProtocols
 		}
 	}
 
@@ -2810,6 +3426,21 @@ func (controller *Controller) launchEstablishing() {
 	disableServerEntriesReporter := p.Bool(parameters.DisableServerEntriesReporter)
 
 	p.Close()
+
+	if !controller.config.IsPersonalPairingMode() {
+		// Candidate scans and workers use the common Light proxy iterator to check
+		// which ingress protocols have available proxy entries. Initialize it first.
+		iterator, err := NewCommonLightTunnelProxyEntryIterator(controller.establishCtx)
+		if err != nil {
+			if controller.isStopEstablishing() {
+				return
+			}
+			NoticeError("failed to iterate over common Light entries: %v", errors.Trace(err))
+			controller.SignalComponentFailure()
+			return
+		}
+		controller.protocolSelectionConstraints.commonLightTunnelProxyEntryIterator = iterator
+	}
 
 	// Trigger CandidateServers and AvailableEgressRegions notices. By default,
 	// this is an asynchronous operation, as the underlying full server entry
@@ -2884,7 +3515,7 @@ func (controller *Controller) getConnectionWorkerPoolSize(
 
 	// ConnectionWorkerPoolSize may be set by tactics.
 	//
-	// Personal pairing modes use distinct parameters which are typically
+	// Personal pairing modes use a shared parameter which is typically
 	// configured to a lower number, limiting concurrent load and
 	// announcement consumption for personal proxies.
 	//
@@ -2892,10 +3523,8 @@ func (controller *Controller) getConnectionWorkerPoolSize(
 	// size which may be set in low memory environments.
 
 	var workerPoolSize int
-	if controller.config.IsInproxyClientPersonalPairingMode() {
-		workerPoolSize = p.Int(parameters.InproxyPersonalPairingConnectionWorkerPoolSize)
-	} else if controller.config.EnablePersonalLightProxyTunnels {
-		workerPoolSize = p.Int(parameters.LightProxyPersonalPairingConnectionWorkerPoolSize)
+	if controller.config.IsPersonalPairingMode() {
+		workerPoolSize = p.Int(parameters.PersonalPairingConnectionWorkerPoolSize)
 	} else {
 		workerPoolSize = p.Int(parameters.ConnectionWorkerPoolSize)
 	}
@@ -3052,6 +3681,9 @@ func (controller *Controller) stopEstablishing() {
 	controller.serverEntryIterator = nil
 	controller.serverAffinityDoneBroadcast = nil
 	controller.establishSignalForceTacticsFetch = nil
+	if controller.protocolSelectionConstraints != nil {
+		controller.protocolSelectionConstraints.commonLightTunnelProxyEntryIterator = nil
+	}
 
 	controller.concurrentEstablishTunnelsMutex.Lock()
 	peakConcurrent := controller.peakConcurrentEstablishTunnels
@@ -3166,7 +3798,8 @@ func (controller *Controller) establishCandidateGenerator() {
 
 	inproxyAwaitBrokerSpecsEmitted := false
 	inproxyAwaitBrokerSpecs :=
-		controller.config.IsInproxyClientPersonalPairingMode() ||
+		(controller.config.IsInproxyClientPersonalPairingMode() &&
+			!controller.config.EnablePersonalLightProxyTunnels) ||
 			(len(controller.protocolSelectionConstraints.limitTunnelProtocols) > 0 &&
 				controller.protocolSelectionConstraints.limitTunnelProtocols.
 					IsOnlyInproxyTunnelProtocols() &&
@@ -3446,6 +4079,21 @@ loop:
 		}
 		timer.Stop()
 
+		// Reset the common Light proxy entry iterator when imports or renewals
+		// may have changed the set of available proxy entries.
+		if commonLightIterator := controller.protocolSelectionConstraints.commonLightTunnelProxyEntryIterator; commonLightIterator != nil &&
+			commonLightIterator.imports.Load() != datastoreCommonLightTunnelProxyEntriesImports.Load() {
+
+			if err := commonLightIterator.Reset(controller.establishCtx); err != nil {
+				if controller.isStopEstablishing() {
+					break loop
+				}
+				NoticeError("failed to reset common Light iterator: %v", errors.Trace(err))
+				controller.SignalComponentFailure()
+				return
+			}
+		}
+
 		if resetIterator {
 			err := iterator.Reset(controller.establishCtx)
 			if err != nil {
@@ -3587,6 +4235,7 @@ loop:
 		// selection counters are adjusted.
 		excludeIntensive := false
 		inproxyForceSelection := false
+		selectedPersonalPairingProtocolFamily := personalPairingProtocolNone
 
 		beginProtocolSelection := func() int {
 
@@ -3598,6 +4247,13 @@ loop:
 				excludeIntensive = true
 			}
 
+			selectedPersonalPairingProtocolFamily =
+				controller.protocolSelectionConstraints.
+					selectPersonalPairingProtocolFamily(
+						controller.establishConnectTunnelCount,
+						excludeIntensive,
+						candidateServerEntry.serverEntry)
+
 			// Force in-proxy protocol selection as required, and if the server
 			// entry supports in-proxy protocols. If this candidate happens to be
 			// a replay of an in-proxy protocol, it's still counted as a forced
@@ -3607,10 +4263,13 @@ loop:
 			// TunnelProtocolIsResourceIntensive currently includes
 			// TunnelProtocolUsesInproxy.
 
-			if !excludeIntensive &&
+			if selectedPersonalPairingProtocolFamily ==
+				personalPairingProtocolNone &&
+				!excludeIntensive &&
 				controller.establishInproxyForceSelectionCount > 0 &&
-				controller.protocolSelectionConstraints.supportedProtocols(
-					controller.establishConnectTunnelCount,
+				controller.protocolSelectionConstraints.serverSupportedProtocols(
+					controller.protocolSelectionConstraints.getLimitTunnelProtocols(
+						controller.establishConnectTunnelCount),
 					excludeIntensive,
 					candidateServerEntry.serverEntry).HasInproxyTunnelProtocols() {
 
@@ -3673,6 +4332,10 @@ loop:
 			// deferred and retains that eligibility, so only the protocol
 			// and intensive constraints now in effect are checked. A
 			// deferred candidate is never deferred again; see deferCandidate.
+
+			if !selectedPersonalPairingProtocolFamily.matches(replayProtocol) {
+				return false
+			}
 
 			if !controller.protocolSelectionConstraints.canReplay(
 				controller.establishConnectTunnelCount,
@@ -3738,6 +4401,7 @@ loop:
 				selectedProtocol, rateLimitDelay, ok := controller.protocolSelectionConstraints.selectProtocol(
 					controller.establishConnectTunnelCount,
 					excludeIntensive,
+					selectedPersonalPairingProtocolFamily,
 					true,
 					replayProtocol,
 					serverEntry)
@@ -3781,11 +4445,16 @@ loop:
 			isPrioritized bool,
 			prioritizeTunnelProtocol string) (string, bool) {
 
-			preferInproxy := inproxyForceSelection || prng.FlipWeightedCoin(inproxyPreferProbability)
+			preferInproxy :=
+				selectedPersonalPairingProtocolFamily ==
+					personalPairingProtocolNone &&
+					(inproxyForceSelection ||
+						prng.FlipWeightedCoin(inproxyPreferProbability))
 
 			selectedProtocol, rateLimitDelay, ok := controller.protocolSelectionConstraints.selectProtocol(
 				controller.establishConnectTunnelCount,
 				excludeIntensive,
+				selectedPersonalPairingProtocolFamily,
 				preferInproxy,
 				prioritizeTunnelProtocol,
 				serverEntry)
@@ -3801,6 +4470,20 @@ loop:
 			dialRateLimitDelay = rateLimitDelay
 
 			return selectedProtocol, ok
+		}
+
+		selectCommonLightTunnelProxyEntry := func(
+			ingressProtocol string) ([]byte, *StoredLightProxyEntry, error) {
+
+			iterator := controller.protocolSelectionConstraints.commonLightTunnelProxyEntryIterator
+			if iterator == nil {
+				return nil, nil, nil
+			}
+			// TODO: move common Light entry reads outside concurrentEstablishTunnelsMutex.
+			// Datastore access is read-only; iterator Reset prunes expired entries.
+			proxyEntryHash, entry, err := iterator.Next(
+				controller.establishCtx, ingressProtocol)
+			return proxyEntryHash, entry, errors.Trace(err)
 		}
 
 		// MakeDialParameters may return a replay instance, if the server
@@ -3835,6 +4518,7 @@ loop:
 			beginProtocolSelection,
 			canReplay,
 			selectProtocol,
+			selectCommonLightTunnelProxyEntry,
 			candidateServerEntry.serverEntry,
 			controller.inproxyClientBrokerClientManager,
 			controller.inproxyNATStateManager,
@@ -3952,11 +4636,24 @@ loop:
 		// reclaim as much as possible.
 		DoGarbageCollection()
 
+		// Cancel Light tunnel dials on network change while preserving replay.
+		connectCtx := controller.establishCtx
+		var cancelConnect context.CancelFunc
+		if protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
+			connectCtx, cancelConnect = common.MergeContextCancel(
+				connectCtx, controller.getCurrentNetworkContext())
+		}
+
 		tunnel, err := ConnectTunnel(
-			controller.establishCtx,
+			connectCtx,
 			controller.config,
 			candidateServerEntry.adjustedEstablishStartTime,
 			dialParams)
+
+		connectCanceled := connectCtx.Err() == context.Canceled
+		if cancelConnect != nil {
+			cancelConnect()
+		}
 
 		controller.concurrentEstablishTunnelsMutex.Lock()
 		if isIntensive {
@@ -3992,6 +4689,9 @@ loop:
 			// case the error is noise.
 			if controller.isStopEstablishing() {
 				break loop
+			}
+			if connectCanceled {
+				continue
 			}
 
 			NoticeInfo("failed to connect to %s: %v",
@@ -4038,6 +4738,18 @@ func (controller *Controller) isStopEstablishing() bool {
 
 func (controller *Controller) runInproxyProxy() {
 	defer controller.runWaitGroup.Done()
+
+	// Keep refreshing tactics for the hosted Light proxy if the in-proxy proxy exits.
+	defer func() {
+		if controller.config.EnableRunningLightProxy &&
+			controller.config.DisableTunnels &&
+			!controller.config.DisableTactics &&
+			controller.runCtx.Err() == nil {
+
+			controller.runWaitGroup.Add(1)
+			go controller.runLightProxyTactics()
+		}
+	}()
 
 	// Obtain and apply tactics before connecting to the broker and
 	// announcing proxies.
@@ -4124,9 +4836,11 @@ func (controller *Controller) runInproxyProxy() {
 		if !inproxy.Enabled() {
 			NoticeError("inproxy proxy: inproxy implementation is not enabled")
 		}
-		// Signal failure -- and shutdown -- only if running in proxy-only
-		// mode. If also running a tunnel, keep running without proxies.
-		if controller.config.DisableTunnels {
+		// Shut down only when neither client tunnels nor a hosted Light proxy
+		// are enabled.
+		if controller.config.DisableTunnels &&
+			!controller.config.EnableRunningLightProxy {
+
 			NoticeError("inproxy proxy: aborting")
 			controller.SignalComponentFailure()
 		}
@@ -4212,47 +4926,55 @@ func (controller *Controller) runInproxyProxy() {
 		}
 	}
 
+	proxyCtx, stopProxy := context.WithCancel(controller.runCtx)
+	defer stopProxy()
+
+	waitForNetworkConnectivity := func() bool {
+		return controller.inproxyWaitForNetworkConnectivity(proxyCtx)
+	}
+	handleTacticsPayload := func(
+		networkID string, compressTactics bool, tacticsPayload []byte) bool {
+
+		return controller.inproxyHandleProxyTacticsPayload(
+			stopProxy, networkID, compressTactics, tacticsPayload)
+	}
+
 	config := &inproxy.ProxyConfig{
-		Logger:                               NoticeCommonLogger(debugLogging),
-		EnableWebRTCDebugLogging:             debugLogging,
-		WaitForNetworkConnectivity:           controller.inproxyWaitForNetworkConnectivity,
-		GetCurrentNetworkContext:             controller.getCurrentNetworkContext,
-		GetBrokerClient:                      controller.inproxyGetProxyBrokerClient,
-		GetBaseAPIParameters:                 controller.inproxyGetProxyAPIParameters,
-		MakeWebRTCDialCoordinator:            controller.inproxyMakeProxyWebRTCDialCoordinator,
-		ExcludeInterfaceName:                 controller.config.splitInterfaceUpstreamInterfaceName(),
-		HandleTacticsPayload:                 controller.inproxyHandleProxyTacticsPayload,
-		MaxCommonClients:                     controller.config.InproxyMaxCommonClients,
-		MaxPersonalClients:                   controller.config.InproxyMaxPersonalClients,
-		ProxyLimits:                          controller.config.InproxyProxyLimits,
-		LimitUpstreamBytesPerSecond:          controller.config.InproxyLimitUpstreamBytesPerSecond,
-		LimitDownstreamBytesPerSecond:        controller.config.InproxyLimitDownstreamBytesPerSecond,
-		ReducedStartTime:                     controller.config.InproxyReducedStartTime,
-		ReducedEndTime:                       controller.config.InproxyReducedEndTime,
-		ReducedMaxCommonClients:              controller.config.InproxyReducedMaxCommonClients,
-		ReducedLimitUpstreamBytesPerSecond:   controller.config.InproxyReducedLimitUpstreamBytesPerSecond,
-		ReducedLimitDownstreamBytesPerSecond: controller.config.InproxyReducedLimitDownstreamBytesPerSecond,
-		MustUpgrade:                          controller.config.OnInproxyMustUpgrade,
-		ActivityUpdater:                      activityUpdater,
+		Logger:                     NoticeCommonLogger(debugLogging),
+		EnableWebRTCDebugLogging:   debugLogging,
+		WaitForNetworkConnectivity: waitForNetworkConnectivity,
+		GetCurrentNetworkContext:   controller.getCurrentNetworkContext,
+		GetBrokerClient:            controller.inproxyGetProxyBrokerClient,
+		GetBaseAPIParameters:       controller.inproxyGetProxyAPIParameters,
+		MakeWebRTCDialCoordinator:  controller.inproxyMakeProxyWebRTCDialCoordinator,
+		ExcludeInterfaceName:       controller.config.splitInterfaceUpstreamInterfaceName(),
+		HandleTacticsPayload:       handleTacticsPayload,
+		ProxyLimits:                controller.proxyLimits,
+		MustUpgrade:                controller.config.OnInproxyMustUpgrade,
+		ActivityUpdater:            activityUpdater,
 	}
 
 	proxy, err := inproxy.NewProxy(config)
 	if err != nil {
 		NoticeError("inproxy.NewProxy failed: %v", errors.Trace(err))
-		controller.SignalComponentFailure()
+		if !controller.config.EnableRunningLightProxy {
+			controller.SignalComponentFailure()
+		}
 		return
 	}
 
 	err = controller.inproxyProxyAnnouncementLimits.SetProxy(proxy)
 	if err != nil {
 		NoticeError("inproxy proxy SetProxy failed: %v", errors.Trace(err))
-		controller.SignalComponentFailure()
+		if !controller.config.EnableRunningLightProxy {
+			controller.SignalComponentFailure()
+		}
 		return
 	}
 
 	NoticeInfo("inproxy proxy: running")
 
-	proxy.Run(controller.runCtx)
+	proxy.Run(proxyCtx)
 
 	// Emit one last NoticeInproxyProxyTotalActivity with the final byte counts.
 	NoticeInproxyProxyTotalActivity(
@@ -4376,7 +5098,8 @@ func (controller *Controller) inproxyAwaitProxyBrokerSpecs() bool {
 	}
 }
 
-func (controller *Controller) inproxyWaitForNetworkConnectivity() bool {
+func (controller *Controller) inproxyWaitForNetworkConnectivity(
+	ctx context.Context) bool {
 
 	var isCompatibleNetwork func() bool
 	emittedIncompatibleNetworkNotice := false
@@ -4403,7 +5126,7 @@ func (controller *Controller) inproxyWaitForNetworkConnectivity() bool {
 	}
 
 	return WaitForNetworkConnectivity(
-		controller.runCtx,
+		ctx,
 		controller.config.NetworkConnectivityChecker,
 		isCompatibleNetwork)
 }
@@ -4491,6 +5214,7 @@ func (controller *Controller) inproxyMakeProxyWebRTCDialCoordinator() (
 // inproxyHandleTacticsPayload duplicates some tactics-handling code from
 // doHandshakeRequest.
 func (controller *Controller) inproxyHandleProxyTacticsPayload(
+	stopProxy context.CancelFunc,
 	networkID string, compressTactics bool, tacticsPayload []byte) bool {
 
 	if controller.config.DisableTactics {
@@ -4574,8 +5298,8 @@ func (controller *Controller) inproxyHandleProxyTacticsPayload(
 
 	if appliedNewTactics {
 
-		// Shutdown if running in proxy-only and tactics now indicate the
-		// proxy is not allowed.
+		// In proxy-only mode, stop the in-proxy proxy when tactics disallow it.
+		// Keep the Controller running if a hosted Light proxy is enabled.
 		//
 		// Limitation: does not immediately stop proxy in dual proxy/tunnel mode.
 
@@ -4587,7 +5311,11 @@ func (controller *Controller) inproxyHandleProxyTacticsPayload(
 			NoticeError("inproxy proxy: not allowed")
 			if controller.config.DisableTunnels {
 				NoticeError("inproxy proxy: shutdown")
-				controller.SignalComponentFailure()
+				if controller.config.EnableRunningLightProxy {
+					stopProxy()
+				} else {
+					controller.SignalComponentFailure()
+				}
 			}
 
 		}

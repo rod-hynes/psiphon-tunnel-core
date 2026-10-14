@@ -41,9 +41,9 @@ const (
 	stopPaddingWriteSizeThreshold = paddingMaxTargetSize
 )
 
-// lightConn is layered over the proxy TLS connection and adds a light proxy
-// header; and traffic shape obfuscation with initial payload padding and
-// large write splitting.
+// lightConn wraps a TLS or QUIC connection with traffic shape obfuscation:
+// initial payload padding and large write splitting. When supplied, a light
+// proxy header is prepended to the first write.
 type lightConn struct {
 	net.Conn
 	header *lightHeader
@@ -52,28 +52,39 @@ type lightConn struct {
 	doneReadPadding bool
 	readBuffer      bytes.Buffer
 
-	writeMutex       sync.Mutex
-	doneWriteHeader  bool
-	doneWritePadding bool
-	writeBuffer      bytes.Buffer
+	writeMutex              sync.Mutex
+	doneWriteHeader         bool
+	doneWritePadding        bool
+	stopWritePaddingPending bool
+	writeBuffer             bytes.Buffer
 }
 
-// lightHeader is the header sent from the client to the proxy. With CBOR
-// encoding and parameter packing (hex strings to binary, enum strings to
-// single bytes), the expected header size is under 150 bytes.
+// lightHeader is the header sent from the client to the proxy. CBOR encoding
+// and parameter packing (hex strings to binary, enum strings to single bytes)
+// reduce its size. Personal pairing adds 35 bytes for the compartment ID.
 type lightHeader struct {
-	SponsorID          []byte `cbor:"1,keyasint,omitempty"`
-	ClientPlatform     uint8  `cbor:"2,keyasint,omitempty"`
-	ClientBuildRev     []byte `cbor:"3,keyasint,omitempty"`
-	DeviceRegion       string `cbor:"4,keyasint,omitempty"`
-	SessionID          []byte `cbor:"5,keyasint,omitempty"`
-	ProxyEntryTracker  int64  `cbor:"6,keyasint,omitempty"`
-	NetworkType        uint8  `cbor:"7,keyasint,omitempty"`
-	ConnectionNum      int64  `cbor:"8,keyasint,omitempty"`
-	DestinationAddress string `cbor:"9,keyasint,omitempty"`
-	TLSProfile         uint8  `cbor:"10,keyasint,omitempty"`
-	TCPDuration        int64  `cbor:"11,keyasint,omitempty"`
-	TLSDuration        int64  `cbor:"12,keyasint,omitempty"`
+	SponsorID                         []byte `cbor:"1,keyasint,omitempty"`
+	ClientPlatform                    uint8  `cbor:"2,keyasint,omitempty"`
+	ClientBuildRev                    []byte `cbor:"3,keyasint,omitempty"`
+	DeviceRegion                      string `cbor:"4,keyasint,omitempty"`
+	SessionID                         []byte `cbor:"5,keyasint,omitempty"`
+	ProxyEntryTracker                 int64  `cbor:"6,keyasint,omitempty"`
+	NetworkType                       uint8  `cbor:"7,keyasint,omitempty"`
+	ConnectionNum                     int64  `cbor:"8,keyasint,omitempty"`
+	DestinationAddress                string `cbor:"9,keyasint,omitempty"`
+	TLSProfile                        uint8  `cbor:"10,keyasint,omitempty"`
+	TCPDuration                       int64  `cbor:"11,keyasint,omitempty"`
+	TLSDuration                       int64  `cbor:"12,keyasint,omitempty"`
+	TunnelDialAuthorization           []byte `cbor:"13,keyasint,omitempty"`
+	EgressProtocol                    uint8  `cbor:"14,keyasint,omitempty"`
+	EgressTLSProfile                  uint8  `cbor:"15,keyasint,omitempty"`
+	EgressRandomizedTLSProfileSeed    []byte `cbor:"16,keyasint,omitempty"`
+	EgressQUICVersion                 uint8  `cbor:"17,keyasint,omitempty"`
+	EgressSNI                         string `cbor:"18,keyasint,omitempty"`
+	EgressQUICDialRootObfuscationSeed []byte `cbor:"19,keyasint,omitempty"`
+	QUICVersion                       uint8  `cbor:"20,keyasint,omitempty"`
+	QUICDuration                      int64  `cbor:"21,keyasint,omitempty"`
+	PersonalCompartmentID             []byte `cbor:"22,keyasint,omitempty"`
 }
 
 func newLightHeader(
@@ -86,9 +97,32 @@ func newLightHeader(
 	networkType uint8,
 	connectionNum int64,
 	destinationAddress string,
+	tunnelDialAuthorization []byte,
+	egressProtocol uint8,
+	egressTLSProfile uint8,
+	egressRandomizedTLSProfileSeed []byte,
+	egressQUICVersion uint8,
+	egressQUICDialRootObfuscationSeed []byte,
+	egressSNI string,
 	tlsProfile uint8,
+	quicVersion uint8,
 	tcpDuration int64,
-	tlsDuration int64) (*lightHeader, error) {
+	tlsDuration int64,
+	quicDuration int64,
+	personalCompartmentID []byte) (*lightHeader, error) {
+
+	if len(tunnelDialAuthorization) > 0 {
+		// Omit this client metadata from tunnel headers to avoid exposing it
+		// to the proxy.
+		sponsorID = nil
+		clientPlatform = 0
+		clientBuildRev = nil
+		deviceRegion = ""
+		sessionID = nil
+		proxyEntryTracker = 0
+		networkType = 0
+		connectionNum = 0
+	}
 
 	if len(deviceRegion) > 2 {
 		// Truncate any unexpectedly long device region, which should be an ISO
@@ -97,18 +131,28 @@ func newLightHeader(
 	}
 
 	return &lightHeader{
-		SponsorID:          sponsorID,
-		ClientPlatform:     clientPlatform,
-		ClientBuildRev:     clientBuildRev,
-		DeviceRegion:       deviceRegion,
-		SessionID:          sessionID,
-		ProxyEntryTracker:  proxyEntryTracker,
-		NetworkType:        networkType,
-		ConnectionNum:      connectionNum,
-		DestinationAddress: destinationAddress,
-		TLSProfile:         tlsProfile,
-		TCPDuration:        tcpDuration,
-		TLSDuration:        tlsDuration,
+		SponsorID:                         sponsorID,
+		ClientPlatform:                    clientPlatform,
+		ClientBuildRev:                    clientBuildRev,
+		DeviceRegion:                      deviceRegion,
+		SessionID:                         sessionID,
+		ProxyEntryTracker:                 proxyEntryTracker,
+		NetworkType:                       networkType,
+		ConnectionNum:                     connectionNum,
+		DestinationAddress:                destinationAddress,
+		TunnelDialAuthorization:           tunnelDialAuthorization,
+		EgressProtocol:                    egressProtocol,
+		EgressTLSProfile:                  egressTLSProfile,
+		EgressRandomizedTLSProfileSeed:    egressRandomizedTLSProfileSeed,
+		EgressQUICVersion:                 egressQUICVersion,
+		EgressQUICDialRootObfuscationSeed: egressQUICDialRootObfuscationSeed,
+		EgressSNI:                         egressSNI,
+		TLSProfile:                        tlsProfile,
+		QUICVersion:                       quicVersion,
+		TCPDuration:                       tcpDuration,
+		TLSDuration:                       tlsDuration,
+		QUICDuration:                      quicDuration,
+		PersonalCompartmentID:             personalCompartmentID,
 	}, nil
 }
 
@@ -117,6 +161,12 @@ func newLightConn(conn net.Conn, header *lightHeader) *lightConn {
 		Conn:   conn,
 		header: header,
 	}
+}
+
+// NewLightFramingConn adds Light traffic shape framing to conn without a
+// light proxy header.
+func NewLightFramingConn(conn net.Conn) net.Conn {
+	return newLightConn(conn, nil)
 }
 
 func (conn *lightConn) Read(b []byte) (int, error) {
@@ -263,10 +313,13 @@ func (conn *lightConn) Write(b []byte) (int, error) {
 	releaseWriteBuffer := false
 	size := conn.writeBuffer.Len() + len(b) + 2 + 17
 	if !conn.doneWritePadding {
-		if size > stopPaddingWriteSizeThreshold {
+		if conn.stopWritePaddingPending ||
+			size > stopPaddingWriteSizeThreshold {
+
 			var wirePaddingSize [2]byte
 			binary.BigEndian.PutUint16(wirePaddingSize[:], stopPadding)
 			conn.writeBuffer.Write(wirePaddingSize[:])
+			conn.stopWritePaddingPending = false
 			conn.doneWritePadding = true
 			releaseWriteBuffer = true
 		} else {
@@ -314,6 +367,60 @@ func (conn *lightConn) Write(b []byte) (int, error) {
 	}
 
 	return n, errors.Trace(err)
+}
+
+func (conn *lightConn) stoppedReadingPadding() bool {
+	conn.readMutex.Lock()
+	defer conn.readMutex.Unlock()
+	return conn.doneReadPadding
+}
+
+func (conn *lightConn) stopWritePadding() {
+	conn.writeMutex.Lock()
+	defer conn.writeMutex.Unlock()
+	if !conn.doneWritePadding {
+		conn.stopWritePaddingPending = true
+	}
+}
+
+// RelayLightFrames relays between Light framing connections while preserving
+// the stop-padding transition.
+func RelayLightFrames(dst, src net.Conn, buffer []byte) (int64, error) {
+	dstConn, ok := dst.(*lightConn)
+	if !ok {
+		return 0, errors.TraceNew("invalid destination connection")
+	}
+	srcConn, ok := src.(*lightConn)
+	if !ok {
+		return 0, errors.TraceNew("invalid source connection")
+	}
+	if len(buffer) == 0 {
+		return 0, errors.TraceNew("invalid relay buffer")
+	}
+
+	var written int64
+	for {
+		n, readErr := srcConn.Read(buffer)
+		if n > 0 {
+			if srcConn.stoppedReadingPadding() {
+				dstConn.stopWritePadding()
+			}
+			writeN, writeErr := dstConn.Write(buffer[:n])
+			written += int64(writeN)
+			if writeErr != nil {
+				return written, errors.Trace(writeErr)
+			}
+			if writeN != n {
+				return written, errors.Trace(io.ErrShortWrite)
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return written, nil
+			}
+			return written, errors.Trace(readErr)
+		}
+	}
 }
 
 func (conn *lightConn) splitWrite(b []byte) (int, error) {
@@ -403,6 +510,12 @@ func (conn *lightConn) readHeader() (*lightHeader, error) {
 
 	if header == nil {
 		return nil, errors.TraceNew("unexpected nil header")
+	}
+
+	if len(header.PersonalCompartmentID) != 0 &&
+		len(header.PersonalCompartmentID) != personalCompartmentIDSize {
+
+		return nil, errors.TraceNew("invalid personal compartment ID")
 	}
 
 	return header, nil

@@ -78,6 +78,90 @@ func TestTunnelProtocolValidation(t *testing.T) {
 	}
 }
 
+func TestLightTunnelProtocols(t *testing.T) {
+
+	testCases := []struct {
+		tunnelProtocol  string
+		usesTLSIngress  bool
+		usesQUICIngress bool
+		usesTLSEgress   bool
+		usesQUICEgress  bool
+	}{
+		{
+			tunnelProtocol: TUNNEL_PROTOCOL_LIGHT_TLS_TLS_SSH,
+			usesTLSIngress: true,
+			usesTLSEgress:  true,
+		},
+		{
+			tunnelProtocol: TUNNEL_PROTOCOL_LIGHT_TLS_QUIC_SSH,
+			usesTLSIngress: true,
+			usesQUICEgress: true,
+		},
+		{
+			tunnelProtocol:  TUNNEL_PROTOCOL_LIGHT_QUIC_TLS_SSH,
+			usesQUICIngress: true,
+			usesTLSEgress:   true,
+		},
+		{
+			tunnelProtocol:  TUNNEL_PROTOCOL_LIGHT_QUIC_QUIC_SSH,
+			usesQUICIngress: true,
+			usesQUICEgress:  true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.tunnelProtocol, func(t *testing.T) {
+
+			if !TunnelProtocolUsesLight(testCase.tunnelProtocol) {
+				t.Error("expected Light protocol")
+			}
+			if TunnelProtocolUsesLightTLSIngress(testCase.tunnelProtocol) !=
+				testCase.usesTLSIngress {
+
+				t.Error("unexpected Light TLS ingress classification")
+			}
+			if TunnelProtocolUsesLightQUICIngress(testCase.tunnelProtocol) !=
+				testCase.usesQUICIngress {
+
+				t.Error("unexpected Light QUIC ingress classification")
+			}
+			if TunnelProtocolUsesLightTLSEgress(testCase.tunnelProtocol) !=
+				testCase.usesTLSEgress {
+
+				t.Error("unexpected Light TLS egress classification")
+			}
+			if TunnelProtocolUsesLightQUICEgress(testCase.tunnelProtocol) !=
+				testCase.usesQUICEgress {
+
+				t.Error("unexpected Light QUIC egress classification")
+			}
+			if TunnelProtocolUsesQUIC(testCase.tunnelProtocol) !=
+				testCase.usesQUICIngress {
+
+				t.Error("unexpected QUIC classification")
+			}
+			if TunnelProtocolUsesTCP(testCase.tunnelProtocol) !=
+				testCase.usesTLSIngress {
+
+				t.Error("unexpected TCP classification")
+			}
+			if TunnelProtocolMayUseClientBPF(testCase.tunnelProtocol) !=
+				testCase.usesTLSIngress {
+
+				t.Error("unexpected client BPF classification")
+			}
+			if TunnelProtocolIsCompatibleWithFragmentor(testCase.tunnelProtocol) {
+				t.Error("unexpected fragmentor compatibility for Light protocol")
+			}
+			if GetCapability(testCase.tunnelProtocol) !=
+				testCase.tunnelProtocol {
+
+				t.Error("unexpected capability")
+			}
+		})
+	}
+}
+
 func TestTLSProfileValidation(t *testing.T) {
 
 	// Test: valid profiles

@@ -43,7 +43,9 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/accesscontrol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/crypto/ssh"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/fragmentor"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/light"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/monotime"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/obfuscator"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/osl"
@@ -179,7 +181,17 @@ func (server *TunnelServer) Run() error {
 			// using protocol.MeekCookieData.ClientTunnelProtocol.
 			continue
 
-		} else if protocol.TunnelProtocolUsesQUIC(tunnelProtocol) {
+		} else if protocol.TunnelProtocolUsesLightQUICEgress(
+			tunnelProtocol) {
+
+			listener, err = listenLightQUICTunnel(
+				support, tunnelProtocol, localAddress, listenPort)
+			if err != nil {
+				return errors.Trace(err)
+			}
+
+		} else if !protocol.TunnelProtocolUsesLight(tunnelProtocol) &&
+			protocol.TunnelProtocolUsesQUIC(tunnelProtocol) {
 
 			usesInproxy := protocol.TunnelProtocolUsesInproxy(tunnelProtocol)
 
@@ -221,10 +233,13 @@ func (server *TunnelServer) Run() error {
 						errors.Trace(err), LogFields(logFields))
 				},
 				localAddress,
+				nil,
 				disablePathMTUDiscovery,
 				maxPacketSizeAdjustment,
 				support.Config.ObfuscatedSSHKey,
-				enableGQUIC)
+				nil,
+				enableGQUIC,
+				true)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -252,26 +267,10 @@ func (server *TunnelServer) Run() error {
 				return errors.Trace(err)
 			}
 
-			if protocol.TunnelProtocolUsesTLSOSSH(tunnelProtocol) {
+			if protocol.TunnelProtocolUsesLightTLSEgress(tunnelProtocol) {
 
-				listener, err = ListenTLSTunnel(support, listener, tunnelProtocol, listenPort)
-				if err != nil {
-					return errors.Trace(err)
-				}
-
-			} else if protocol.TunnelProtocolUsesShadowsocks(tunnelProtocol) {
-
-				logTunnelProtocol := tunnelProtocol
-				listener, err = ListenShadowsocks(
-					support,
-					listener,
-					support.Config.ShadowsocksKey,
-					func(peerAddress string, err error, logFields common.LogFields) {
-						logIrregularTunnel(
-							support, logTunnelProtocol, listenPort, peerAddress,
-							errors.Trace(err), LogFields(logFields))
-					},
-				)
+				listener, err = listenLightTLSTunnel(
+					support, listener, tunnelProtocol, listenPort)
 				if err != nil {
 					return errors.Trace(err)
 				}
@@ -722,6 +721,10 @@ func (sshServer *sshServer) runListener(sshListener *sshListener, listenerError 
 	// TunnelServer.Run will properly shut down instead of remaining
 	// running.
 
+	// Apply TLS and Shadowsocks after tactics so fragmentation acts on TCP.
+	listener := sshListener.Listener
+	var err error
+
 	if protocol.TunnelProtocolUsesMeekHTTP(sshListener.tunnelProtocol) ||
 		protocol.TunnelProtocolUsesMeekHTTPS(sshListener.tunnelProtocol) {
 
@@ -753,10 +756,32 @@ func (sshServer *sshServer) runListener(sshListener *sshListener, listenerError 
 			}
 		}
 
-	} else {
+		return
 
-		runListener(sshListener.Listener, sshServer.shutdownBroadcast, listenerError, "", handleClient)
+	} else if protocol.TunnelProtocolUsesTLSOSSH(sshListener.tunnelProtocol) {
+
+		listener, err = ListenTLSTunnel(
+			sshServer.support, listener, sshListener.tunnelProtocol, sshListener.port)
+
+	} else if protocol.TunnelProtocolUsesShadowsocks(sshListener.tunnelProtocol) {
+
+		listener, err = ListenShadowsocks(
+			sshServer.support,
+			listener,
+			sshServer.support.Config.ShadowsocksKey,
+			func(peerAddress string, err error, logFields common.LogFields) {
+				logIrregularTunnel(
+					sshServer.support, sshListener.tunnelProtocol, sshListener.port,
+					peerAddress, errors.Trace(err), LogFields(logFields))
+			},
+		)
 	}
+	if err != nil {
+		reportListenerError(listenerError, errors.Trace(err))
+		return
+	}
+
+	runListener(listener, sshServer.shutdownBroadcast, listenerError, "", handleClient)
 }
 
 // runMeekTLSOSSHDemuxListener blocks running a listener which demuxes meek and
@@ -1161,7 +1186,7 @@ func (sshServer *sshServer) getLoadStats() (
 	zeroProtocolStats := func() map[string]map[string]interface{} {
 		stats := make(map[string]map[string]interface{})
 		stats["ALL"] = zeroClientStats()
-		for tunnelProtocol := range sshServer.support.Config.TunnelProtocolPorts {
+		for _, tunnelProtocol := range sshServer.support.Config.GetRunningProtocols() {
 			stats[tunnelProtocol] = zeroClientStats()
 
 			if sshServer.tunnelProtocolUsesTLSDemux(tunnelProtocol) {
@@ -1446,8 +1471,11 @@ func (sshServer *sshServer) getLoadStats() (
 		//   under None, not the current client.peerGeoIPData.Country, so
 		//   the -1 subtracts some _other_ client from the populated regionStats.
 		//
-		// - For in-proxy protocols, the accepted proximate metric uses the
-		//   peer GeoIP, which represents the proxy, not the client.
+		// - For in-proxy and Light protocols, the accepted proximate metric uses
+		//   the peer GeoIP, which represents the proxy, not the client. For Light,
+		//   the established proximate metric is omitted when the original client
+		//   IP reported by the proxy is untrusted. These clients still count as
+		//   established clients under None in server_load.
 
 		stats := regionStats[client.peerGeoIPData.Country]["ALL"]
 
@@ -1810,6 +1838,22 @@ func (sshServer *sshServer) handleClient(
 
 	peerAddr := conn.RemoteAddr()
 
+	// Perform outer-layer transport handshakes for protocols that have not
+	// already completed it. This is done before the SSH handshake semaphore,
+	// so contention does not delay obfuscation mechanisms.
+	lightTunnelConn, initializeErr :=
+		sshServer.handshakeTunnelTransport(conn)
+
+	if initializeErr != nil {
+		log.WithTraceFields(
+			LogFields{"error": initializeErr}).Debug(
+			"Tunnel transport initialization failed")
+	}
+
+	if initializeErr == nil && lightTunnelConn != nil {
+		tunnelProtocol = lightTunnelConn.TunnelProtocol()
+	}
+
 	// Check if there were irregularities during the network connection
 	// establishment. When present, log and then behave as Obfuscated SSH does
 	// when the client fails to provide a valid seed message.
@@ -1817,32 +1861,48 @@ func (sshServer *sshServer) handleClient(
 	// One concrete irregular case is failure to send a PROXY protocol header for
 	// TAPDANCE-OSSH.
 
+	var irregularErr error
+	var lightIrregularErr *light.IrregularTunnelError
 	if indicator, ok := conn.(common.IrregularIndicator); ok {
+		irregularErr = indicator.IrregularTunnelError()
+	} else if std_errors.As(initializeErr, &lightIrregularErr) {
+		irregularErr = initializeErr
+	}
 
-		tunnelErr := indicator.IrregularTunnelError()
+	if initializeErr != nil && irregularErr == nil {
+		conn.Close()
+		return
+	}
 
-		if tunnelErr != nil {
+	if irregularErr != nil {
+		logIrregularTunnel(
+			sshServer.support,
+			sshListener.tunnelProtocol,
+			sshListener.port,
+			common.IPAddressFromAddr(peerAddr),
+			errors.Trace(irregularErr),
+			nil)
 
-			logIrregularTunnel(
-				sshServer.support,
-				sshListener.tunnelProtocol,
-				sshListener.port,
-				common.IPAddressFromAddr(peerAddr),
-				errors.Trace(tunnelErr),
-				nil)
-
-			var afterFunc *time.Timer
-			if sshServer.support.Config.sshHandshakeTimeout > 0 {
-				afterFunc = time.AfterFunc(sshServer.support.Config.sshHandshakeTimeout, func() {
+		var afterFunc *time.Timer
+		if sshServer.support.Config.sshHandshakeTimeout > 0 {
+			afterFunc = time.AfterFunc(
+				sshServer.support.Config.sshHandshakeTimeout,
+				func() {
 					conn.Close()
 				})
-			}
-			_, _ = io.Copy(ioutil.Discard, conn)
-			conn.Close()
-			afterFunc.Stop()
-
-			return
 		}
+
+		drainConn := conn
+		if lightTunnelConn != nil {
+			drainConn = lightTunnelConn.Conn
+		}
+		_, _ = io.Copy(ioutil.Discard, drainConn)
+		conn.Close()
+		if afterFunc != nil {
+			afterFunc.Stop()
+		}
+
+		return
 	}
 
 	// Get any packet manipulation values from GetAppliedSpecName as soon as
@@ -1889,8 +1949,8 @@ func (sshServer *sshServer) handleClient(
 		}
 	}
 
-	// For in-proxy tunnel protocols, accepted client GeoIP reflects the proxy
-	// address, not the client.
+	// For in-proxy and Light tunnel protocols, accepted client GeoIP reflects
+	// the proxy address, not the client.
 
 	peerGeoIPData := sshServer.support.GeoIPService.Lookup(
 		common.IPAddressFromAddr(peerAddr))
@@ -1959,11 +2019,86 @@ func (sshServer *sshServer) handleClient(
 		return
 	}
 
+	if lightTunnelConn != nil {
+		sshClient.lightProxyID = lightTunnelConn.proxyID
+		if clientIP := lightTunnelConn.GetTrustedClientIP(); clientIP != "" {
+			sshClient.clientIP = clientIP
+			sshClient.clientGeoIPData = sshServer.support.GeoIPService.Lookup(clientIP)
+			sshClient.isUntrustedLightProxy = false
+		}
+	}
+
 	// sshClient.run _must_ call onSSHHandshakeFinished to release the semaphore:
 	// in any error case; or, as soon as the SSH handshake phase has successfully
 	// completed.
 
 	sshClient.run(conn, onSSHHandshakeFinished)
+}
+
+func (sshServer *sshServer) handshakeTunnelTransport(
+	conn net.Conn) (*LightTunnelConn, error) {
+
+	// For TLS-OSSH, complete the TLS handshake. For Light, complete the egress
+	// transport handshake and verify the proxy report to get the original client IP
+	// before initializing client GeoIP.
+
+	var lightTunnelConn *LightTunnelConn
+	var initialize func(context.Context) error
+
+	// Demultiplexed TLS connections have already completed their handshake.
+findTunnelConn:
+	for candidateConn := conn; ; {
+		switch typedConn := candidateConn.(type) {
+		case *LightTunnelConn:
+			lightTunnelConn = typedConn
+			initialize = typedConn.initialize
+			break findTunnelConn
+		case *TLSTunnelConn:
+			initialize = typedConn.Handshake
+			break findTunnelConn
+		case *fragmentor.Conn:
+			candidateConn = typedConn.Conn
+		default:
+			break findTunnelConn
+		}
+	}
+
+	if initialize == nil {
+		return nil, nil
+	}
+
+	initializeCtx, cancelInitialize :=
+		context.WithCancel(context.Background())
+	shutdownDone := make(chan struct{})
+	go func() {
+		select {
+		case <-sshServer.shutdownBroadcast:
+			cancelInitialize()
+		case <-shutdownDone:
+		}
+	}()
+
+	// TODO: add a distinct transportHandshakeTimeout
+	var cancelTimeout context.CancelFunc
+	if sshServer.support.Config.sshHandshakeTimeout > 0 {
+		initializeCtx, cancelTimeout = context.WithTimeout(
+			initializeCtx,
+			sshServer.support.Config.sshHandshakeTimeout)
+	}
+
+	err := initialize(initializeCtx)
+
+	close(shutdownDone)
+	if cancelTimeout != nil {
+		cancelTimeout()
+	}
+	cancelInitialize()
+
+	if err != nil {
+		return lightTunnelConn, errors.Trace(err)
+	}
+
+	return lightTunnelConn, nil
 }
 
 func (sshServer *sshServer) monitorPortForwardDialError(err error) {
@@ -2055,6 +2190,8 @@ type sshClient struct {
 	sshListener                          *sshListener
 	tunnelProtocol                       string
 	isInproxyTunnelProtocol              bool
+	isUntrustedLightProxy                bool
+	lightProxyID                         inproxy.ID
 	additionalTransportData              *additionalTransportData
 	sshConn                              ssh.Conn
 	throttledConn                        *common.ThrottledConn
@@ -2108,8 +2245,8 @@ type sshClient struct {
 	blocklistHitsLogCount                int
 	proxyProtocolMetrics                 proxyProtocolMetrics
 
-	clientEvents           []string
-	lightProxyClientEvents []string
+	clientEvents                   []string
+	lightFallbackProxyClientEvents []string
 }
 
 type trafficState struct {
@@ -2435,6 +2572,7 @@ func newSshClient(
 		sshListener:                      sshListener,
 		tunnelProtocol:                   tunnelProtocol,
 		isInproxyTunnelProtocol:          protocol.TunnelProtocolUsesInproxy(tunnelProtocol),
+		isUntrustedLightProxy:            protocol.TunnelProtocolUsesLight(tunnelProtocol),
 		additionalTransportData:          transportData,
 		serverPacketManipulation:         serverPacketManipulation,
 		replayedServerPacketManipulation: replayedServerPacketManipulation,
@@ -2467,12 +2605,16 @@ func newSshClient(
 
 	// In the case of in-proxy tunnel protocols, clientIP and clientGeoIPData
 	// are not set until the original client IP is relayed from the broker
-	// during the handshake. In other cases, clientGeoIPData is the
-	// peerGeoIPData (this includes fronted meek).
+	// during the handshake. Otherwise, default to the peer (including fronted
+	// meek). Light client GeoIP remains unknown unless handleClient obtains
+	// a trusted original client IP.
 
 	if !client.isInproxyTunnelProtocol {
 		client.clientIP = peerIP
 		client.clientGeoIPData = peerGeoIPData
+	}
+	if client.isUntrustedLightProxy {
+		client.clientGeoIPData = NewGeoIPData()
 	}
 
 	return client, nil
@@ -2614,9 +2756,17 @@ func (sshClient *sshClient) run(
 	// A tunnel which fails to meet the targets but successfully completes any
 	// liveness test and the API handshake is ignored in terms of replay scoring.
 	//
-	// In the case of in-proxy tunnel protocols, the peer address will be the
+	// In the case of in-proxy and Light tunnel protocols, the peer address will be the
 	// proxy, not the client, and GeoIP targeted replay will apply to the 2nd
 	// hop.
+
+	replayTunnelProtocol := sshClient.tunnelProtocol
+	if protocol.TunnelProtocolUsesLight(replayTunnelProtocol) {
+		// The same Light server listener handles tunnels with TLS or QUIC ingress.
+		// Use its configured protocol so replay writes match packet manipulation
+		// lookups.
+		replayTunnelProtocol = sshClient.sshListener.tunnelProtocol
+	}
 
 	isReplayCandidate, replayWaitDuration, replayTargetDuration :=
 		sshClient.sshServer.support.ReplayCache.GetReplayTargetDuration(sshClient.peerGeoIPData)
@@ -2643,7 +2793,7 @@ func (sshClient *sshClient) run(
 					sshClient.Unlock()
 
 					sshClient.sshServer.support.ReplayCache.SetReplayParameters(
-						sshClient.tunnelProtocol,
+						replayTunnelProtocol,
 						sshClient.peerGeoIPData,
 						sshClient.serverPacketManipulation,
 						getFragmentorSeed(),
@@ -2680,7 +2830,7 @@ func (sshClient *sshClient) run(
 
 				if usedReplay {
 					sshClient.sshServer.support.ReplayCache.FailedReplayParameters(
-						sshClient.tunnelProtocol,
+						replayTunnelProtocol,
 						sshClient.peerGeoIPData,
 						sshClient.serverPacketManipulation,
 						getFragmentorSeed())
@@ -2729,11 +2879,12 @@ func (sshClient *sshClient) run(
 			// server allows non-conforming selections.
 			//
 			// The exception is TUNNEL_PROTOCOL_SSH, which is intended to appear
-			// like SSH on the wire.
+			// like SSH on the wire. Light tunnels also omit OSSH and carry SSH
+			// inside TLS or QUIC.
 			sshServerConfig.ObfuscatedSSHMode = true
 
 		} else {
-			// For TUNNEL_PROTOCOL_SSH only, randomize KEX.
+			// Randomize KEX for protocols without OSSH.
 			if sshClient.sshServer.support.Config.ObfuscatedSSHKey != "" {
 				sshServerConfig.KEXPRNGSeed, err = protocol.DeriveSSHServerKEXPRNGSeed(
 					sshClient.sshServer.support.Config.ObfuscatedSSHKey)
@@ -3069,7 +3220,11 @@ func (sshClient *sshClient) passwordCallback(conn ssh.ConnMetadata, password []b
 	// Initially, in the case of in-proxy tunnel protocols, the GeoIP session
 	// cache entry will be the proxy's GeoIPData. This is updated to be the
 	// client's GeoIPData in setHandshakeState.
-	sshClient.sshServer.setGeoIPSessionCache(sessionID, sshClient.peerGeoIPData)
+	geoIPData := sshClient.peerGeoIPData
+	if !sshClient.isInproxyTunnelProtocol {
+		geoIPData = sshClient.getClientGeoIPData()
+	}
+	sshClient.sshServer.setGeoIPSessionCache(sessionID, geoIPData)
 
 	return nil, nil
 }
@@ -3789,18 +3944,18 @@ func (sshClient *sshClient) setUdpgwChannelHandler(udpgwChannelHandler *udpgwPor
 	return true
 }
 
-// light_proxy_client_events is intentionally omitted; sshClient accumulates
-// these events separately.
+// light_fallback_proxy_client_events is intentionally omitted;
+// sshClient accumulates these events separately.
 var serverTunnelStatParams = append(
 	[]requestParamSpec{
 		{"last_connected", isLastConnected, requestParamOptional},
 		{"establishment_duration", isIntString, requestParamOptional},
-		{"light_proxy_id", isAnyString, requestParamOptional},
-		{"light_proxy_entry_tracker", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_dial_IPv4", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_dial_IPv6", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_dial_failed", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_dial_canceled", isIntString, requestParamOptional | requestParamLogStringAsInt}},
+		{"light_fallback_proxy_id", isAnyString, requestParamOptional},
+		{"light_fallback_proxy_entry_tracker", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_fallback_proxy_dial_IPv4", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_fallback_proxy_dial_IPv6", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_fallback_proxy_dial_failed", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_fallback_proxy_dial_canceled", isIntString, requestParamOptional | requestParamLogStringAsInt}},
 	baseAndDialParams...)
 
 func (sshClient *sshClient) logTunnel(additionalMetrics []LogFields) {
@@ -3988,8 +4143,8 @@ func (sshClient *sshClient) logTunnel(additionalMetrics []LogFields) {
 	if len(sshClient.clientEvents) > 0 {
 		logFields["client_events"] = sshClient.clientEvents
 	}
-	if len(sshClient.lightProxyClientEvents) > 0 {
-		logFields["light_proxy_client_events"] = sshClient.lightProxyClientEvents
+	if len(sshClient.lightFallbackProxyClientEvents) > 0 {
+		logFields["light_fallback_proxy_client_events"] = sshClient.lightFallbackProxyClientEvents
 	}
 
 	// Merge in additional metrics from the optional metrics source

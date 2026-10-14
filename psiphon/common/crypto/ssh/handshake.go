@@ -1067,7 +1067,7 @@ func (t *handshakeTransport) sendKexInit() error {
 
 			// The peer is not randomized. For Psiphon tunnels, this is
 			// currently the code path for all tunnel protocols except for
-			// plain SSH; in these cases the server does not randomize its
+			// plain SSH/LIGHT-SSH; in these cases the server does not randomize its
 			// KEX. Prefer non-SHA-1 algorithms common with the server's
 			// default algorithm lists to avoid SHA-1 algorithm negotiation.
 

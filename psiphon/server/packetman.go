@@ -125,6 +125,9 @@ func selectPacketManipulationSpec(
 	// tunnel protocol name, which is used to lookup first replay and then
 	// enabled packet manipulation specs in ServerProtocolPacketManipulations.
 	//
+	// Light protocols use the configured listener name for both ingress
+	// variants; the ingress transport is not observable at this layer.
+	//
 	// This assumes that all TunnelProtocolMayUseServerPacketManipulation
 	// protocols run on distinct ports, which is true when all such protocols run
 	// over TCP.

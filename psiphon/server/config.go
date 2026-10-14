@@ -20,6 +20,7 @@
 package server
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -39,6 +40,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/crypto/ssh"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/light"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/osl"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
@@ -159,7 +161,13 @@ type Config struct {
 	// "SSH", "OSSH", "TLS-OSSH", "UNFRONTED-MEEK-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH",
 	// "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "FRONTED-MEEK-OSSH",
 	// "FRONTED-MEEK-QUIC-OSSH", "FRONTED-MEEK-HTTP-OSSH", "QUIC-OSSH",
-	// "TAPDANCE-OSSH", "CONJURE-OSSH", and "SHADOWSOCKS-OSSH".
+	// "TAPDANCE-OSSH", "CONJURE-OSSH", "SHADOWSOCKS-OSSH",
+	// "LIGHT-TLS-TLS-SSH", "LIGHT-TLS-QUIC-SSH", "LIGHT-QUIC-TLS-SSH",
+	// and "LIGHT-QUIC-QUIC-SSH".
+	//
+	// Only one Light listener per egress transport (proxy to server) may be
+	// configured. Each supports both ingress transports (client to proxy).
+	// Per-listener Light settings must use the protocol name configured here.
 	TunnelProtocolPorts map[string]int `json:",omitempty"`
 
 	// TunnelProtocolPassthroughAddresses specifies passthrough addresses to be
@@ -169,8 +177,24 @@ type Config struct {
 	//
 	// TunnelProtocolPassthroughAddresses is supported for:
 	// "TLS-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH",
-	// "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "UNFRONTED-MEEK-OSSH".
+	// "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "UNFRONTED-MEEK-OSSH",
+	// "LIGHT-TLS-TLS-SSH", and "LIGHT-QUIC-TLS-SSH".
 	TunnelProtocolPassthroughAddresses map[string]string `json:",omitempty"`
+
+	// LightCertificate is a TLS certificate shared by Light tunnel protocol listeners.
+	LightCertificate string `json:",omitempty"`
+
+	// LightPrivateKey is the private key for LightCertificate.
+	LightPrivateKey string `json:",omitempty"`
+
+	// LightRootObfuscationSecret is used to derive Light protocol obfuscation secrets.
+	LightRootObfuscationSecret string `json:",omitempty"`
+
+	// TODO: support multiple issuer keys to allow overlap during key rotation.
+
+	// LightTrustedProxyAuthorizationPublicKey verifies trusted proxy
+	// authorizations included in proxy reports.
+	LightTrustedProxyAuthorizationPublicKey string `json:",omitempty"`
 
 	// LegacyPassthrough indicates whether to expect legacy passthrough messages
 	// from clients attempting to connect. This should be set for existing/legacy
@@ -212,9 +236,9 @@ type Config struct {
 	// is SSH_HANDSHAKE_TIMEOUT.
 	SSHHandshakeTimeoutMilliseconds *int `json:",omitempty"`
 
-	// ObfuscatedSSHKey is the secret key for use in the Obfuscated
-	// SSH protocol. The same secret key is used for all protocols,
-	// run by this server instance, which use Obfuscated SSH.
+	// ObfuscatedSSHKey is required for all tunnel protocols. It is required
+	// by protocols using Obfuscated SSH and seeds SSH KEX randomization
+	// for protocols without Obfuscated SSH.
 	ObfuscatedSSHKey string `json:",omitempty"`
 
 	// ShadowsocksKey is the secret key for use in the Shadowsocks
@@ -730,10 +754,28 @@ func (config *Config) AddServerEntryTag(logFields LogFields) {
 	}
 }
 
-// GetRunningProtocols returns the list of protcols this server is running.
+// GetRunningProtocols returns the protocols this server is running,
+// including implicit Light ingress variants.
 // The caller must not mutate the return value.
 func (config *Config) GetRunningProtocols() []string {
 	return config.runningProtocols
+}
+
+func getLightTunnelProtocolIngressVariants(tunnelProtocol string) []string {
+	switch {
+	case protocol.TunnelProtocolUsesLightTLSEgress(tunnelProtocol):
+		return []string{
+			protocol.TUNNEL_PROTOCOL_LIGHT_TLS_TLS_SSH,
+			protocol.TUNNEL_PROTOCOL_LIGHT_QUIC_TLS_SSH,
+		}
+	case protocol.TunnelProtocolUsesLightQUICEgress(tunnelProtocol):
+		return []string{
+			protocol.TUNNEL_PROTOCOL_LIGHT_TLS_QUIC_SSH,
+			protocol.TUNNEL_PROTOCOL_LIGHT_QUIC_QUIC_SSH,
+		}
+	default:
+		return []string{tunnelProtocol}
+	}
 }
 
 // GetRunningOnlyInproxyBroker indicates if the server is running only the
@@ -819,6 +861,7 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 
 	config.runningProtocols = []string{}
 	config.runningOnlyInproxyBroker = config.MeekServerRunInproxyBroker
+	var lightTLSListening, lightQUICListening bool
 
 	for tunnelProtocol := range config.TunnelProtocolPorts {
 		if !common.Contains(protocol.SupportedTunnelProtocols, tunnelProtocol) {
@@ -848,12 +891,10 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 					tunnelProtocol)
 			}
 		}
-		if protocol.TunnelProtocolUsesObfuscatedSSH(tunnelProtocol) {
-			if config.ObfuscatedSSHKey == "" {
-				return nil, errors.Tracef(
-					"Tunnel protocol %s requires ObfuscatedSSHKey",
-					tunnelProtocol)
-			}
+		if config.ObfuscatedSSHKey == "" {
+			return nil, errors.Tracef(
+				"Tunnel protocol %s requires ObfuscatedSSHKey",
+				tunnelProtocol)
 		}
 		if protocol.TunnelProtocolUsesTLSOSSH(tunnelProtocol) {
 			// Meek obfuscated key used for legacy reasons. See comment for
@@ -862,6 +903,41 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 				return nil, errors.Tracef(
 					"Tunnel protocol %s requires MeekObfuscatedKey",
 					tunnelProtocol)
+			}
+		}
+
+		if protocol.TunnelProtocolUsesLight(tunnelProtocol) {
+			if protocol.TunnelProtocolUsesLightTLSEgress(tunnelProtocol) {
+				if lightTLSListening {
+					return nil, errors.TraceNew(
+						"multiple Light TLS listeners")
+				}
+				lightTLSListening = true
+			} else if protocol.TunnelProtocolUsesLightQUICEgress(
+				tunnelProtocol) {
+
+				if lightQUICListening {
+					return nil, errors.TraceNew(
+						"multiple Light QUIC listeners")
+				}
+				lightQUICListening = true
+			}
+
+			if config.LightCertificate == "" ||
+				config.LightPrivateKey == "" ||
+				config.LightRootObfuscationSecret == "" {
+
+				return nil, errors.Tracef(
+					"Tunnel protocol %s requires LightCertificate, LightPrivateKey, LightRootObfuscationSecret",
+					tunnelProtocol)
+			}
+			secret, err := hex.DecodeString(
+				config.LightRootObfuscationSecret)
+			if err != nil ||
+				len(secret) != light.TunnelRootObfuscationSecretSize {
+
+				return nil, errors.TraceNew(
+					"invalid LightRootObfuscationSecret")
 			}
 		}
 		if protocol.TunnelProtocolUsesMeekHTTP(tunnelProtocol) ||
@@ -897,19 +973,50 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 			}
 		}
 
-		config.runningProtocols = append(config.runningProtocols, tunnelProtocol)
+		config.runningProtocols = append(
+			config.runningProtocols,
+			getLightTunnelProtocolIngressVariants(tunnelProtocol)...)
 		config.runningOnlyInproxyBroker = false
+	}
+
+	if config.LightTrustedProxyAuthorizationPublicKey != "" {
+		publicKey, err := base64.StdEncoding.DecodeString(
+			config.LightTrustedProxyAuthorizationPublicKey)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if len(publicKey) != ed25519.PublicKeySize {
+			return nil, errors.TraceNew(
+				"invalid LightTrustedProxyAuthorizationPublicKey")
+		}
 	}
 
 	for tunnelProtocol, address := range config.TunnelProtocolPassthroughAddresses {
 		if !protocol.TunnelProtocolSupportsPassthrough(tunnelProtocol) {
 			return nil, errors.Tracef("Passthrough unsupported tunnel protocol: %s", tunnelProtocol)
 		}
+		if _, ok := config.TunnelProtocolPorts[tunnelProtocol]; !ok &&
+			protocol.TunnelProtocolUsesLight(tunnelProtocol) {
+
+			return nil, errors.Tracef(
+				"Passthrough configured for missing Light listener: %s",
+				tunnelProtocol)
+		}
 		_, _, err := net.SplitHostPort(address)
 		if err != nil {
 			return nil, errors.Tracef(
 				"Tunnel protocol %s passthrough address %s invalid: %s",
 				tunnelProtocol, address, err)
+		}
+	}
+
+	for tunnelProtocol := range config.IptablesAcceptRateLimitTunnelProtocolRateLimits {
+		if _, ok := config.TunnelProtocolPorts[tunnelProtocol]; !ok &&
+			protocol.TunnelProtocolUsesLight(tunnelProtocol) {
+
+			return nil, errors.Tracef(
+				"iptables rate limit configured for missing Light listener: %s",
+				tunnelProtocol)
 		}
 	}
 
@@ -1137,6 +1244,8 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 	usingMeek := false
 	usingTLSOSSH := false
 	usingInproxy := false
+	usingLight := false
+	var lightTLSListening, lightQUICListening bool
 
 	for tunnelProtocol, port := range params.TunnelProtocolPorts {
 
@@ -1160,6 +1269,25 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 
 		if protocol.TunnelProtocolUsesInproxy(tunnelProtocol) {
 			usingInproxy = true
+		}
+
+		if protocol.TunnelProtocolUsesLight(tunnelProtocol) {
+			usingLight = true
+			if protocol.TunnelProtocolUsesLightTLSEgress(tunnelProtocol) {
+				if lightTLSListening {
+					return nil, nil, nil, nil, nil, errors.TraceNew(
+						"multiple Light TLS listeners")
+				}
+				lightTLSListening = true
+			} else if protocol.TunnelProtocolUsesLightQUICEgress(
+				tunnelProtocol) {
+
+				if lightQUICListening {
+					return nil, nil, nil, nil, nil, errors.TraceNew(
+						"multiple Light QUIC listeners")
+				}
+				lightQUICListening = true
+			}
 		}
 	}
 
@@ -1247,6 +1375,28 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 		meekObfuscatedKey = hex.EncodeToString(meekObfuscatedKeyBytes)
 	}
 
+	// Light tunnel config
+
+	var lightCertificate, lightPrivateKey, lightVerifyPin,
+		lightRootObfuscationSecret string
+	var lightRootObfuscationSecretBytes []byte
+
+	if usingLight {
+		lightCertificate, lightPrivateKey, lightVerifyPin, err =
+			common.GenerateWebServerCertificate(values.GetHostName())
+		if err != nil {
+			return nil, nil, nil, nil, nil, errors.Trace(err)
+		}
+
+		lightRootObfuscationSecretBytes, err = common.MakeSecureRandomBytes(
+			light.TunnelRootObfuscationSecretSize)
+		if err != nil {
+			return nil, nil, nil, nil, nil, errors.Trace(err)
+		}
+		lightRootObfuscationSecret =
+			hex.EncodeToString(lightRootObfuscationSecretBytes)
+	}
+
 	// Inproxy config
 
 	var inproxyServerSessionPublicKey,
@@ -1324,6 +1474,9 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 		ObfuscatedSSHKey:                   obfuscatedSSHKey,
 		TunnelProtocolPorts:                params.TunnelProtocolPorts,
 		TunnelProtocolPassthroughAddresses: params.TunnelProtocolPassthroughAddresses,
+		LightCertificate:                   lightCertificate,
+		LightPrivateKey:                    lightPrivateKey,
+		LightRootObfuscationSecret:         lightRootObfuscationSecret,
 		DNSResolverIPAddress:               "8.8.8.8",
 		UDPInterceptUdpgwServerAddress:     "127.0.0.1:7300",
 		MeekCookieEncryptionPrivateKey:     meekCookieEncryptionPrivateKey,
@@ -1420,44 +1573,47 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 
 	var frontingProviderID string
 
-	for tunnelProtocol := range params.TunnelProtocolPorts {
+	for configuredTunnelProtocol := range params.TunnelProtocolPorts {
+		for _, tunnelProtocol := range getLightTunnelProtocolIngressVariants(
+			configuredTunnelProtocol) {
 
-		capability := protocol.GetCapability(tunnelProtocol)
+			capability := protocol.GetCapability(tunnelProtocol)
 
-		// In-proxy tunnel protocol capabilities don't include
-		// v1/-PASSTHROUGHv2 suffixes; see comments in ServerEntry.hasCapability.
-		if !protocol.TunnelProtocolUsesInproxy(tunnelProtocol) {
+			// In-proxy tunnel protocol capabilities don't include
+			// v1/-PASSTHROUGHv2 suffixes; see comments in ServerEntry.hasCapability.
+			if !protocol.TunnelProtocolUsesInproxy(tunnelProtocol) {
 
-			// Note: do not add passthrough annotation if HTTP unfronted meek
-			// because it would result in an invalid capability.
-			if params.Passthrough &&
-				protocol.TunnelProtocolSupportsPassthrough(tunnelProtocol) &&
-				tunnelProtocol != protocol.TUNNEL_PROTOCOL_UNFRONTED_MEEK {
+				// Note: do not add passthrough annotation if HTTP unfronted meek
+				// because it would result in an invalid capability.
+				if params.Passthrough &&
+					protocol.TunnelProtocolSupportsPassthrough(tunnelProtocol) &&
+					tunnelProtocol != protocol.TUNNEL_PROTOCOL_UNFRONTED_MEEK {
 
-				if !params.LegacyPassthrough {
-					capability += "-PASSTHROUGH-v2"
-				} else {
-					capability += "-PASSTHROUGH"
+					if !params.LegacyPassthrough {
+						capability += "-PASSTHROUGH-v2"
+					} else {
+						capability += "-PASSTHROUGH"
+					}
+				}
+
+				if tunnelProtocol == protocol.TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH &&
+					!params.EnableGQUIC {
+
+					capability += "v1"
 				}
 			}
 
-			if tunnelProtocol == protocol.TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH &&
-				!params.EnableGQUIC {
+			capabilities = append(capabilities, capability)
 
-				capability += "v1"
+			if params.TacticsRequestPublicKey != "" && params.TacticsRequestObfuscatedKey != "" &&
+				protocol.TunnelProtocolSupportsTactics(tunnelProtocol) {
+
+				capabilities = append(capabilities, protocol.GetTacticsCapability(tunnelProtocol))
 			}
-		}
 
-		capabilities = append(capabilities, capability)
-
-		if params.TacticsRequestPublicKey != "" && params.TacticsRequestObfuscatedKey != "" &&
-			protocol.TunnelProtocolSupportsTactics(tunnelProtocol) {
-
-			capabilities = append(capabilities, protocol.GetTacticsCapability(tunnelProtocol))
-		}
-
-		if protocol.TunnelProtocolUsesFrontedMeek(tunnelProtocol) {
-			frontingProviderID = params.FrontingProviderID
+			if protocol.TunnelProtocolUsesFrontedMeek(tunnelProtocol) {
+				frontingProviderID = params.FrontingProviderID
+			}
 		}
 	}
 
@@ -1467,12 +1623,21 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 	// - Only one meek port may be specified per server entry.
 	// - Neither fronted meek nor Conjuure protocols are supported here.
 
-	var sshPort, obfuscatedSSHPort, meekPort, obfuscatedSSHQUICPort, tlsOSSHPort, shadowsocksPort int
+	var sshPort, obfuscatedSSHPort, meekPort, obfuscatedSSHQUICPort,
+		tlsOSSHPort, shadowsocksPort, lightTlsSSHPort, lightQuicSSHPort int
 	var inproxySSHPort, inproxyOSSHPort, inproxyQUICPort, inproxyMeekPort, inproxyTlsOSSHPort, inproxyShadowsocksPort int
 
 	for tunnelProtocol, port := range params.TunnelProtocolPorts {
 
 		if !protocol.TunnelProtocolUsesInproxy(tunnelProtocol) {
+			if protocol.TunnelProtocolUsesLightTLSEgress(tunnelProtocol) {
+				lightTlsSSHPort = port
+				continue
+			}
+			if protocol.TunnelProtocolUsesLightQUICEgress(tunnelProtocol) {
+				lightQuicSSHPort = port
+				continue
+			}
 			switch tunnelProtocol {
 			case protocol.TUNNEL_PROTOCOL_TLS_OBFUSCATED_SSH:
 				tlsOSSHPort = port
@@ -1506,6 +1671,53 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 			case protocol.TUNNEL_PROTOCOL_SHADOWSOCKS_OSSH:
 				inproxyShadowsocksPort = port
 			}
+		}
+	}
+
+	var lightDialAuthorization []byte
+	if usingLight {
+		if params.ServerEntrySignaturePublicKey == "" ||
+			params.ServerEntrySignaturePrivateKey == "" {
+
+			return nil, nil, nil, nil, nil, errors.TraceNew(
+				"Light tunnel protocols require server entry signature keys")
+		}
+
+		signaturePrivateKey, err := base64.StdEncoding.DecodeString(
+			params.ServerEntrySignaturePrivateKey)
+		if err != nil {
+			return nil, nil, nil, nil, nil, errors.Trace(err)
+		}
+		if len(signaturePrivateKey) != ed25519.PrivateKeySize {
+			return nil, nil, nil, nil, nil, errors.TraceNew(
+				"invalid server entry signature private key")
+		}
+
+		verifyPin, err := base64.StdEncoding.DecodeString(
+			lightVerifyPin)
+		if err != nil {
+			return nil, nil, nil, nil, nil, errors.Trace(err)
+		}
+
+		IPAddress := net.ParseIP(params.ServerIPAddress)
+		if IPv4 := IPAddress.To4(); IPv4 != nil {
+			IPAddress = IPv4
+		}
+
+		// When generating a server entry, its Light ports should be kept in sync
+		// with the ports in its signed dial authorization.
+		lightDialAuthorization, err = light.SignTunnelDialAuthorization(
+			ed25519.PrivateKey(signaturePrivateKey),
+			&light.TunnelDialAuthorization{
+				Version:               light.TunnelDialAuthorizationVersion,
+				IPAddress:             IPAddress,
+				VerifyPin:             verifyPin,
+				RootObfuscationSecret: lightRootObfuscationSecretBytes,
+				TLSPort:               uint16(lightTlsSSHPort),
+				QUICPort:              uint16(lightQuicSSHPort),
+			})
+		if err != nil {
+			return nil, nil, nil, nil, nil, errors.Trace(err)
 		}
 	}
 
@@ -1549,6 +1761,9 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 		InproxyMeekPort:                     inproxyMeekPort,
 		InproxyTlsOSSHPort:                  inproxyTlsOSSHPort,
 		InproxyShadowsocksPort:              inproxyShadowsocksPort,
+		LightDialAuthorization:              lightDialAuthorization,
+		LightTlsSSHPort:                     lightTlsSSHPort,
+		LightQuicSSHPort:                    lightQuicSSHPort,
 	}
 
 	if params.ServerEntrySignaturePublicKey != "" {

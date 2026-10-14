@@ -862,22 +862,45 @@ func init() {
 
 		// Specs: server.connectedRequestParams
 
-		{179, "light_proxy_id", unpaddedBase64Converter},
-		{180, "light_proxy_entry_tracker", intConverter},
-		{181, "light_proxy_dial_IPv4", intConverter},
-		{182, "light_proxy_dial_IPv6", intConverter},
-		{183, "light_proxy_dial_failed", intConverter},
+		{179, "light_fallback_proxy_id", unpaddedBase64Converter},
+		{180, "light_fallback_proxy_entry_tracker", intConverter},
+		{181, "light_fallback_proxy_dial_IPv4", intConverter},
+		{182, "light_fallback_proxy_dial_IPv6", intConverter},
+		{183, "light_fallback_proxy_dial_failed", intConverter},
 
-		// Specs: server.baseDialParams
-
-		{184, "tunnel_personal_light_proxy_id", unpaddedBase64Converter},
+		// Key 184 is retired.
 
 		// Specs: server.connectedRequestParams
 
-		{185, "light_proxy_dial_canceled", intConverter},
-		{186, "light_proxy_client_events", nil},
+		{185, "light_fallback_proxy_dial_canceled", intConverter},
+		{186, "light_fallback_proxy_client_events", nil},
 
-		// Next key value = 187
+		// Specs: server.baseDialParams
+
+		{187, "light_sni", nil},
+		{188, "light_tls_profile", nil},
+		{189, "light_tls_fragmented", intConverter},
+		{190, "light_tls_padding", intConverter},
+		{191, "light_quic_version", nil},
+		{192, "light_egress_sni", nil},
+		{193, "light_egress_tls_profile", nil},
+		{194, "light_egress_quic_version", nil},
+		{195, "light_tcp_duration", intConverter},
+		{196, "light_tls_duration", intConverter},
+		{197, "light_quic_duration", intConverter},
+		{198, "light_dial_is_IPv6", intConverter},
+		{199, "light_dial_port_number", intConverter},
+		{200, "light_tls_sent_ticket", intConverter},
+		{201, "light_tls_did_resume", intConverter},
+		{202, "light_quic_sent_ticket", intConverter},
+		{203, "light_quic_did_resume", intConverter},
+		{204, "light_proxy_entry_tracker", intConverter},
+
+		// Specs: server.handshakeRequestParams
+
+		{205, "light_proxy_id", unpaddedBase64Converter},
+
+		// Next key value = 206
 	}
 
 	for _, spec := range packedAPIParameterSpecs {
@@ -963,6 +986,9 @@ func init() {
 		{46, "localTimestamp", nil},
 		{47, "isLocalDerivedTag", nil},
 		{48, "allowUpstreamProxy", nil},
+		{49, "lightDialAuthorization", base64Converter},
+		{50, "lightTlsSSHPort", nil},
+		{51, "lightQuicSSHPort", nil},
 	}
 
 	for _, spec := range packedServerEntryFieldSpecs {

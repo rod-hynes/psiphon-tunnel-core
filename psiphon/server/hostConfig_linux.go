@@ -97,7 +97,7 @@ func configureIptablesAcceptRateLimitChain(config *Config, add bool) error {
 	// - In the "recent" rule case, value[0] specifies --seconds N and value[1] specifies --hitcount N.
 	// - In the other case, value[0] specifies --limit N/sec and value[1] is ignored.
 
-	inproxyAcceptRateLimitRules := func(networkProtocol string, portNumber int, rateLimit [2]int) ([]string, error) {
+	proxyAcceptRateLimitRules := func(networkProtocol string, portNumber int, rateLimit [2]int) ([]string, error) {
 		if rateLimit[0] == 0 {
 			rateLimit[0] = 1000
 		}
@@ -147,13 +147,18 @@ func configureIptablesAcceptRateLimitChain(config *Config, add bool) error {
 			var protocolRules []string
 			var err error
 
-			if protocol.TunnelProtocolUsesInproxy(tunnelProtocol) {
+			if protocol.TunnelProtocolUsesInproxy(tunnelProtocol) ||
+				protocol.TunnelProtocolUsesLight(tunnelProtocol) {
 
+				usesTCP := protocol.TunnelProtocolUsesTCP(tunnelProtocol)
+				if protocol.TunnelProtocolUsesLight(tunnelProtocol) {
+					usesTCP = protocol.TunnelProtocolUsesLightTLSEgress(tunnelProtocol)
+				}
 				networkProtocol := "tcp"
-				if !protocol.TunnelProtocolUsesTCP(tunnelProtocol) {
+				if !usesTCP {
 					networkProtocol = "udp"
 				}
-				protocolRules, err = inproxyAcceptRateLimitRules(networkProtocol, portNumber, rateLimit)
+				protocolRules, err = proxyAcceptRateLimitRules(networkProtocol, portNumber, rateLimit)
 				if err != nil {
 					return errors.Trace(err)
 				}

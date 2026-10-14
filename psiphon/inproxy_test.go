@@ -113,7 +113,7 @@ func runInproxyBrokerDialParametersTest(t *testing.T) error {
 
 	tlsCache := utls.NewLRUClientSessionCache(0)
 
-	manager := NewInproxyBrokerClientManager(config, isProxy, tlsCache)
+	manager := NewInproxyBrokerClientManager(config, isProxy, tlsCache, inproxy.SessionPrivateKey{})
 
 	// Test: no broker specs
 
@@ -139,7 +139,7 @@ func runInproxyBrokerDialParametersTest(t *testing.T) error {
 	}
 	config.SetResolver(resolver.NewResolver(&resolver.NetworkConfig{}, networkID))
 
-	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache)
+	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache, inproxy.SessionPrivateKey{})
 
 	brokerClient, brokerDialParams, err := manager.GetBrokerClient(networkID)
 	if err != nil {
@@ -173,7 +173,7 @@ func runInproxyBrokerDialParametersTest(t *testing.T) error {
 
 	brokerClient.GetBrokerDialCoordinator().BrokerClientRoundTripperSucceeded(roundTripper)
 
-	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache)
+	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache, inproxy.SessionPrivateKey{})
 
 	brokerClient, brokerDialParams, err = manager.GetBrokerClient(networkID)
 	if err != nil {
@@ -250,7 +250,7 @@ func runInproxyBrokerDialParametersTest(t *testing.T) error {
 
 	brokerClient.GetBrokerDialCoordinator().BrokerClientRoundTripperFailed(roundTripper)
 
-	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache)
+	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache, inproxy.SessionPrivateKey{})
 
 	brokerClient, brokerDialParams, err = manager.GetBrokerClient(networkID)
 	if err != nil {
@@ -270,9 +270,9 @@ func runInproxyBrokerDialParametersTest(t *testing.T) error {
 	// Test: no common compartment IDs sent when personal ID is set
 
 	config.InproxyClientPersonalCompartmentID = personalCompartmentID.String()
-	config.InproxyProxyPersonalCompartmentID = personalCompartmentID.String()
+	config.ProxyPersonalCompartmentID = personalCompartmentID.String()
 
-	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache)
+	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache, inproxy.SessionPrivateKey{})
 
 	brokerClient, brokerDialParams, err = manager.GetBrokerClient(networkID)
 	if err != nil {
@@ -301,7 +301,7 @@ func runInproxyBrokerDialParametersTest(t *testing.T) error {
 	}
 	config.SetResolver(resolver.NewResolver(&resolver.NetworkConfig{}, networkID))
 
-	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache)
+	manager = NewInproxyBrokerClientManager(config, isProxy, tlsCache, inproxy.SessionPrivateKey{})
 
 	brokerClient, brokerDialParams, err = manager.GetBrokerClient(networkID)
 	if err != nil {

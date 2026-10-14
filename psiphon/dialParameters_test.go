@@ -171,10 +171,16 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	steeringIPCache := lrucache.NewWithLRU(1*time.Hour, 1*time.Hour, 0)
 
+	makeDialParameters := func(serverEntry *protocol.ServerEntry) (*DialParameters, error) {
+		return MakeDialParameters(
+			clientConfig, steeringIPCache, nil, nil, nil, nil,
+			canReplay, selectProtocol, nil, serverEntry, nil, nil, false, 0)
+	}
+
 	upstreamProxyErrorCallback := func(_ error) {}
 
 	dialParams, err := MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, upstreamProxyErrorCallback, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+		clientConfig, steeringIPCache, nil, nil, upstreamProxyErrorCallback, nil, canReplay, selectProtocol, nil, serverEntries[0], nil, nil, false, 0)
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -298,14 +304,21 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("missing upstreamProxyErrorCallback")
 	}
 
+	// Test: server entries require an obfuscated SSH key
+
+	serverEntryWithoutKey := *serverEntries[0]
+	serverEntryWithoutKey.SshObfuscatedKey = ""
+	if _, err := makeDialParameters(&serverEntryWithoutKey); err == nil {
+		t.Fatal("expected missing sshObfuscatedKey to fail")
+	}
+
 	// Test: no replay after dial reported to fail
 
 	dialErr := errors.TraceNew("dial error")
 
 	dialParams.Failed(clientConfig, dialErr)
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -325,8 +338,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 	testNetworkID = prng.HexString(8)
 	clientConfig.networkIDGetter.FlushCache()
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -346,8 +358,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	dialParams.Succeeded()
 
-	replayDialParams, err := MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	replayDialParams, err := makeDialParameters(serverEntries[0])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -468,8 +479,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("SetParameters failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -491,8 +501,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("SetParameters failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -511,8 +520,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	time.Sleep(1 * time.Second)
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -531,8 +539,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	serverEntries[0].ConfigurationVersion += 1
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -559,16 +566,14 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("SetParameters failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
 
 	dialParams.Succeeded()
 
-	replayDialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	replayDialParams, err = makeDialParameters(serverEntries[0])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -600,8 +605,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("SetParameters failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 
 	if protocol.TunnelProtocolUsesFrontedMeek(tunnelProtocol) {
 		if err == nil {
@@ -630,8 +634,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("SetParameters failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 
 	if protocol.TunnelProtocolIsDirect(tunnelProtocol) {
 		if err == nil {
@@ -661,8 +664,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("SetParameters failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[0])
 
 	if protocol.TunnelProtocolUsesInproxy(tunnelProtocol) {
 		if err == nil {
@@ -689,8 +691,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		// Test: steering IP used in non-replay case
 
-		dialParams, err = MakeDialParameters(
-			clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+		dialParams, err = makeDialParameters(serverEntries[0])
 		if err != nil {
 			t.Fatalf("MakeDialParameters failed: %s", err)
 		}
@@ -707,8 +708,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		setCacheEntry("127.0.0.1")
 
-		dialParams, err = MakeDialParameters(
-			clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+		dialParams, err = makeDialParameters(serverEntries[0])
 		if err != nil {
 			t.Fatalf("MakeDialParameters failed: %s", err)
 		}
@@ -735,8 +735,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		dialParams.Succeeded()
 
-		dialParams, err = MakeDialParameters(
-			clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+		dialParams, err = makeDialParameters(serverEntries[0])
 		if err != nil {
 			t.Fatalf("MakeDialParameters failed: %s", err)
 		}
@@ -753,8 +752,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		setCacheEntry("127.0.0.2")
 
-		dialParams, err = MakeDialParameters(
-			clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+		dialParams, err = makeDialParameters(serverEntries[0])
 		if err != nil {
 			t.Fatalf("MakeDialParameters failed: %s", err)
 		}
@@ -769,8 +767,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		steeringIPCache.Flush()
 
-		dialParams, err = MakeDialParameters(
-			clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+		dialParams, err = makeDialParameters(serverEntries[0])
 		if err != nil {
 			t.Fatalf("MakeDialParameters failed: %s", err)
 		}
@@ -779,8 +776,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		setCacheEntry("127.0.0.3")
 
-		dialParams, err = MakeDialParameters(
-			clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[0], nil, nil, false, 0)
+		dialParams, err = makeDialParameters(serverEntries[0])
 		if err != nil {
 			t.Fatalf("MakeDialParameters failed: %s", err)
 		}
@@ -818,8 +814,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[1], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[1])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -840,8 +835,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	dialParams.Succeeded()
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[1], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[1])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -871,8 +865,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[1], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[1])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -915,6 +908,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 			}
 			return selectProtocol(serverEntry, isPrioritized, prioritizeTunnelProtocol)
 		},
+		nil,
 		serverEntries[2], nil, nil, false, 0)
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
@@ -948,8 +942,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[3], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[3])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -996,8 +989,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[3], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[3])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -1031,8 +1023,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
 	}
 
-	dialParams, err = MakeDialParameters(
-		clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntries[4], nil, nil, false, 0)
+	dialParams, err = makeDialParameters(serverEntries[4])
 	if err != nil {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
@@ -1077,8 +1068,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 			// Pave a replay candidate
 
-			dialParams, err := MakeDialParameters(
-				clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntry, nil, nil, false, 0)
+			dialParams, err := makeDialParameters(serverEntry)
 			if err != nil {
 				t.Fatalf("MakeDialParameters failed: %s", err)
 			}
@@ -1124,8 +1114,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
 
-			dialParams, err := MakeDialParameters(
-				clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntry, nil, nil, false, 0)
+			dialParams, err := makeDialParameters(serverEntry)
 			if err != nil {
 				t.Fatalf("MakeDialParameters failed: %s", err)
 			}
@@ -1147,8 +1136,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
 
-			dialParams, err := MakeDialParameters(
-				clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntry, nil, nil, false, 0)
+			dialParams, err := makeDialParameters(serverEntry)
 			if err != nil {
 				t.Fatalf("MakeDialParameters failed: %s", err)
 			}
@@ -1189,8 +1177,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
 
-			dialParams, err := MakeDialParameters(
-				clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntry, nil, nil, false, 0)
+			dialParams, err := makeDialParameters(serverEntry)
 			if err != nil {
 				t.Fatalf("MakeDialParameters failed: %s", err)
 			}
@@ -1208,8 +1195,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
 
-			dialParams, err := MakeDialParameters(
-				clientConfig, steeringIPCache, nil, nil, nil, nil, canReplay, selectProtocol, serverEntry, nil, nil, false, 0)
+			dialParams, err := makeDialParameters(serverEntry)
 			if err != nil {
 				t.Fatalf("MakeDialParameters failed: %s", err)
 			}
@@ -1421,7 +1407,13 @@ func TestLimitTunnelDialPortNumbers(t *testing.T) {
 	}
 
 	selectProtocol := func(serverEntry *protocol.ServerEntry, _ bool, prioritizeTunnelProtocol string) (string, bool) {
-		protocol, _, ok := constraints.selectProtocol(0, false, false, prioritizeTunnelProtocol, serverEntry)
+		protocol, _, ok := constraints.selectProtocol(
+			0,
+			false,
+			personalPairingProtocolNone,
+			false,
+			prioritizeTunnelProtocol,
+			serverEntry)
 		return protocol, ok
 	}
 
@@ -1487,6 +1479,7 @@ func makeMockServerEntries(
 			IpAddress:                  fmt.Sprintf("192.168.0.%d", i),
 			SshPort:                    prng.Range(10, 19),
 			SshObfuscatedPort:          prng.Range(20, 29),
+			SshObfuscatedKey:           prng.HexString(32),
 			SshObfuscatedQUICPort:      prng.Range(30, 39),
 			SshObfuscatedTapDancePort:  prng.Range(40, 49),
 			SshObfuscatedConjurePort:   prng.Range(50, 59),

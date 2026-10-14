@@ -310,6 +310,7 @@ func runLimitTunnelProtocols(t *testing.T, replayCandidateCount int) {
 		dialParams, err := MakeDialParameters(
 			clientConfig, controller.steeringIPCache, nil, nil, nil, nil, nil,
 			func(*protocol.ServerEntry, bool, string) (string, bool) { return testCase.replayProtocol, true },
+			nil,
 			entry, nil, nil, false, 0)
 		if err != nil || dialParams == nil {
 			t.Fatalf("error creating replay parameters: %v", err)

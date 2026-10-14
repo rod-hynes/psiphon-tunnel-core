@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 
+	tls "github.com/Psiphon-Labs/psiphon-tls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
@@ -46,8 +47,12 @@ func Listen(
 	_ common.Logger,
 	_ func(string, error, common.LogFields),
 	_ string,
+	_ net.PacketConn,
+	_ bool,
 	_ int,
 	_ string,
+	_ *tls.Certificate,
+	_ bool,
 	_ bool) (net.Listener, error) {
 
 	return nil, errors.TraceNew("operation is not enabled")
@@ -67,9 +72,24 @@ func Dial(
 	_ int,
 	_ bool,
 	_ bool,
+	_ string,
 	_ *common.TLSClientSessionCacheWrapper) (net.Conn, error) {
 
 	return nil, errors.TraceNew("operation is not enabled")
+}
+
+type Conn struct {
+	net.Conn
+}
+
+func (*Conn) ExportKeyingMaterial(
+	_ string, _ []byte, _ int) ([]byte, error) {
+
+	return nil, errors.TraceNew("operation is not enabled")
+}
+
+func (*Conn) GetTLSConnectionState() (tls.ConnectionState, error) {
+	return tls.ConnectionState{}, errors.TraceNew("operation is not enabled")
 }
 
 type QUICTransporter struct {
