@@ -176,6 +176,7 @@ var handshakeRequestParams = append(
 			{"missing_server_entry_signature", isBase64String, requestParamOptional},
 			{"missing_server_entry_provider_id", isBase64String, requestParamOptional},
 			{"enable_proxy_protocol_headers", isBooleanFlag, requestParamOptional | requestParamNotLogged},
+			{"light_proxy_id", isUnpaddedBase64String, requestParamOptional | requestParamNotLogged},
 		},
 		baseAndDialParams...),
 	tacticsParams...)
@@ -266,6 +267,21 @@ func handshakeAPIRequestHandler(
 		return nil, errors.Trace(err)
 	}
 
+	// Check the client's expected proxy ID against the verified proxy report.
+	if protocol.TunnelProtocolUsesLight(sshClient.tunnelProtocol) {
+		expectedProxyIDString, err := getStringRequestParam(params, "light_proxy_id")
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		expectedProxyID, err := inproxy.IDFromString(expectedProxyIDString)
+		if err != nil {
+			return nil, errors.TraceMsg(err, "invalid Light proxy ID")
+		}
+		if !expectedProxyID.Equal(sshClient.lightProxyID) {
+			return nil, errors.TraceNew("Light proxy ID mismatch")
+		}
+	}
+
 	sponsorID, _ := getStringRequestParam(params, "sponsor_id")
 	clientVersion, _ := getStringRequestParam(params, "client_version")
 	clientPlatform, _ := getStringRequestParam(params, "client_platform")
@@ -308,6 +324,15 @@ func handshakeAPIRequestHandler(
 	splitTunnelOwnRegion, _ := getBoolStringRequestParam(params, "split_tunnel")
 	splitTunnelOtherRegions, _ := getStringArrayRequestParam(params, "split_tunnel_regions")
 
+	// Limitation: split tunneling is disabled for Light tunnels. See the
+	// split-tunnel TODO in protocolSelectionConstraints.serverSupportedProtocols
+	// in psiphon/controller.go.
+	if protocol.TunnelProtocolUsesLight(sshClient.tunnelProtocol) &&
+		(splitTunnelOwnRegion || len(splitTunnelOtherRegions) > 0) {
+
+		return nil, errors.TraceNew("split tunnel is not supported with Light tunnels")
+	}
+
 	ownRegion := ""
 	if splitTunnelOwnRegion {
 		ownRegion = clientGeoIPData.Country
@@ -334,10 +359,15 @@ func handshakeAPIRequestHandler(
 		responseMarshaler = protocol.CBOREncoding.Marshal
 	}
 
-	tacticsPayload, err := support.TacticsServer.GetTacticsPayload(
-		common.GeoIPData(clientGeoIPData), params, compressTactics)
-	if err != nil {
-		return nil, errors.Trace(err)
+	// Omit client region and tactics updates when the original client IP reported
+	// by the Light proxy is untrusted.
+	var tacticsPayload *tactics.Payload
+	if !sshClient.isUntrustedLightProxy {
+		tacticsPayload, err = support.TacticsServer.GetTacticsPayload(
+			common.GeoIPData(clientGeoIPData), params, compressTactics)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
 	}
 
 	var newTacticsTag string
@@ -398,10 +428,11 @@ func handshakeAPIRequestHandler(
 	// TODO: as a future enhancement, use the packed, CBOR encoding --
 	// protocol.EncodePackedServerEntryFields -- for server entries.
 
-	// Discover new servers
+	// Discover new servers. Skip IP-based discovery when the original client IP
+	// reported by the Light proxy is untrusted.
 
 	var encodedServerList []string
-	if !sshClient.getDisableDiscovery() {
+	if !sshClient.isUntrustedLightProxy && !sshClient.getDisableDiscovery() {
 
 		encodedServerList = support.discovery.DiscoverServers(
 			net.ParseIP(sshClient.getClientIP()))
@@ -468,6 +499,12 @@ func handshakeAPIRequestHandler(
 		clientAddress = net.JoinHostPort(sshClient.getClientIP(), "0")
 	}
 
+	clientRegion := clientGeoIPData.Country
+	if sshClient.isUntrustedLightProxy {
+		clientRegion = ""
+		clientAddress = ""
+	}
+
 	var marshaledTacticsPayload []byte
 	if tacticsPayload != nil {
 		marshaledTacticsPayload, err = responseMarshaler(tacticsPayload)
@@ -480,7 +517,7 @@ func handshakeAPIRequestHandler(
 		Homepages:                homepages,
 		UpgradeClientVersion:     db.GetUpgradeClientVersion(clientVersion, normalizedPlatform),
 		EncodedServerList:        encodedServerList,
-		ClientRegion:             clientGeoIPData.Country,
+		ClientRegion:             clientRegion,
 		ClientAddress:            clientAddress,
 		ServerTimestamp:          common.GetCurrentTimestamp(),
 		ActiveAuthorizationIDs:   handshakeStateInfo.activeAuthorizationIDs,
@@ -707,13 +744,13 @@ var uniqueUserParams = append(
 var connectedRequestParams = append(
 	[]requestParamSpec{
 		{"establishment_duration", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_id", isAnyString, requestParamOptional},
-		{"light_proxy_entry_tracker", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_dial_IPv4", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_dial_IPv6", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_dial_failed", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_dial_canceled", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"light_proxy_client_events", isClientEvent, requestParamOptional | requestParamArray | requestParamNotLogged}},
+		{"light_fallback_proxy_id", isAnyString, requestParamOptional},
+		{"light_fallback_proxy_entry_tracker", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_fallback_proxy_dial_IPv4", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_fallback_proxy_dial_IPv6", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_fallback_proxy_dial_failed", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_fallback_proxy_dial_canceled", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_fallback_proxy_client_events", isClientEvent, requestParamOptional | requestParamArray | requestParamNotLogged}},
 	uniqueUserParams...)
 
 // updateOnConnectedParamNames are connected request parameters which are
@@ -726,12 +763,12 @@ var updateOnConnectedParamNames = append(
 	[]string{
 		"last_connected",
 		"establishment_duration",
-		"light_proxy_id",
-		"light_proxy_entry_tracker",
-		"light_proxy_dial_IPv4",
-		"light_proxy_dial_IPv6",
-		"light_proxy_dial_failed",
-		"light_proxy_dial_canceled",
+		"light_fallback_proxy_id",
+		"light_fallback_proxy_entry_tracker",
+		"light_fallback_proxy_dial_IPv4",
+		"light_fallback_proxy_dial_IPv6",
+		"light_fallback_proxy_dial_failed",
+		"light_fallback_proxy_dial_canceled",
 	},
 	fragmentor.GetUpstreamMetricsNames()...)
 
@@ -746,12 +783,14 @@ func connectedAPIRequestHandler(
 	sshClient *sshClient,
 	params common.APIParameters) ([]byte, error) {
 
+	renameLegacyLightFallbackParams(params)
+
 	err := validateRequestParams(params, connectedRequestParams)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
-	lightProxyClientEvents, _ := getStringArrayRequestParam(params, "light_proxy_client_events")
+	lightFallbackProxyClientEvents, _ := getStringArrayRequestParam(params, "light_fallback_proxy_client_events")
 
 	connectedRequestTime := time.Now().UTC()
 	connectedTime := connectedRequestTime.Truncate(time.Hour)
@@ -771,12 +810,12 @@ func connectedAPIRequestHandler(
 	// tunnel. Prepend the events in case a later status batch arrived first,
 	// keeping both the event order and the earliest events when the report
 	// limit is reached.
-	if len(lightProxyClientEvents) > 0 {
-		count := min(len(lightProxyClientEvents), CLIENT_EVENTS_MAX_COUNT_PER_TUNNEL)
+	if len(lightFallbackProxyClientEvents) > 0 {
+		count := min(len(lightFallbackProxyClientEvents), CLIENT_EVENTS_MAX_COUNT_PER_TUNNEL)
 		remaining := CLIENT_EVENTS_MAX_COUNT_PER_TUNNEL - count
-		sshClient.lightProxyClientEvents = append(
-			lightProxyClientEvents[:count:count],
-			sshClient.lightProxyClientEvents[:min(len(sshClient.lightProxyClientEvents), remaining)]...)
+		sshClient.lightFallbackProxyClientEvents = append(
+			lightFallbackProxyClientEvents[:count:count],
+			sshClient.lightFallbackProxyClientEvents[:min(len(sshClient.lightFallbackProxyClientEvents), remaining)]...)
 	}
 
 	authorizedAccessTypes := sshClient.handshakeState.authorizedAccessTypes
@@ -884,11 +923,31 @@ func connectedAPIRequestHandler(
 	return responsePayload, nil
 }
 
+// renameLegacyLightFallbackParams renames legacy light_proxy_* parameters to
+// light_fallback_proxy_* in connected requests and status payloads.
+// Do not apply it to failed-tunnel records, where light_proxy_id identifies
+// a Light tunnel proxy.
+func renameLegacyLightFallbackParams(params common.APIParameters) {
+	for _, suffix := range []string{
+		"id", "entry_tracker", "dial_IPv4", "dial_IPv6",
+		"dial_failed", "dial_canceled", "client_events",
+	} {
+		oldName := "light_proxy_" + suffix
+		newName := "light_fallback_proxy_" + suffix
+		if value, ok := params[oldName]; ok {
+			if _, ok := params[newName]; !ok {
+				params[newName] = value
+			}
+			delete(params, oldName)
+		}
+	}
+}
+
 var statusRequestParams = baseParams
 
 var statusRequestPayloadParams = []requestParamSpec{
 	{"client_events", isClientEvent, requestParamOptional | requestParamArray | requestParamNotLogged},
-	{"light_proxy_client_events", isClientEvent, requestParamOptional | requestParamArray | requestParamNotLogged},
+	{"light_fallback_proxy_client_events", isClientEvent, requestParamOptional | requestParamArray | requestParamNotLogged},
 }
 
 var remoteServerListStatParams = append(
@@ -945,7 +1004,8 @@ var failedTunnelStatParams = append(
 		{"liveness_test_received_downstream_bytes", isIntString, requestParamOptional | requestParamLogStringAsInt},
 		{"bytes_up", isIntString, requestParamOptional | requestParamLogStringAsInt},
 		{"bytes_down", isIntString, requestParamOptional | requestParamLogStringAsInt},
-		{"tunnel_error", isAnyString, 0}},
+		{"tunnel_error", isAnyString, 0},
+		{"light_proxy_id", isAnyString, requestParamOptional}},
 	baseAndDialParams...)
 
 // statusAPIRequestHandler implements the "status" API request.
@@ -973,13 +1033,15 @@ func statusAPIRequestHandler(
 		return nil, errors.Trace(err)
 	}
 
+	renameLegacyLightFallbackParams(statusData)
+
 	err = validateRequestParams(statusData, statusRequestPayloadParams)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
 	clientEvents, _ := getStringArrayRequestParam(statusData, "client_events")
-	lightProxyClientEvents, _ := getStringArrayRequestParam(statusData, "light_proxy_client_events")
+	lightFallbackProxyClientEvents, _ := getStringArrayRequestParam(statusData, "light_fallback_proxy_client_events")
 
 	// Logs are queued until the input is fully validated. Otherwise, stats
 	// could be double counted if the client has a bug in its request
@@ -1177,16 +1239,16 @@ func statusAPIRequestHandler(
 		sshClient.Unlock()
 	}
 
-	if droppedLogCount > 0 || len(clientEvents) > 0 || len(lightProxyClientEvents) > 0 {
+	if droppedLogCount > 0 || len(clientEvents) > 0 || len(lightFallbackProxyClientEvents) > 0 {
 		sshClient.Lock()
 		sshClient.persistentStatsDroppedLogCount += droppedLogCount
 		remaining := max(0, CLIENT_EVENTS_MAX_COUNT_PER_TUNNEL-len(sshClient.clientEvents))
 		sshClient.clientEvents = append(
 			sshClient.clientEvents, clientEvents[:min(len(clientEvents), remaining)]...)
-		remaining = max(0, CLIENT_EVENTS_MAX_COUNT_PER_TUNNEL-len(sshClient.lightProxyClientEvents))
-		sshClient.lightProxyClientEvents = append(
-			sshClient.lightProxyClientEvents,
-			lightProxyClientEvents[:min(len(lightProxyClientEvents), remaining)]...)
+		remaining = max(0, CLIENT_EVENTS_MAX_COUNT_PER_TUNNEL-len(sshClient.lightFallbackProxyClientEvents))
+		sshClient.lightFallbackProxyClientEvents = append(
+			sshClient.lightFallbackProxyClientEvents,
+			lightFallbackProxyClientEvents[:min(len(lightFallbackProxyClientEvents), remaining)]...)
 		sshClient.Unlock()
 	}
 
@@ -1279,11 +1341,17 @@ func dslAPIRequestHandler(
 		return nil, errors.TraceNew("too many DSL requests")
 	}
 
+	clientIP := sshClient.getClientIP()
+	if sshClient.isUntrustedLightProxy {
+		// The original client IP is untrusted.
+		clientIP = "0.0.0.0"
+	}
+
 	responsePayload, err := dslHandleRequest(
 		sshClient.runCtx,
 		support,
 		nil, // no extendTimeout
-		sshClient.getClientIP(),
+		clientIP,
 		common.GeoIPData(sshClient.getClientGeoIPData()),
 		true, // client request is tunneled
 		requestPayload)
@@ -1571,7 +1639,24 @@ var baseDialParams = []requestParamSpec{
 	{"unique_candidate_estimate", isIntString, requestParamOptional | requestParamLogStringAsInt},
 	{"candidates_moved_to_front", isIntString, requestParamOptional | requestParamLogStringAsInt},
 	{"first_fronted_meek_candidate", isIntString, requestParamOptional | requestParamLogStringAsInt},
-	{"tunnel_personal_light_proxy_id", isAnyString, requestParamOptional},
+	{"light_sni", isDomainOrEmpty, requestParamOptional},
+	{"light_tls_profile", isAnyString, requestParamOptional},
+	{"light_tls_fragmented", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
+	{"light_tls_padding", isIntString, requestParamOptional | requestParamLogStringAsInt},
+	{"light_quic_version", isAnyString, requestParamOptional},
+	{"light_egress_sni", isDomainOrEmpty, requestParamOptional},
+	{"light_egress_tls_profile", isAnyString, requestParamOptional},
+	{"light_egress_quic_version", isAnyString, requestParamOptional},
+	{"light_tcp_duration", isIntString, requestParamOptional | requestParamLogStringAsInt},
+	{"light_tls_duration", isIntString, requestParamOptional | requestParamLogStringAsInt},
+	{"light_quic_duration", isIntString, requestParamOptional | requestParamLogStringAsInt},
+	{"light_dial_is_IPv6", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
+	{"light_dial_port_number", isIntString, requestParamOptional | requestParamLogStringAsInt},
+	{"light_tls_sent_ticket", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
+	{"light_tls_did_resume", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
+	{"light_quic_sent_ticket", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
+	{"light_quic_did_resume", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
+	{"light_proxy_entry_tracker", isIntString, requestParamOptional | requestParamLogStringAsInt},
 }
 
 var inproxyDialParams = []requestParamSpec{
@@ -2275,6 +2360,10 @@ func isDomain(value string) bool {
 		}
 	}
 	return true
+}
+
+func isDomainOrEmpty(value string) bool {
+	return value == "" || isDomain(value)
 }
 
 func isHostHeader(value string) bool {

@@ -217,12 +217,13 @@ func setNoticeFiles(
 }
 
 const (
-	noticeIsDiagnostic    = 1
-	noticeIsHomepage      = 2
-	noticeClearHomepages  = 4
-	noticeSyncHomepages   = 8
-	noticeSkipRedaction   = 16
-	noticeIsNotDiagnostic = 32
+	noticeIsDiagnostic            = 1
+	noticeIsHomepage              = 2
+	noticeClearHomepages          = 4
+	noticeSyncHomepages           = 8
+	noticeSkipRedaction           = 16
+	noticeIsNotDiagnostic         = 32
+	noticeRedactionForDiagnostics = 64
 )
 
 // outputNotice encodes a notice in JSON and writes it to the output writer.
@@ -273,12 +274,16 @@ func (nl *noticeLogger) outputNotice(noticeType string, noticeFlags uint32, args
 	// diagnostics logs.
 
 	skipRedaction := (noticeFlags&noticeSkipRedaction != 0)
+	writerOutput := output
 
 	if !skipRedaction {
 		// Ensure direct server IPs are not exposed in notices. The "net" package,
 		// and possibly other 3rd party packages, will include destination addresses
 		// in I/O error messages.
 		output = common.RedactIPAddresses(output)
+	}
+	if noticeFlags&noticeRedactionForDiagnostics == 0 {
+		writerOutput = output
 	}
 
 	// Don't call RedactFilePaths here, as the file path redaction can
@@ -328,7 +333,7 @@ func (nl *noticeLogger) outputNotice(noticeType string, noticeFlags uint32, args
 	}
 
 	if !skipWriter {
-		_, _ = nl.writer.Write(output)
+		_, _ = nl.writer.Write(writerOutput)
 	}
 }
 
@@ -705,6 +710,13 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 			}
 		}
 
+		if protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
+			metrics := dialParams.GetLightTunnelMetrics()
+			for name, value := range metrics {
+				args = append(args, name, value)
+			}
+		}
+
 		if dialParams.ShadowsocksPrefixSpec != nil {
 			if dialParams.ShadowsocksPrefixSpec.Spec != nil {
 				args = append(args, "ShadowsocksPrefix", dialParams.ShadowsocksPrefixSpec.Name)
@@ -718,8 +730,8 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 			args = append(args, "DSLPrioritizedTunnelProtocol", dialParams.DSLPrioritizedTunnelProtocol)
 		}
 
-		if dialParams.TunnelLightProxyID != "" {
-			args = append(args, "tunnelPersonalLightProxyID", dialParams.TunnelLightProxyID)
+		if dialParams.LightProxyID != "" {
+			args = append(args, "lightProxyID", dialParams.LightProxyID)
 		}
 
 	}
@@ -1220,6 +1232,89 @@ func NoticeInproxyProxyTotalActivity(
 // NoticeLightProxyAvailable indicates that a light proxy is available for use.
 func NoticeLightProxyAvailable() {
 	singletonNoticeLogger.outputNotice("LightProxyAvailable", 0)
+}
+
+// NoticeLightProxyListening reports a bound Light proxy endpoint.
+// The address is unredacted for the host app and redacted in diagnostic files.
+// The host app must also redact the address in its own diagnostics.
+func NoticeLightProxyListening(address, protocol string) {
+	singletonNoticeLogger.outputNotice(
+		"LightProxyListening", noticeRedactionForDiagnostics,
+		"address", address,
+		"protocol", protocol)
+}
+
+// NoticeLightProxyStarted reports that all Light proxy listeners are ready.
+func NoticeLightProxyStarted() {
+	singletonNoticeLogger.outputNotice("LightProxyStarted", 0)
+}
+
+// NoticeLightProxyStopped reports that the hosted Light proxy has stopped.
+// Listener startup failures also emit this notice, without LightProxyStarted.
+func NoticeLightProxyStopped() {
+	singletonNoticeLogger.outputNotice("LightProxyStopped", 0)
+}
+
+// NoticeLightProxyListenError reports a listener startup failure.
+// The address is unredacted for the host app and redacted in diagnostic files.
+// The host app must also redact the address in its own diagnostics.
+func NoticeLightProxyListenError(listenAddress, message string) {
+	singletonNoticeLogger.outputNotice(
+		"LightProxyListenError", noticeRedactionForDiagnostics,
+		"listenAddress", listenAddress,
+		"message", common.RedactIPAddressesString(message))
+}
+
+// NoticeLightProxyActivity reports the hosted Light proxy's current connection
+// count and bytes transferred since the previous update.
+// Requested by EmitLightProxyActivity, this notice is excluded from diagnostics.
+func NoticeLightProxyActivity(
+	currentConnectionCount int64,
+	bytesUp int64,
+	bytesDown int64,
+	bytesDurationMilliseconds int64) {
+
+	singletonNoticeLogger.outputNotice(
+		"LightProxyActivity", noticeIsNotDiagnostic,
+		"currentConnectionCount", currentConnectionCount,
+		"bytesUp", bytesUp,
+		"bytesDown", bytesDown,
+		"bytesDurationMilliseconds", bytesDurationMilliseconds)
+}
+
+// NoticeLightProxyTotalActivity reports the hosted Light proxy's current
+// connection count and byte totals since startup. This is a diagnostic notice.
+func NoticeLightProxyTotalActivity(
+	currentConnectionCount int64,
+	totalBytesUp int64,
+	totalBytesDown int64) {
+
+	singletonNoticeLogger.outputNotice(
+		"LightProxyTotalActivity", noticeIsDiagnostic,
+		"currentConnectionCount", currentConnectionCount,
+		"totalBytesUp", totalBytesUp,
+		"totalBytesDown", totalBytesDown)
+}
+
+// NoticeLightProxyConnection reports the outcome and byte counts when a
+// connection handled by the hosted Light proxy ends.
+func NoticeLightProxyConnection(
+	destinationAddress, failure string,
+	bytesRead, bytesWritten int64) {
+
+	singletonNoticeLogger.outputNotice(
+		"LightProxyConnection", 0,
+		"destinationAddress", destinationAddress,
+		"failure", failure,
+		"bytesRead", bytesRead,
+		"bytesWritten", bytesWritten)
+}
+
+// NoticeLightProxyIrregularConnection reports an irregular Light proxy connection.
+func NoticeLightProxyIrregularConnection(irregularity string) {
+	singletonNoticeLogger.outputNotice(
+		"LightProxyIrregularConnection", 0,
+		"irregularity", irregularity)
 }
 
 // NoticeDSLAccessTokenAvailable indicates that an opaque DSL access token is

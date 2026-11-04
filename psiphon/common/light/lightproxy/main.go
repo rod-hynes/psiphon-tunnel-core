@@ -17,6 +17,9 @@
  *
  */
 
+// Command lightproxy is a test harness for fallback light proxies.
+// Personal and common tunnel modes are not supported; use
+// psiphon.Controller for tunnel proxies.
 package main
 
 import (
@@ -29,9 +32,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	tls "github.com/Psiphon-Labs/psiphon-tls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/buildinfo"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
@@ -39,20 +44,23 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/quic"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tlsdialer"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/transforms"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/internal/testutils"
 	utls "github.com/Psiphon-Labs/utls"
 	"golang.org/x/sync/errgroup"
 )
 
-// This program is primarily intended for testing and does not provide
-// production-grade logging or wire up GeoIP lookup.
+// This program is intended for testing fallback light proxies and does not
+// provide production-grade logging or wire up GeoIP lookup.
 
 func main() {
 
 	var configFilename string
 	var entryFilename string
 	var providerID string
+	var dialAddresses stringListFlag
 	var listenAddresses stringListFlag
 	var dialAddressIPv4 string
 	var dialAddressIPv6 string
@@ -96,21 +104,26 @@ func main() {
 		"generate proxy provider ID; optional")
 
 	flag.Var(
+		&dialAddresses,
+		"dialAddress",
+		"generate proxy dial endpoint: tls://IP:port or quic://IP:port; flag may be repeated")
+
+	flag.Var(
 		&listenAddresses,
 		"listenAddress",
-		"generate proxy listen address; flag may be repeated")
+		"generate proxy listen endpoint; same format and order as dial endpoints; defaults to dial endpoints")
 
 	flag.StringVar(
 		&dialAddressIPv4,
 		"dialAddressIPv4",
 		"",
-		"generate proxy IPv4 dial address")
+		"generate TLS proxy IPv4 dial address; cannot combine with dialAddress")
 
 	flag.StringVar(
 		&dialAddressIPv6,
 		"dialAddressIPv6",
 		"",
-		"generate proxy IPv6 dial address; optional")
+		"generate TLS proxy IPv6 dial address; optional with dialAddressIPv4")
 
 	flag.StringVar(
 		&recommendedSNI,
@@ -181,7 +194,7 @@ func main() {
 		&passthroughAddress,
 		"passthroughAddress",
 		"",
-		"generate passthrough address")
+		"generate passthrough address; required when TLS is enabled")
 
 	flag.StringVar(
 		&splitUpstreamInterfaceName,
@@ -253,11 +266,65 @@ func main() {
 	if args[0] == "generate" {
 		err := func() error {
 
+			if len(dialAddresses) == 0 {
+				if dialAddressIPv4 == "" {
+					return errors.TraceNew("missing dial address")
+				}
+				dialAddresses = append(dialAddresses, dialAddressIPv4)
+				if dialAddressIPv6 != "" {
+					dialAddresses = append(dialAddresses, dialAddressIPv6)
+				}
+			} else if dialAddressIPv4 != "" || dialAddressIPv6 != "" {
+				return errors.TraceNew(
+					"cannot combine dialAddress with legacy dial address flags")
+			}
+
+			parseAddresses := func(addresses []string) ([]light.ProxyAddress, error) {
+				var result []light.ProxyAddress
+				for _, address := range addresses {
+					proxyProtocol := light.LIGHT_PROTOCOL_TLS
+					if scheme, endpoint, ok := strings.Cut(address, "://"); ok {
+						switch strings.ToLower(scheme) {
+						case "tls":
+							proxyProtocol = light.LIGHT_PROTOCOL_TLS
+						case "quic":
+							proxyProtocol = light.LIGHT_PROTOCOL_QUIC
+						default:
+							return nil, errors.TraceNew("unsupported proxy protocol")
+						}
+						address = endpoint
+					}
+
+					host, portString, err := net.SplitHostPort(address)
+					if err != nil {
+						return nil, errors.Trace(err)
+					}
+					port, err := strconv.Atoi(portString)
+					if err != nil {
+						return nil, errors.Trace(err)
+					}
+					result = append(result, light.ProxyAddress{
+						IPAddress: host,
+						Port:      port,
+						Protocol:  proxyProtocol,
+					})
+				}
+				return result, nil
+			}
+
+			proxyDialAddresses, err := parseAddresses(dialAddresses)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			proxyListenAddresses, err := parseAddresses(listenAddresses)
+			if err != nil {
+				return errors.Trace(err)
+			}
+
 			config, entry, err := light.Generate(
 				providerID,
-				[]string(listenAddresses),
-				dialAddressIPv4,
-				dialAddressIPv6,
+				proxyListenAddresses,
+				proxyDialAddresses,
 				recommendedSNI,
 				recommendedSNIRegex,
 				recommendedSNIProbability,
@@ -272,7 +339,9 @@ func main() {
 				nil,
 				nil,
 				nil,
-				passthroughAddress)
+				passthroughAddress,
+				"",
+				"")
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -402,8 +471,10 @@ func runTestLightProxy(
 	}
 
 	var tlsClientSessionCache utls.ClientSessionCache
+	var quicClientSessionCache tls.ClientSessionCache
 	if !disableTLSCache {
 		tlsClientSessionCache = utls.NewLRUClientSessionCache(0)
+		quicClientSessionCache = tls.NewLRUClientSessionCache(0)
 	}
 
 	tlsDialer := func(
@@ -415,8 +486,7 @@ func runTestLightProxy(
 		fragmentClientHello bool,
 		tlsPadding int,
 		passthroughMessage []byte,
-		verifyPin string,
-		verifyServerName string) (net.Conn, error) {
+		verifyPin string) (net.Conn, error) {
 
 		tlsConfig := &tlsdialer.Config{
 			Parameters: params,
@@ -425,7 +495,6 @@ func runTestLightProxy(
 			},
 			UseDialAddrSNI:           false,
 			SNIServerName:            sni,
-			VerifyServerName:         verifyServerName,
 			VerifyPins:               []string{verifyPin},
 			VerifyPinsOnly:           true,
 			TLSProfile:               tlsProfile,
@@ -448,6 +517,67 @@ func runTestLightProxy(
 			tlsConfig)
 	}
 
+	var quicDialer light.ClientQUICDialer
+	if quic.Enabled() {
+		quicDialer = func(
+			ctx context.Context,
+			address string,
+			sni string,
+			quicVersion string,
+			clientHelloSeed *prng.Seed,
+			obfuscatedQUICPaddingSeed *prng.Seed,
+			obfuscatedQUICNonceTransformerParameters *transforms.ObfuscatorSeedTransformerParameters,
+			disablePathMTUDiscovery bool,
+			obfuscationKey string,
+			verifyPin string) (net.Conn, error) {
+
+			remoteAddr, err := net.ResolveUDPAddr("udp", address)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+
+			network, localAddress := "udp4", "0.0.0.0:0"
+			if remoteAddr.IP.To4() == nil {
+				network, localAddress = "udp6", "[::]:0"
+			}
+			listenConfig := net.ListenConfig{}
+			packetConn, err := listenConfig.ListenPacket(
+				ctx, network, localAddress)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+
+			// QUIC requires a cache wrapper; an empty key disables caching.
+			sessionCacheKey := address
+			if disableTLSCache {
+				sessionCacheKey = common.TLS_NULL_SESSION_KEY
+			}
+
+			conn, err := quic.Dial(
+				ctx,
+				packetConn,
+				remoteAddr,
+				sni,
+				quicVersion,
+				clientHelloSeed,
+				obfuscationKey,
+				obfuscatedQUICPaddingSeed,
+				obfuscatedQUICNonceTransformerParameters,
+				disablePathMTUDiscovery,
+				0,
+				false,
+				false,
+				verifyPin,
+				common.WrapClientSessionCache(
+					quicClientSessionCache, sessionCacheKey))
+			if err != nil {
+				packetConn.Close()
+				return nil, errors.Trace(err)
+			}
+			return conn, nil
+		}
+	}
+
 	infoLogSampleRate := float64(10) / float64(workerCount)
 	logger := testutils.NewTestLoggerWithInfoSampling(infoLogSampleRate)
 
@@ -459,6 +589,7 @@ func runTestLightProxy(
 			return conn, errors.Trace(err)
 		},
 		TLSDialer:         tlsDialer,
+		QUICDialer:        quicDialer,
 		SponsorID:         "0000000000000000",
 		ClientPlatform:    "lightproxy",
 		ClientBuildRev:    buildinfo.GetBuildInfo().BuildRev,
@@ -511,16 +642,18 @@ func lightProxyTestFetch(
 				nil,
 				0,
 				"UNKNOWN",
+				"",
 				protocol.TLS_PROFILE_CHROME_133,
 				nil,
+				protocol.QUIC_VERSION_V1,
+				nil,
+				nil,
+				false,
 				"",
 				false,
 				0,
-				address)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-
+				address,
+				nil)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -566,8 +699,16 @@ func (r *proxyEventReceiver) logf(format string, args ...interface{}) {
 	fmt.Printf(format, args...)
 }
 
-func (r *proxyEventReceiver) Listening(address string) {
-	r.logf("[Listening] %s\n", address)
+func (r *proxyEventReceiver) ListeningTCP(address string) {
+	r.logf("[ListeningTCP] %s\n", address)
+}
+
+func (r *proxyEventReceiver) ListeningUDP(address string) {
+	r.logf("[ListeningUDP] %s\n", address)
+}
+
+func (r *proxyEventReceiver) Started() {
+	r.logf("[Started]\n")
 }
 
 func (r *proxyEventReceiver) Paused() {
@@ -602,15 +743,16 @@ func (r *proxyEventReceiver) Connection(stats *light.ConnectionStats) {
 		`proxyConnectionNum: %d, sponsorID: %s, platform: %s, ` +
 		`buildRev: %s, deviceRegion: %s, sessionID: %s, ` +
 		`tracker: %d, networkType: %s, clientConnectionNum: %d, ` +
-		`destination: %s, tlsProfile: %s, sni: %s, ` +
+		`destination: %s, protocol: %s, tlsProfile: %s, quicVersion: %s, sni: %s, ` +
 		`tlsClientHelloFragmented: %t, tlsClientHelloPadding: %d, ` +
 		`tlsDidResume: %t, ` +
-		`clientTCPDuration: %s, clientTLSDuration: %s, ` +
-		`completedTCP: %s, completedTLS: %s, completedLightHeader: %s, ` +
-		`completedUpstreamDNS: %s, completedUpstreamTCP: %s, upstreamDNSCached: %v, ` +
+		`clientTCPDuration: %s, clientTLSDuration: %s, clientQUICDuration: %s, ` +
+		`completedTCP: %s, completedTLS: %s, completedQUIC: %s, completedLightHeader: %s, ` +
+		`completedUpstreamDNS: %s, completedUpstreamTCP: %s, ` +
+		`completedUpstreamTLS: %s, completedUpstreamQUIC: %s, upstreamDNSCached: %v, ` +
 		`proxyProtocolHeaderAdded: %t, proxyProtocolHeaderReplaced: %t, ` +
 		`bytesRead: %d, bytesWritten: %d, ` +
-		`failure: %s` + "\n"
+		`failure: %s, matchedPersonalCompartments: %t` + "\n"
 
 	r.logf(
 		connectionFormat,
@@ -625,24 +767,31 @@ func (r *proxyEventReceiver) Connection(stats *light.ConnectionStats) {
 		stats.NetworkType,
 		stats.ClientConnectionNum,
 		stats.DestinationAddress,
+		stats.Protocol,
 		stats.TLSProfile,
+		stats.QUICVersion,
 		stats.SNI,
 		stats.TLSClientHelloFragmented,
 		stats.TLSClientHelloPadding,
 		stats.TLSDidResume,
 		stats.ClientTCPDuration,
 		stats.ClientTLSDuration,
+		stats.ClientQUICDuration,
 		stats.ProxyCompletedTCP.Format(time.RFC3339Nano),
 		stats.ProxyCompletedTLS.Format(time.RFC3339Nano),
+		stats.ProxyCompletedQUIC.Format(time.RFC3339Nano),
 		stats.ProxyCompletedLightHeader.Format(time.RFC3339Nano),
 		stats.ProxyCompletedUpstreamDNS.Format(time.RFC3339Nano),
 		stats.ProxyCompletedUpstreamTCP.Format(time.RFC3339Nano),
+		stats.ProxyCompletedUpstreamTLS.Format(time.RFC3339Nano),
+		stats.ProxyCompletedUpstreamQUIC.Format(time.RFC3339Nano),
 		stats.UpstreamDNSCached,
 		stats.ProxyProtocolHeaderAdded,
 		stats.ProxyProtocolHeaderReplaced,
 		stats.BytesRead,
 		stats.BytesWritten,
-		stats.Failure)
+		stats.Failure,
+		stats.MatchedPersonalCompartments)
 }
 
 func (r *proxyEventReceiver) IrregularConnection(

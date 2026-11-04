@@ -115,9 +115,9 @@ type Tunnel struct {
 	// Synchronized using controller.clientEventMutex. Client events
 	// attributed to the tunnel and per-tunnel report limit counters are
 	// stored in Tunnel so they naturally share the Tunnel lifetime.
-	clientEvents                       []string
-	clientEventReportedCount           int
-	lightProxyClientEventReportedCount int
+	clientEvents                               []string
+	clientEventReportedCount                   int
+	lightFallbackProxyClientEventReportedCount int
 }
 
 // getCustomParameters helpers wrap the verbose function call chain required
@@ -948,6 +948,19 @@ func dialTunnel(
 			return nil, errors.Trace(err)
 		}
 
+	} else if protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
+
+		lightProxyClient := dialParams.lightProxyClient
+		if lightProxyClient == nil {
+			return nil, errors.TraceNew("missing Light proxy client")
+		}
+
+		dialConn, err = dialLightProxyTunnel(
+			ctx, config, lightProxyClient, dialParams)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+
 	} else if protocol.TunnelProtocolUsesQUIC(dialParams.TunnelProtocol) {
 
 		var packetConn net.PacketConn
@@ -1014,6 +1027,7 @@ func dialTunnel(
 			dialParams.QUICMaxPacketSizeAdjustment,
 			dialParams.QUICDialEarly,
 			dialParams.QUICUseObfuscatedPSK,
+			"",
 			dialParams.quicTLSClientSessionCache)
 		if err != nil {
 			return nil, errors.Trace(err)
@@ -1204,18 +1218,16 @@ func dialTunnel(
 		//
 		// TUNNEL_PROTOCOL_SSH is excepted since its KEX appears in
 		// plaintext, and the protocol is intended to look like SSH on the
-		// wire.
+		// wire. Light tunnels also omit OSSH and carry SSH inside TLS or QUIC.
 		sshClientConfig.ObfuscatedSSHMode = true
 	} else {
-		// For TUNNEL_PROTOCOL_SSH only, the server is expected to randomize
-		// its KEX; setting PeerKEXPRNGSeed will ensure successful negotiation
-		// between two randomized KEXes.
-		if dialParams.ServerEntry.SshObfuscatedKey != "" {
-			sshClientConfig.PeerKEXPRNGSeed, err = protocol.DeriveSSHServerKEXPRNGSeed(
-				dialParams.ServerEntry.SshObfuscatedKey)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
+		// For protocols without OSSH, the server randomizes its KEX;
+		// PeerKEXPRNGSeed ensures successful negotiation between two
+		// randomized KEXes.
+		sshClientConfig.PeerKEXPRNGSeed, err = protocol.DeriveSSHServerKEXPRNGSeed(
+			dialParams.ServerEntry.SshObfuscatedKey)
+		if err != nil {
+			return nil, errors.Trace(err)
 		}
 	}
 

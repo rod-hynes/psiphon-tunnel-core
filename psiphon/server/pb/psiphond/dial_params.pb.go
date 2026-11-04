@@ -115,7 +115,24 @@ type DialParams struct {
 	MeekPayloadPadding                *bool                  `protobuf:"varint,89,opt,name=meek_payload_padding,json=meekPayloadPadding,proto3,oneof" json:"meek_payload_padding,omitempty"`
 	DslPrioritizedReason              *string                `protobuf:"bytes,90,opt,name=dsl_prioritized_reason,json=dslPrioritizedReason,proto3,oneof" json:"dsl_prioritized_reason,omitempty"`
 	DslPrioritizedTunnelProtocol      *string                `protobuf:"bytes,91,opt,name=dsl_prioritized_tunnel_protocol,json=dslPrioritizedTunnelProtocol,proto3,oneof" json:"dsl_prioritized_tunnel_protocol,omitempty"`
-	TunnelPersonalLightProxyId        *string                `protobuf:"bytes,92,opt,name=tunnel_personal_light_proxy_id,json=tunnelPersonalLightProxyId,proto3,oneof" json:"tunnel_personal_light_proxy_id,omitempty"`
+	LightSni                          *string                `protobuf:"bytes,93,opt,name=light_sni,json=lightSni,proto3,oneof" json:"light_sni,omitempty"`
+	LightTlsProfile                   *string                `protobuf:"bytes,94,opt,name=light_tls_profile,json=lightTlsProfile,proto3,oneof" json:"light_tls_profile,omitempty"`
+	LightTlsFragmented                *bool                  `protobuf:"varint,95,opt,name=light_tls_fragmented,json=lightTlsFragmented,proto3,oneof" json:"light_tls_fragmented,omitempty"`
+	LightTlsPadding                   *int64                 `protobuf:"varint,96,opt,name=light_tls_padding,json=lightTlsPadding,proto3,oneof" json:"light_tls_padding,omitempty"`
+	LightQuicVersion                  *string                `protobuf:"bytes,97,opt,name=light_quic_version,json=lightQuicVersion,proto3,oneof" json:"light_quic_version,omitempty"`
+	LightEgressSni                    *string                `protobuf:"bytes,98,opt,name=light_egress_sni,json=lightEgressSni,proto3,oneof" json:"light_egress_sni,omitempty"`
+	LightEgressTlsProfile             *string                `protobuf:"bytes,99,opt,name=light_egress_tls_profile,json=lightEgressTlsProfile,proto3,oneof" json:"light_egress_tls_profile,omitempty"`
+	LightEgressQuicVersion            *string                `protobuf:"bytes,100,opt,name=light_egress_quic_version,json=lightEgressQuicVersion,proto3,oneof" json:"light_egress_quic_version,omitempty"`
+	LightTcpDuration                  *int64                 `protobuf:"varint,101,opt,name=light_tcp_duration,json=lightTcpDuration,proto3,oneof" json:"light_tcp_duration,omitempty"`
+	LightTlsDuration                  *int64                 `protobuf:"varint,102,opt,name=light_tls_duration,json=lightTlsDuration,proto3,oneof" json:"light_tls_duration,omitempty"`
+	LightQuicDuration                 *int64                 `protobuf:"varint,103,opt,name=light_quic_duration,json=lightQuicDuration,proto3,oneof" json:"light_quic_duration,omitempty"`
+	LightDialIs_IPv6                  *bool                  `protobuf:"varint,104,opt,name=light_dial_is_IPv6,json=lightDialIsIPv6,proto3,oneof" json:"light_dial_is_IPv6,omitempty"`
+	LightDialPortNumber               *int64                 `protobuf:"varint,105,opt,name=light_dial_port_number,json=lightDialPortNumber,proto3,oneof" json:"light_dial_port_number,omitempty"`
+	LightTlsSentTicket                *bool                  `protobuf:"varint,106,opt,name=light_tls_sent_ticket,json=lightTlsSentTicket,proto3,oneof" json:"light_tls_sent_ticket,omitempty"`
+	LightTlsDidResume                 *bool                  `protobuf:"varint,107,opt,name=light_tls_did_resume,json=lightTlsDidResume,proto3,oneof" json:"light_tls_did_resume,omitempty"`
+	LightQuicSentTicket               *bool                  `protobuf:"varint,108,opt,name=light_quic_sent_ticket,json=lightQuicSentTicket,proto3,oneof" json:"light_quic_sent_ticket,omitempty"`
+	LightQuicDidResume                *bool                  `protobuf:"varint,109,opt,name=light_quic_did_resume,json=lightQuicDidResume,proto3,oneof" json:"light_quic_did_resume,omitempty"`
+	LightProxyEntryTracker            *int64                 `protobuf:"varint,110,opt,name=light_proxy_entry_tracker,json=lightProxyEntryTracker,proto3,oneof" json:"light_proxy_entry_tracker,omitempty"`
 	unknownFields                     protoimpl.UnknownFields
 	sizeCache                         protoimpl.SizeCache
 }
@@ -787,18 +804,137 @@ func (x *DialParams) GetDslPrioritizedTunnelProtocol() string {
 	return ""
 }
 
-func (x *DialParams) GetTunnelPersonalLightProxyId() string {
-	if x != nil && x.TunnelPersonalLightProxyId != nil {
-		return *x.TunnelPersonalLightProxyId
+func (x *DialParams) GetLightSni() string {
+	if x != nil && x.LightSni != nil {
+		return *x.LightSni
 	}
 	return ""
+}
+
+func (x *DialParams) GetLightTlsProfile() string {
+	if x != nil && x.LightTlsProfile != nil {
+		return *x.LightTlsProfile
+	}
+	return ""
+}
+
+func (x *DialParams) GetLightTlsFragmented() bool {
+	if x != nil && x.LightTlsFragmented != nil {
+		return *x.LightTlsFragmented
+	}
+	return false
+}
+
+func (x *DialParams) GetLightTlsPadding() int64 {
+	if x != nil && x.LightTlsPadding != nil {
+		return *x.LightTlsPadding
+	}
+	return 0
+}
+
+func (x *DialParams) GetLightQuicVersion() string {
+	if x != nil && x.LightQuicVersion != nil {
+		return *x.LightQuicVersion
+	}
+	return ""
+}
+
+func (x *DialParams) GetLightEgressSni() string {
+	if x != nil && x.LightEgressSni != nil {
+		return *x.LightEgressSni
+	}
+	return ""
+}
+
+func (x *DialParams) GetLightEgressTlsProfile() string {
+	if x != nil && x.LightEgressTlsProfile != nil {
+		return *x.LightEgressTlsProfile
+	}
+	return ""
+}
+
+func (x *DialParams) GetLightEgressQuicVersion() string {
+	if x != nil && x.LightEgressQuicVersion != nil {
+		return *x.LightEgressQuicVersion
+	}
+	return ""
+}
+
+func (x *DialParams) GetLightTcpDuration() int64 {
+	if x != nil && x.LightTcpDuration != nil {
+		return *x.LightTcpDuration
+	}
+	return 0
+}
+
+func (x *DialParams) GetLightTlsDuration() int64 {
+	if x != nil && x.LightTlsDuration != nil {
+		return *x.LightTlsDuration
+	}
+	return 0
+}
+
+func (x *DialParams) GetLightQuicDuration() int64 {
+	if x != nil && x.LightQuicDuration != nil {
+		return *x.LightQuicDuration
+	}
+	return 0
+}
+
+func (x *DialParams) GetLightDialIs_IPv6() bool {
+	if x != nil && x.LightDialIs_IPv6 != nil {
+		return *x.LightDialIs_IPv6
+	}
+	return false
+}
+
+func (x *DialParams) GetLightDialPortNumber() int64 {
+	if x != nil && x.LightDialPortNumber != nil {
+		return *x.LightDialPortNumber
+	}
+	return 0
+}
+
+func (x *DialParams) GetLightTlsSentTicket() bool {
+	if x != nil && x.LightTlsSentTicket != nil {
+		return *x.LightTlsSentTicket
+	}
+	return false
+}
+
+func (x *DialParams) GetLightTlsDidResume() bool {
+	if x != nil && x.LightTlsDidResume != nil {
+		return *x.LightTlsDidResume
+	}
+	return false
+}
+
+func (x *DialParams) GetLightQuicSentTicket() bool {
+	if x != nil && x.LightQuicSentTicket != nil {
+		return *x.LightQuicSentTicket
+	}
+	return false
+}
+
+func (x *DialParams) GetLightQuicDidResume() bool {
+	if x != nil && x.LightQuicDidResume != nil {
+		return *x.LightQuicDidResume
+	}
+	return false
+}
+
+func (x *DialParams) GetLightProxyEntryTracker() int64 {
+	if x != nil && x.LightProxyEntryTracker != nil {
+		return *x.LightProxyEntryTracker
+	}
+	return 0
 }
 
 var File_ca_psiphon_psiphond_dial_params_proto protoreflect.FileDescriptor
 
 const file_ca_psiphon_psiphond_dial_params_proto_rawDesc = "" +
 	"\n" +
-	"%ca.psiphon.psiphond/dial_params.proto\x12\x13ca.psiphon.psiphond\x1a\x1fgoogle/protobuf/timestamp.proto\"\xb77\n" +
+	"%ca.psiphon.psiphond/dial_params.proto\x12\x13ca.psiphon.psiphond\x1a\x1fgoogle/protobuf/timestamp.proto\"\xcbA\n" +
 	"\n" +
 	"DialParams\x12*\n" +
 	"\x0econjure_cached\x18\x01 \x01(\bH\x00R\rconjureCached\x88\x01\x01\x12(\n" +
@@ -901,8 +1037,25 @@ const file_ca_psiphon_psiphond_dial_params_proto_rawDesc = "" +
 	"\x1cfirst_fronted_meek_candidate\x18X \x01(\x03HVR\x19firstFrontedMeekCandidate\x88\x01\x01\x125\n" +
 	"\x14meek_payload_padding\x18Y \x01(\bHWR\x12meekPayloadPadding\x88\x01\x01\x129\n" +
 	"\x16dsl_prioritized_reason\x18Z \x01(\tHXR\x14dslPrioritizedReason\x88\x01\x01\x12J\n" +
-	"\x1fdsl_prioritized_tunnel_protocol\x18[ \x01(\tHYR\x1cdslPrioritizedTunnelProtocol\x88\x01\x01\x12G\n" +
-	"\x1etunnel_personal_light_proxy_id\x18\\ \x01(\tHZR\x1atunnelPersonalLightProxyId\x88\x01\x01B\x11\n" +
+	"\x1fdsl_prioritized_tunnel_protocol\x18[ \x01(\tHYR\x1cdslPrioritizedTunnelProtocol\x88\x01\x01\x12 \n" +
+	"\tlight_sni\x18] \x01(\tHZR\blightSni\x88\x01\x01\x12/\n" +
+	"\x11light_tls_profile\x18^ \x01(\tH[R\x0flightTlsProfile\x88\x01\x01\x125\n" +
+	"\x14light_tls_fragmented\x18_ \x01(\bH\\R\x12lightTlsFragmented\x88\x01\x01\x12/\n" +
+	"\x11light_tls_padding\x18` \x01(\x03H]R\x0flightTlsPadding\x88\x01\x01\x121\n" +
+	"\x12light_quic_version\x18a \x01(\tH^R\x10lightQuicVersion\x88\x01\x01\x12-\n" +
+	"\x10light_egress_sni\x18b \x01(\tH_R\x0elightEgressSni\x88\x01\x01\x12<\n" +
+	"\x18light_egress_tls_profile\x18c \x01(\tH`R\x15lightEgressTlsProfile\x88\x01\x01\x12>\n" +
+	"\x19light_egress_quic_version\x18d \x01(\tHaR\x16lightEgressQuicVersion\x88\x01\x01\x121\n" +
+	"\x12light_tcp_duration\x18e \x01(\x03HbR\x10lightTcpDuration\x88\x01\x01\x121\n" +
+	"\x12light_tls_duration\x18f \x01(\x03HcR\x10lightTlsDuration\x88\x01\x01\x123\n" +
+	"\x13light_quic_duration\x18g \x01(\x03HdR\x11lightQuicDuration\x88\x01\x01\x120\n" +
+	"\x12light_dial_is_IPv6\x18h \x01(\bHeR\x0flightDialIsIPv6\x88\x01\x01\x128\n" +
+	"\x16light_dial_port_number\x18i \x01(\x03HfR\x13lightDialPortNumber\x88\x01\x01\x126\n" +
+	"\x15light_tls_sent_ticket\x18j \x01(\bHgR\x12lightTlsSentTicket\x88\x01\x01\x124\n" +
+	"\x14light_tls_did_resume\x18k \x01(\bHhR\x11lightTlsDidResume\x88\x01\x01\x128\n" +
+	"\x16light_quic_sent_ticket\x18l \x01(\bHiR\x13lightQuicSentTicket\x88\x01\x01\x126\n" +
+	"\x15light_quic_did_resume\x18m \x01(\bHjR\x12lightQuicDidResume\x88\x01\x01\x12>\n" +
+	"\x19light_proxy_entry_tracker\x18n \x01(\x03HkR\x16lightProxyEntryTracker\x88\x01\x01B\x11\n" +
 	"\x0f_conjure_cachedB\x10\n" +
 	"\x0e_conjure_delayB\x17\n" +
 	"\x15_conjure_empty_packetB\x12\n" +
@@ -994,8 +1147,26 @@ const file_ca_psiphon_psiphond_dial_params_proto_rawDesc = "" +
 	"\x1d_first_fronted_meek_candidateB\x17\n" +
 	"\x15_meek_payload_paddingB\x19\n" +
 	"\x17_dsl_prioritized_reasonB\"\n" +
-	" _dsl_prioritized_tunnel_protocolB!\n" +
-	"\x1f_tunnel_personal_light_proxy_idBHZFgithub.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/server/pb/psiphondb\x06proto3"
+	" _dsl_prioritized_tunnel_protocolB\f\n" +
+	"\n" +
+	"_light_sniB\x14\n" +
+	"\x12_light_tls_profileB\x17\n" +
+	"\x15_light_tls_fragmentedB\x14\n" +
+	"\x12_light_tls_paddingB\x15\n" +
+	"\x13_light_quic_versionB\x13\n" +
+	"\x11_light_egress_sniB\x1b\n" +
+	"\x19_light_egress_tls_profileB\x1c\n" +
+	"\x1a_light_egress_quic_versionB\x15\n" +
+	"\x13_light_tcp_durationB\x15\n" +
+	"\x13_light_tls_durationB\x16\n" +
+	"\x14_light_quic_durationB\x15\n" +
+	"\x13_light_dial_is_IPv6B\x19\n" +
+	"\x17_light_dial_port_numberB\x18\n" +
+	"\x16_light_tls_sent_ticketB\x17\n" +
+	"\x15_light_tls_did_resumeB\x19\n" +
+	"\x17_light_quic_sent_ticketB\x18\n" +
+	"\x16_light_quic_did_resumeB\x1c\n" +
+	"\x1a_light_proxy_entry_trackerJ\x04\b\\\x10]BHZFgithub.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/server/pb/psiphondb\x06proto3"
 
 var (
 	file_ca_psiphon_psiphond_dial_params_proto_rawDescOnce sync.Once
