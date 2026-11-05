@@ -52,10 +52,7 @@ func listenLightTLSTunnel(
 	}
 
 	listener = tls.NewListener(listener, tlsConfig)
-	additionalMetrics := make(common.LogFields)
-	if passthroughAddress != "" {
-		additionalMetrics["passthrough_address"] = passthroughAddress
-	}
+	additionalMetrics := common.LogFields{"passthrough_address": passthroughAddress}
 
 	return newLightTunnelListener(
 		support,
@@ -153,7 +150,7 @@ func makeLightTunnelTLSConfig(
 	passthroughAddress := support.Config.
 		TunnelProtocolPassthroughAddresses[listenerTunnelProtocol]
 	if passthroughAddress == "" {
-		return config, "", nil
+		return nil, "", errors.TraceNew("missing Light TLS passthrough address")
 	}
 
 	rootObfuscationSecret, err := hex.DecodeString(
@@ -519,14 +516,6 @@ func (conn *LightTunnelConn) GetMetrics() common.LogFields {
 	logFields.Add(conn.proxyReport.GetMetrics())
 	logFields["light_proxy_id"] = conn.proxyID.String()
 	logFields["light_proxy_is_trusted"] = conn.trustedProxy
-
-	if conn.lookupGeoIP != nil && !conn.trustedProxy {
-		clientGeoIPData := conn.lookupGeoIP(conn.clientIP.String())
-		clientGeoIPData.SetLogFieldsWithPrefix(
-			"light_untrusted_",
-			"client",
-			LogFields(logFields))
-	}
 
 	// These egress values are observed by the server, not reported by the proxy.
 	switch conn.expectedEgressProtocol {

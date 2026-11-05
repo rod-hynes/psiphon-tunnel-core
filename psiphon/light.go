@@ -909,12 +909,14 @@ func (conn *lightFallbackProxyConn) Close() error {
 }
 
 type lightProxyEventReceiver struct {
-	config                 *Config
-	started                chan struct{}
-	lastActivityNotice     time.Time
-	currentConnectionCount int64
-	totalBytesUp           int64
-	totalBytesDown         int64
+	config                     *Config
+	started                    chan struct{}
+	lastActivityNotice         time.Time
+	currentConnectionCount     int64
+	totalBytesUp               int64
+	totalBytesDown             int64
+	lastPersonalRegionActivity map[string]light.RegionActivitySnapshot
+	lastCommonRegionActivity   map[string]light.RegionActivitySnapshot
 }
 
 func newLightProxyEventReceiver(config *Config) *lightProxyEventReceiver {
@@ -958,31 +960,42 @@ func (r *lightProxyEventReceiver) Rejected() {
 }
 
 func (r *lightProxyEventReceiver) Connection(stats *light.ConnectionStats) {
-	if r.config.EmitLightProxyActivity {
-		NoticeLightProxyConnection(
-			stats.DestinationAddress,
-			stats.Failure,
-			stats.BytesRead,
-			stats.BytesWritten)
+	if stats.ProxyCompletedLightHeader.IsZero() {
+		// light.Proxy.Run logs pre-header failures through WarningLog.
+		return
 	}
+	NoticeInfo(
+		"light proxy: connection: failure=%s "+
+			"bytesRead=%d bytesWritten=%d matchedPersonalCompartments=%t",
+		stats.Failure,
+		stats.BytesRead,
+		stats.BytesWritten,
+		stats.MatchedPersonalCompartments)
 }
 
 func (r *lightProxyEventReceiver) Activity(stats *light.ActivityStats) {
 	connectionCountChanged := stats.CurrentConnectionCount != r.currentConnectionCount
+	regionActivityChanged :=
+		lightProxyRegionActivityChanged(r.lastPersonalRegionActivity, stats.PersonalRegionActivity) ||
+			lightProxyRegionActivityChanged(r.lastCommonRegionActivity, stats.CommonRegionActivity)
 
 	if r.config.EmitLightProxyActivity &&
-		(stats.BytesUp > 0 || stats.BytesDown > 0 || connectionCountChanged) {
+		(stats.BytesUp > 0 || stats.BytesDown > 0 ||
+			connectionCountChanged || regionActivityChanged) {
 
 		NoticeLightProxyActivity(
 			stats.CurrentConnectionCount,
 			stats.BytesUp,
 			stats.BytesDown,
-			stats.BytesDuration.Milliseconds())
+			stats.BytesDuration.Milliseconds(),
+			stats.PersonalRegionActivity, stats.CommonRegionActivity)
 	}
 
 	r.currentConnectionCount = stats.CurrentConnectionCount
 	r.totalBytesUp += stats.BytesUp
 	r.totalBytesDown += stats.BytesDown
+	r.lastPersonalRegionActivity = stats.PersonalRegionActivity
+	r.lastCommonRegionActivity = stats.CommonRegionActivity
 
 	p := r.config.GetParameters().Get()
 	noticePeriod := p.Duration(parameters.LightTunnelProxyTotalActivityNoticePeriod)
@@ -996,12 +1009,32 @@ func (r *lightProxyEventReceiver) Activity(stats *light.ActivityStats) {
 	}
 }
 
+func lightProxyRegionActivityChanged(
+	previous, current map[string]light.RegionActivitySnapshot) bool {
+
+	for region, activity := range current {
+		last := previous[region]
+		if activity.BytesUp > 0 || activity.BytesDown > 0 ||
+			activity.ConnectingClients != last.ConnectingClients ||
+			activity.ConnectedClients != last.ConnectedClients {
+			return true
+		}
+	}
+	for region, activity := range previous {
+		if _, ok := current[region]; !ok &&
+			(activity.ConnectingClients != 0 || activity.ConnectedClients != 0) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *lightProxyEventReceiver) IrregularConnection(
 	_ string,
 	_ common.GeoIPData,
 	irregularity string) {
 
-	NoticeLightProxyIrregularConnection(irregularity)
+	NoticeWarning("light proxy: irregular connection: %s", irregularity)
 }
 
 func (r *lightProxyEventReceiver) DebugLog(_ string, _ string) {

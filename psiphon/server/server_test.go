@@ -2843,7 +2843,6 @@ func runServer(t *testing.T, runConfig *runServerConfig) {
 	if !expectTrafficFailure {
 
 		waitOnNotification(t, slokSeeded, timeoutSignal, "SLOK seeded timeout exceeded")
-
 		expected := expectedNumSLOKs
 		if doDSL {
 			expected += len(dslTestConfig.clientSLOKs)
@@ -3757,13 +3756,12 @@ func checkExpectedServerTunnelLogFields(
 			if !ok {
 				return fmt.Errorf("missing Light proxy GeoIP field %s", suffix)
 			}
-			if runConfig.trustedLightProxy {
-				expected["client_"+suffix] = value
-				absentFields = append(absentFields, "light_untrusted_client_"+suffix)
-			} else {
-				expected["client_"+suffix] = GEOIP_UNKNOWN_VALUE
-				expected["light_untrusted_client_"+suffix] = value
-			}
+			expected["client_"+suffix] = value
+		}
+		if runConfig.trustedLightProxy {
+			absentFields = append(absentFields, "is_untrusted_client_geoip")
+		} else {
+			expected["is_untrusted_client_geoip"] = true
 		}
 		for name, want := range expected {
 			if fields[name] != want {

@@ -129,11 +129,6 @@ message ServerTunnel {
     optional string light_proxy_isp = 215;
     optional string light_proxy_asn = 216;
     optional string light_proxy_aso = 217;
-    optional string light_untrusted_client_region = 218;
-    optional string light_untrusted_client_city = 219;
-    optional string light_untrusted_client_isp = 220;
-    optional string light_untrusted_client_asn = 221;
-    optional string light_untrusted_client_aso = 222;
     optional string light_egress_tls_sni = 223;
     optional bool light_egress_tls_fragmented = 224;
     optional int64 light_egress_tls_padding = 225;

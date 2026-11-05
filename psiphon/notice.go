@@ -36,6 +36,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/buildinfo"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/light"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/stacktrace"
@@ -101,6 +102,11 @@ func GetEmitNetworkParameters() bool {
 // notices are written to stderr. Notices are newline delimited.
 //
 // writer specifies an alternate io.Writer where notices are to be written.
+//
+// Writes are synchronous and may occur while notice or controller locks are
+// held. Reentrancy is unsupported: the writer and any callback it invokes must
+// not call tunnel-core APIs or emit notices synchronously. Dispatch such work
+// asynchronously and return promptly.
 //
 // Notices are encoded in JSON. Here's an example:
 //
@@ -1184,6 +1190,26 @@ func NoticeInproxyMustUpgrade() {
 		"InproxyMustUpgrade", 0)
 }
 
+// NoticeInproxyProxyStarted reports that the controller is running the proxy.
+func NoticeInproxyProxyStarted() {
+	singletonNoticeLogger.outputNotice("InproxyProxyStarted", 0)
+}
+
+// NoticeInproxyProxyStopped reports that the in-proxy component has stopped,
+// including startup exclusions or failures without a preceding InproxyProxyStarted.
+func NoticeInproxyProxyStopped(reason, message string) {
+
+	singletonNoticeLogger.outputNotice(
+		"InproxyProxyStopped", 0, "reason", reason,
+		"message", common.RedactIPAddressesString(message))
+}
+
+// NoticeInproxyProxyDisallowed reports a tactics restriction. In combined
+// proxy/tunnel mode this does not currently stop the running proxy.
+func NoticeInproxyProxyDisallowed() {
+	singletonNoticeLogger.outputNotice("InproxyProxyDisallowed", 0)
+}
+
 // NoticeInproxyProxyActivity reports proxy usage statistics. The stats are
 // for activity since the last NoticeInproxyProxyActivity report.
 //
@@ -1267,19 +1293,25 @@ func NoticeLightProxyListenError(listenAddress, message string) {
 
 // NoticeLightProxyActivity reports the hosted Light proxy's current connection
 // count and bytes transferred since the previous update.
+// Limitation: aggregate counts include pre-header and passthrough activity
+// without personal/common attribution. Independently sampled aggregate and
+// region counters may also differ at interval boundaries.
 // Requested by EmitLightProxyActivity, this notice is excluded from diagnostics.
 func NoticeLightProxyActivity(
 	currentConnectionCount int64,
 	bytesUp int64,
 	bytesDown int64,
-	bytesDurationMilliseconds int64) {
+	bytesDurationMilliseconds int64,
+	personalRegionActivity, commonRegionActivity map[string]light.RegionActivitySnapshot) {
 
 	singletonNoticeLogger.outputNotice(
 		"LightProxyActivity", noticeIsNotDiagnostic,
 		"currentConnectionCount", currentConnectionCount,
 		"bytesUp", bytesUp,
 		"bytesDown", bytesDown,
-		"bytesDurationMilliseconds", bytesDurationMilliseconds)
+		"bytesDurationMilliseconds", bytesDurationMilliseconds,
+		"personalRegionActivity", personalRegionActivity,
+		"commonRegionActivity", commonRegionActivity)
 }
 
 // NoticeLightProxyTotalActivity reports the hosted Light proxy's current
@@ -1294,27 +1326,6 @@ func NoticeLightProxyTotalActivity(
 		"currentConnectionCount", currentConnectionCount,
 		"totalBytesUp", totalBytesUp,
 		"totalBytesDown", totalBytesDown)
-}
-
-// NoticeLightProxyConnection reports the outcome and byte counts when a
-// connection handled by the hosted Light proxy ends.
-func NoticeLightProxyConnection(
-	destinationAddress, failure string,
-	bytesRead, bytesWritten int64) {
-
-	singletonNoticeLogger.outputNotice(
-		"LightProxyConnection", 0,
-		"destinationAddress", destinationAddress,
-		"failure", failure,
-		"bytesRead", bytesRead,
-		"bytesWritten", bytesWritten)
-}
-
-// NoticeLightProxyIrregularConnection reports an irregular Light proxy connection.
-func NoticeLightProxyIrregularConnection(irregularity string) {
-	singletonNoticeLogger.outputNotice(
-		"LightProxyIrregularConnection", 0,
-		"irregularity", irregularity)
 }
 
 // NoticeDSLAccessTokenAvailable indicates that an opaque DSL access token is

@@ -75,7 +75,8 @@ import (
 //
 // proxyProtocolHeaderMACKeys/proxyProtocolHeaderCustomTLVs/
 // proxyProtocolHeaderTargetDestinationAddresses enable adding PROXY protocol
-// headers to fallback upstream connections. All values are selected by sponsor ID.
+// headers to fallback upstream connections. Targets are hosts without ports,
+// matching psiphond tactics. All values are selected by sponsor ID.
 //
 // passthroughAddress is a psiphon-tls PassthroughAddress and is required for TLS.
 //
@@ -185,6 +186,14 @@ func Generate(
 			return nil, nil, errors.TraceNew(
 				"recommended TLS profile does not support TLS 1.3")
 		}
+	}
+
+	if tunnelProxyID != "" &&
+		(len(proxyProtocolHeaderMACKeys) != 0 ||
+			len(proxyProtocolHeaderCustomTLVs) != 0 ||
+			len(proxyProtocolHeaderTargetDestinationAddresses) != 0) {
+
+		return nil, nil, errors.TraceNew("PROXY protocol headers are unsupported in tunnel mode")
 	}
 
 	_, err = prepareProxyProtocolHeaderConfigs(

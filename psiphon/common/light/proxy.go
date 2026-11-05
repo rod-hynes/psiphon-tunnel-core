@@ -142,6 +142,8 @@ type ProxyConfig struct {
 	ProviderID string `json:",omitempty"`
 
 	// DialAddresses specifies public endpoints paired with ListenAddresses.
+	// In tunnel mode it may be omitted when ListenAddresses is provided;
+	// proxy GeoIP is then unavailable. Distributed entries still need addresses.
 	DialAddresses []ProxyAddress `json:",omitempty"`
 
 	// ListenAddresses specifies local endpoints paired by index with
@@ -238,7 +240,8 @@ type ProxyConfig struct {
 	ProxyProtocolHeaderCustomTLVs map[string]string `json:",omitempty"`
 
 	// ProxyProtocolHeaderTargetDestinationAddresses maps sponsor IDs to
-	// destinations that receive PROXY protocol headers. Fallback mode only.
+	// hosts (domain or IP, without a port) that receive PROXY protocol headers
+	// on any port. Match the requested host, not a resolved IP. Fallback mode only.
 	ProxyProtocolHeaderTargetDestinationAddresses map[string][]string `json:",omitempty"`
 
 	// ProxyLimits provides shared, dynamic proxy limits in both modes.
@@ -368,14 +371,16 @@ type ActivityStats struct {
 	BytesDown              int64
 	BytesDuration          time.Duration
 	CurrentConnectionCount int64
-	RegionActivity         map[string]RegionActivityStats
+	PersonalRegionActivity map[string]RegionActivitySnapshot
+	CommonRegionActivity   map[string]RegionActivitySnapshot
 }
 
-// RegionActivityStats are per-region proxy activity stats.
-type RegionActivityStats struct {
-	BytesUp                int64
-	BytesDown              int64
-	CurrentConnectionCount int64
+// RegionActivitySnapshot holds personal or common activity for one client region.
+type RegionActivitySnapshot struct {
+	BytesUp           int64 `json:"bytesUp"`
+	BytesDown         int64 `json:"bytesDown"`
+	ConnectingClients int64 `json:"connectingClients"`
+	ConnectedClients  int64 `json:"connectedClients"`
 }
 
 // ProxyEventReceiver receives event callbacks from a light proxy, and handles
@@ -475,14 +480,18 @@ type Proxy struct {
 	activityBytesDown      atomic.Int64
 	currentConnectionCount atomic.Int64
 
-	activityRegionsMutex sync.Mutex
-	regionActivity       map[string]*regionActivity
+	personalStatsMutex     sync.Mutex
+	personalRegionActivity map[string]*regionActivity
+
+	commonStatsMutex     sync.Mutex
+	commonRegionActivity map[string]*regionActivity
 }
 
 type regionActivity struct {
-	bytesUp                atomic.Int64
-	bytesDown              atomic.Int64
-	currentConnectionCount atomic.Int64
+	bytesUp           atomic.Int64
+	bytesDown         atomic.Int64
+	connectingClients atomic.Int64
+	connectedClients  atomic.Int64
 }
 
 // NewProxy initializes a Proxy. ProxyConfig, LookupGeoIP, and
@@ -496,12 +505,12 @@ func NewProxy(
 		return nil, errors.TraceNew("invalid config")
 	}
 
-	err := ValidateProxyAddresses(
-		config.DialAddresses, config.ListenAddresses)
+	listenAddresses, err := ValidateProxyConfigAddresses(
+		config.DialAddresses, config.ListenAddresses, !config.TunnelMode)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	protocols := getLightProtocols(config.DialAddresses)
+	protocols := getLightProtocols(listenAddresses)
 	if common.Contains(protocols, LIGHT_PROTOCOL_QUIC) && !quic.Enabled() {
 		return nil, errors.TraceNew("QUIC is not enabled")
 	}
@@ -536,11 +545,6 @@ func NewProxy(
 		}
 	} else if proxyID == "" {
 		return nil, errors.TraceNew("missing proxy ID")
-	}
-
-	listenAddresses := config.ListenAddresses
-	if len(listenAddresses) == 0 {
-		listenAddresses = config.DialAddresses
 	}
 
 	if config.ObfuscationKey == "" {
@@ -787,7 +791,7 @@ func NewProxy(
 			dnsResolverCacheMaxSize)
 	}
 
-	proxyGeoIPData := make([]common.GeoIPData, len(config.DialAddresses))
+	proxyGeoIPData := make([]common.GeoIPData, len(listenAddresses))
 	for i, address := range config.DialAddresses {
 		proxyGeoIPData[i] = lookupGeoIP(address.IPAddress)
 	}
@@ -863,7 +867,8 @@ func NewProxy(
 			0,
 			rateLimiterReapHistoryFrequency,
 			rateLimiterMaxCacheEntries),
-		regionActivity: make(map[string]*regionActivity),
+		personalRegionActivity: make(map[string]*regionActivity),
+		commonRegionActivity:   make(map[string]*regionActivity),
 	}
 
 	if common.Contains(protocols, LIGHT_PROTOCOL_TLS) {
@@ -936,6 +941,13 @@ func validateTunnelProxyConfig(config *ProxyConfig) error {
 			return errors.TraceNew("unexpected tunnel proxy configuration")
 		}
 		return nil
+	}
+
+	if len(config.ProxyProtocolHeaderMACKeys) != 0 ||
+		len(config.ProxyProtocolHeaderCustomTLVs) != 0 ||
+		len(config.ProxyProtocolHeaderTargetDestinationAddresses) != 0 {
+
+		return errors.TraceNew("PROXY protocol headers are unsupported in tunnel mode")
 	}
 
 	if len(config.TunnelDialAuthorizationPublicKey) !=
@@ -1218,12 +1230,27 @@ func (proxy *Proxy) handleConn(
 	conn net.Conn,
 	addressIndex int) (retErr error) {
 
+	var activity *regionActivity
+	connected := false
+	counted := false
 	connToClose := conn
 	defer func() {
 		connToClose.Close()
+		// Limitation: a concurrent TLS Close may count final bytes after this
+		// decrement, so those bytes may be omitted if the region bucket is pruned.
+		if activity != nil {
+			if connected {
+				activity.connectedClients.Add(-1)
+			} else {
+				activity.connectingClients.Add(-1)
+			}
+		}
+		if counted {
+			proxy.currentConnectionCount.Add(-1)
+		}
 	}()
 
-	ingressProtocol := proxy.config.DialAddresses[addressIndex].Protocol
+	ingressProtocol := proxy.listenAddresses[addressIndex].Protocol
 
 	var geoIPData common.GeoIPData
 	var completedTCP time.Time
@@ -1354,15 +1381,7 @@ func (proxy *Proxy) handleConn(
 	if proxy.config.EmitActivity {
 
 		proxy.currentConnectionCount.Add(1)
-		defer proxy.currentConnectionCount.Add(-1)
-
-		activityRegion := proxy.getOrCreateRegionActivity(geoIPData.Country)
-		if activityRegion != nil {
-			bytesCounter.activityRegion = activityRegion
-			defer func() {
-				activityRegion.currentConnectionCount.Add(-1)
-			}()
-		}
+		counted = true
 	}
 
 	// Pre-header there is a fixed deadline and no inactivity timeout.
@@ -1511,6 +1530,13 @@ func (proxy *Proxy) handleConn(
 		isPersonal = true
 	}
 
+	if proxy.config.EmitActivity {
+		activity = proxy.getOrCreateRegionActivity(geoIPData.Country, isPersonal)
+		// Assign before relay or TLS close callbacks can update byte counts
+		// concurrently. Pre-header cancellation only closes the raw connection.
+		bytesCounter.assignByteCountsToActivity(activity)
+	}
+
 	if preHeaderDeadlineTimer != nil {
 		preHeaderDeadlineTimer.Stop()
 	}
@@ -1633,9 +1659,10 @@ func (proxy *Proxy) handleConn(
 	if proxy.config.TunnelMode {
 		addProxyProtocolHeader = false
 	} else if addProxyProtocolHeader {
+		// normalizeDestinationAddress already validated and normalized this host.
+		host, _, _ := net.SplitHostPort(normalizedDestinationAddress)
 		addProxyProtocolHeader =
-			proxyProtocolHeaderConfig.targetDestinationAddresses.Contains(
-				normalizedDestinationAddress)
+			proxyProtocolHeaderConfig.targetDestinationAddresses.Contains(host)
 	}
 
 	if addProxyProtocolHeader {
@@ -1701,6 +1728,15 @@ func (proxy *Proxy) handleConn(
 	upstreamConn = throttledConn
 	if proxy.config.TunnelMode {
 		upstreamConn = NewLightFramingConn(upstreamConn)
+	}
+
+	if activity != nil {
+		// Increment first to avoid a premature prune. A concurrent snapshot may
+		// briefly count the client as both connecting and connected; this is
+		// accepted to keep updates lock-free.
+		activity.connectedClients.Add(1)
+		activity.connectingClients.Add(-1)
+		connected = true
 	}
 
 	copyWithRelayBuffer := func(dst net.Conn, src net.Conn) (int64, error) {
@@ -2100,6 +2136,14 @@ type bytesCounter struct {
 	activityRegion *regionActivity
 }
 
+// assignByteCountsToActivity adds all bytes counted so far to the selected
+// personal or common activity counters and directs future byte updates there.
+func (counter *bytesCounter) assignByteCountsToActivity(activity *regionActivity) {
+	counter.activityRegion = activity
+	activity.bytesUp.Add(counter.bytesRead.Load())
+	activity.bytesDown.Add(counter.bytesWritten.Load())
+}
+
 func (counter *bytesCounter) UpdateProgress(bytesRead, bytesWritten, _ int64) {
 	counter.bytesRead.Add(bytesRead)
 	counter.bytesWritten.Add(bytesWritten)
@@ -2113,45 +2157,53 @@ func (counter *bytesCounter) UpdateProgress(bytesRead, bytesWritten, _ int64) {
 	}
 }
 
-func (proxy *Proxy) getOrCreateRegionActivity(region string) *regionActivity {
+func (proxy *Proxy) getOrCreateRegionActivity(
+	region string, isPersonal bool) *regionActivity {
+
 	if region == "" {
-		return nil
+		region = "None"
 	}
+	mutex := &proxy.commonStatsMutex
+	statsMap := proxy.commonRegionActivity
+	if isPersonal {
+		mutex = &proxy.personalStatsMutex
+		statsMap = proxy.personalRegionActivity
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
 
-	proxy.activityRegionsMutex.Lock()
-	defer proxy.activityRegionsMutex.Unlock()
-
-	stats, ok := proxy.regionActivity[region]
+	stats, ok := statsMap[region]
 	if !ok {
 		stats = &regionActivity{}
-		proxy.regionActivity[region] = stats
+		statsMap[region] = stats
 	}
-	stats.currentConnectionCount.Add(1)
+	stats.connectingClients.Add(1)
 	return stats
 }
 
-func (proxy *Proxy) snapshotAndResetRegionActivity() map[string]RegionActivityStats {
-	proxy.activityRegionsMutex.Lock()
-	defer proxy.activityRegionsMutex.Unlock()
+func (proxy *Proxy) snapshotAndResetRegionActivity(
+	mutex *sync.Mutex,
+	statsMap map[string]*regionActivity) map[string]RegionActivitySnapshot {
 
-	result := make(map[string]RegionActivityStats, len(proxy.regionActivity))
-	var regionsToDelete []string
-	for region, stats := range proxy.regionActivity {
-		snapshot := RegionActivityStats{
-			BytesUp:                stats.bytesUp.Swap(0),
-			BytesDown:              stats.bytesDown.Swap(0),
-			CurrentConnectionCount: stats.currentConnectionCount.Load(),
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	result := make(map[string]RegionActivitySnapshot, len(statsMap))
+	for region, stats := range statsMap {
+		// Read counts first so a concurrent disconnect cannot cause an entry
+		// with unreported bytes to be pruned.
+		snapshot := RegionActivitySnapshot{
+			ConnectingClients: stats.connectingClients.Load(),
+			ConnectedClients:  stats.connectedClients.Load(),
+			BytesUp:           stats.bytesUp.Swap(0),
+			BytesDown:         stats.bytesDown.Swap(0),
 		}
-		if snapshot.BytesUp > 0 ||
-			snapshot.BytesDown > 0 ||
-			snapshot.CurrentConnectionCount > 0 {
+		if snapshot.BytesUp > 0 || snapshot.BytesDown > 0 ||
+			snapshot.ConnectingClients > 0 || snapshot.ConnectedClients > 0 {
 			result[region] = snapshot
 		} else {
-			regionsToDelete = append(regionsToDelete, region)
+			delete(statsMap, region)
 		}
-	}
-	for _, region := range regionsToDelete {
-		delete(proxy.regionActivity, region)
 	}
 	return result
 }
@@ -2183,7 +2235,10 @@ func (proxy *Proxy) emitActivity() {
 		BytesDown:              proxy.activityBytesDown.Swap(0),
 		BytesDuration:          duration,
 		CurrentConnectionCount: proxy.currentConnectionCount.Load(),
-		RegionActivity:         proxy.snapshotAndResetRegionActivity(),
+		PersonalRegionActivity: proxy.snapshotAndResetRegionActivity(
+			&proxy.personalStatsMutex, proxy.personalRegionActivity),
+		CommonRegionActivity: proxy.snapshotAndResetRegionActivity(
+			&proxy.commonStatsMutex, proxy.commonRegionActivity),
 	})
 }
 

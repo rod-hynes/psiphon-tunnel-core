@@ -157,13 +157,12 @@ func runTestLightProxy(
 		proxyProtocolHeaderCustomTLVs = map[string]string{
 			testSponsorID: base64.StdEncoding.EncodeToString(
 				proxyProtocolHeaderCustomTLV)}
-		proxyProtocolHeaderTargetDestinationAddresses = map[string][]string{
-			testSponsorID: {echoAddress}}
-
 		echoHost, echoPortStr, err := net.SplitHostPort(echoAddress)
 		if err != nil {
 			return errors.Trace(err)
 		}
+		proxyProtocolHeaderTargetDestinationAddresses = map[string][]string{
+			testSponsorID: {echoHost}}
 		echoIP := net.ParseIP(echoHost)
 		if echoIP == nil {
 			return errors.TraceNew("invalid echo IP")
@@ -3148,14 +3147,16 @@ func (r *testProxyEventReceiver) Activity(stats *ActivityStats) {
 	r.mutex.Unlock()
 
 	if r.expectedActivityRegion != "" {
-		regionStats, ok := stats.RegionActivity[r.expectedActivityRegion]
-		if ok &&
-			(regionStats.BytesUp > 0 ||
-				regionStats.BytesDown > 0 ||
-				regionStats.CurrentConnectionCount > 0) {
-			r.activityRegionSeenOnce.Do(func() {
-				close(r.activityRegionSeen)
-			})
+		for _, activity := range []map[string]RegionActivitySnapshot{
+			stats.PersonalRegionActivity, stats.CommonRegionActivity,
+		} {
+			regionStats, ok := activity[r.expectedActivityRegion]
+			if ok && (regionStats.BytesUp > 0 || regionStats.BytesDown > 0 ||
+				regionStats.ConnectingClients > 0 || regionStats.ConnectedClients > 0) {
+				r.activityRegionSeenOnce.Do(func() {
+					close(r.activityRegionSeen)
+				})
+			}
 		}
 	}
 
@@ -3418,5 +3419,68 @@ func TestTunnelQUICDerivation(t *testing.T) {
 				t.Fatal("expected distinct address-family QUIC dial seeds")
 			}
 		})
+	}
+}
+
+func TestLightActivityByteCountAssignment(t *testing.T) {
+	for _, isPersonal := range []bool{false, true} {
+		for _, region := range []string{"CA", ""} {
+			t.Run(fmt.Sprintf("Personal=%t/Region=%s", isPersonal, region), func(t *testing.T) {
+				proxy := &Proxy{
+					personalRegionActivity: make(map[string]*regionActivity),
+					commonRegionActivity:   make(map[string]*regionActivity),
+				}
+				activity := proxy.getOrCreateRegionActivity(region, isPersonal)
+				counter := new(bytesCounter)
+				counter.UpdateProgress(7, 11, 0)
+				counter.assignByteCountsToActivity(activity)
+				var workers sync.WaitGroup
+				for i := 0; i < 4; i++ {
+					workers.Add(1)
+					go func() {
+						defer workers.Done()
+						for j := 0; j < 1000; j++ {
+							counter.UpdateProgress(1, 2, 0)
+						}
+					}()
+				}
+				workers.Wait()
+
+				mutex, statsMap, other := &proxy.commonStatsMutex,
+					proxy.commonRegionActivity, proxy.personalRegionActivity
+				if isPersonal {
+					mutex, statsMap, other = &proxy.personalStatsMutex,
+						proxy.personalRegionActivity, proxy.commonRegionActivity
+				}
+				wantRegion := region
+				if wantRegion == "" {
+					wantRegion = "None"
+				}
+				got := proxy.snapshotAndResetRegionActivity(mutex, statsMap)
+				want := RegionActivitySnapshot{
+					BytesUp: 4007, BytesDown: 8011, ConnectingClients: 1,
+				}
+				if len(got) != 1 || got[wantRegion] != want || len(other) != 0 {
+					t.Fatalf("incorrect byte assignment: got %v, other %v", got, other)
+				}
+
+				activity.connectedClients.Add(1)
+				activity.connectingClients.Add(-1)
+				got = proxy.snapshotAndResetRegionActivity(mutex, statsMap)
+				if got[wantRegion] != (RegionActivitySnapshot{ConnectedClients: 1}) {
+					t.Fatalf("active bucket lost or interval bytes not reset: %v", got)
+				}
+				counter.UpdateProgress(3, 5, 0)
+				activity.connectedClients.Add(-1)
+				got = proxy.snapshotAndResetRegionActivity(mutex, statsMap)
+				if got[wantRegion] != (RegionActivitySnapshot{BytesUp: 3, BytesDown: 5}) {
+					t.Fatalf("final bytes were lost after disconnect: %v", got)
+				}
+				got = proxy.snapshotAndResetRegionActivity(mutex, statsMap)
+				if len(got) != 0 || len(statsMap) != 0 {
+					t.Fatal("idle region bucket was not pruned")
+				}
+			})
+		}
 	}
 }

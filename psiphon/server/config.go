@@ -180,6 +180,7 @@ type Config struct {
 	// "TLS-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH",
 	// "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "UNFRONTED-MEEK-OSSH",
 	// "LIGHT-TLS-TLS-SSH", and "LIGHT-QUIC-TLS-SSH".
+	// It is required for every configured Light TLS egress listener.
 	TunnelProtocolPassthroughAddresses map[string]string `json:",omitempty"`
 
 	// LightCertificate is a TLS certificate shared by Light tunnel protocol listeners.
@@ -941,6 +942,10 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 
 		if protocol.TunnelProtocolUsesLight(tunnelProtocol) {
 			if protocol.TunnelProtocolUsesLightTLSEgress(tunnelProtocol) {
+				if config.TunnelProtocolPassthroughAddresses[tunnelProtocol] == "" {
+					return nil, errors.Tracef(
+						"Tunnel protocol %s requires a passthrough address", tunnelProtocol)
+				}
 				if lightTLSListening {
 					return nil, errors.TraceNew(
 						"multiple Light TLS listeners")
@@ -1310,6 +1315,10 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 				if lightTLSListening {
 					return nil, nil, nil, nil, nil, errors.TraceNew(
 						"multiple Light TLS listeners")
+				}
+				if params.TunnelProtocolPassthroughAddresses[tunnelProtocol] == "" {
+					return nil, nil, nil, nil, nil, errors.TraceNew(
+						"missing Light TLS passthrough address")
 				}
 				lightTLSListening = true
 			} else if protocol.TunnelProtocolUsesLightQUICEgress(

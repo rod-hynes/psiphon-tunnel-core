@@ -1598,6 +1598,8 @@ func TestControllerLightProxyLifecycle(t *testing.T) {
 				config.ProxySessionPrivateKey = ""
 			} else {
 				config.InproxyEnableProxy = inproxy.Enabled()
+				// Start before port mapping has discovered public addresses.
+				config.LightProxyDialAddresses = nil
 			}
 			if err := config.Commit(false); err != nil {
 				t.Fatal(err)
@@ -1635,7 +1637,7 @@ func TestControllerLightProxyLifecycle(t *testing.T) {
 				switch name {
 				case "LightProxyListening", "LightProxyStarted",
 					"LightProxyStopped", "LightProxyListenError",
-					"Error", "Exiting":
+					"InproxyProxyStopped", "Error", "Exiting":
 
 					notices <- notice{name: name, data: data}
 				case "Info":
@@ -1682,7 +1684,7 @@ func TestControllerLightProxyLifecycle(t *testing.T) {
 			readListening := func() []light.ProxyAddress {
 				t.Helper()
 				addresses := make(
-					[]light.ProxyAddress, len(config.LightProxyDialAddresses))
+					[]light.ProxyAddress, len(config.LightProxyListenAddresses))
 				for i := range addresses {
 					data := waitNotice("LightProxyListening")
 					host, portString, err := net.SplitHostPort(data["address"].(string))
@@ -1694,7 +1696,7 @@ func TestControllerLightProxyLifecycle(t *testing.T) {
 						t.Fatal("unexpected bound address")
 					}
 					proxyProtocol := data["protocol"].(string)
-					if proxyProtocol != config.LightProxyDialAddresses[i].Protocol {
+					if proxyProtocol != config.LightProxyListenAddresses[i].Protocol {
 						t.Fatal("unexpected listener protocol")
 					}
 					addresses[i] = light.ProxyAddress{
@@ -1891,8 +1893,8 @@ func TestControllerLightProxyLifecycle(t *testing.T) {
 				}
 			} else {
 				if config.InproxyEnableProxy {
-					failure := waitNotice("Error")
-					if failure["message"] != "inproxy proxy: no proxy broker specs" {
+					failure := waitNotice("InproxyProxyStopped")
+					if failure["reason"] != "no_broker_specs" {
 						t.Fatal("unexpected in-proxy startup failure")
 					}
 					controller.runWaitGroup.Wait()
@@ -1909,9 +1911,7 @@ func TestControllerLightProxyLifecycle(t *testing.T) {
 				t.Fatal("Controller.Run did not exit")
 			}
 			waitNotice("LightProxyStopped")
-			if !earlyReturn {
-				waitNotice("Exiting")
-			}
+			waitNotice("Exiting")
 
 			if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 				t.Fatal(err)
@@ -1976,8 +1976,12 @@ func TestControllerInproxyDisallow(t *testing.T) {
 					}
 
 					listening := make(chan string, 1)
+					var stoppedNotice map[string]interface{}
 					err = SetNoticeWriter(NewNoticeReceiver(func(encoded []byte) {
 						noticeType, data, err := GetNotice(encoded)
+						if err == nil && noticeType == "InproxyProxyStopped" {
+							stoppedNotice = data
+						}
 						if err == nil && noticeType == "LightProxyListening" {
 							address, _ := data["address"].(string)
 							listening <- address
@@ -2037,6 +2041,11 @@ func TestControllerInproxyDisallow(t *testing.T) {
 					}
 
 					wantControllerStopped := disableTunnels && !hostedLight
+					if startup && (stoppedNotice == nil ||
+						stoppedNotice["reason"] != "not_allowed") {
+
+						t.Fatalf("unexpected stopped notice: %v", stoppedNotice)
+					}
 					if got := controller.runCtx.Err() != nil; got != wantControllerStopped {
 						t.Fatalf("Controller stopped = %t, want %t", got, wantControllerStopped)
 					}
@@ -2836,10 +2845,81 @@ func TestLightProxyActivity(t *testing.T) {
 			}
 			setPeriod("1h")
 			receiver := newLightProxyEventReceiver(config)
+			for _, emitDiagnostics := range []bool{false, true} {
+				SetEmitDiagnosticNotices(emitDiagnostics, false)
+				receiver.Connection(&light.ConnectionStats{BytesRead: 1, BytesWritten: 2})
+				check(nil)
+				receiver.Connection(&light.ConnectionStats{
+					ProxyCompletedLightHeader: time.Now(),
+					BytesRead:                 1, BytesWritten: 2,
+				})
+				receiver.IrregularConnection("", common.GeoIPData{}, "test irregularity")
+				if emitDiagnostics {
+					check([]string{"Info", "Warning"})
+				} else {
+					check(nil)
+				}
+			}
 			receiver.Activity(&light.ActivityStats{CurrentConnectionCount: 1, BytesUp: 10, BytesDown: 20})
 			check(activityNotices(true))
 			receiver.Activity(&light.ActivityStats{CurrentConnectionCount: 1})
 			check(nil)
+
+			// Kind and region changes must be reported even with unchanged aggregate counts.
+			receiver.Activity(&light.ActivityStats{
+				CurrentConnectionCount: 1,
+				PersonalRegionActivity: map[string]light.RegionActivitySnapshot{
+					"None": {BytesUp: 10, BytesDown: 20, ConnectedClients: 1},
+				},
+			})
+			for _, notice := range notices {
+				regions, ok := notice.data["personalRegionActivity"].(map[string]interface{})
+				if !ok {
+					t.Fatal("missing personal region activity")
+				}
+				activity, ok := regions["None"].(map[string]interface{})
+				if !ok || activity["bytesUp"] != float64(10) ||
+					activity["bytesDown"] != float64(20) ||
+					activity["connectedClients"] != float64(1) {
+					t.Fatal("incorrect None bucket notice")
+				}
+			}
+			check(activityNotices(false))
+			receiver.Activity(&light.ActivityStats{
+				CurrentConnectionCount: 1,
+				PersonalRegionActivity: map[string]light.RegionActivitySnapshot{
+					"None": {ConnectedClients: 1},
+				},
+			})
+			check(nil)
+			// Region bytes can arrive after their aggregate count was reported.
+			receiver.Activity(&light.ActivityStats{
+				CurrentConnectionCount: 1,
+				PersonalRegionActivity: map[string]light.RegionActivitySnapshot{
+					"None": {BytesUp: 1, ConnectedClients: 1},
+				},
+			})
+			check(activityNotices(false))
+			receiver.Activity(&light.ActivityStats{
+				CurrentConnectionCount: 1,
+				CommonRegionActivity: map[string]light.RegionActivitySnapshot{
+					"None": {ConnectedClients: 1},
+				},
+			})
+			check(activityNotices(false))
+			receiver.Activity(&light.ActivityStats{
+				CurrentConnectionCount: 1,
+				CommonRegionActivity: map[string]light.RegionActivitySnapshot{
+					"CA": {ConnectedClients: 1},
+				},
+			})
+			check(activityNotices(false))
+			receiver.Activity(&light.ActivityStats{CurrentConnectionCount: 1})
+			check(activityNotices(false))
+			if len(receiver.lastPersonalRegionActivity) != 0 ||
+				len(receiver.lastCommonRegionActivity) != 0 {
+				t.Fatal("expired region snapshots were retained")
+			}
 
 			receiver.lastActivityNotice = time.Now().Add(-2 * time.Second)
 			receiver.Activity(&light.ActivityStats{CurrentConnectionCount: 1, BytesUp: 1})
@@ -2856,6 +2936,11 @@ func TestLightProxyActivity(t *testing.T) {
 				notices[0].data["currentConnectionCount"] != float64(0) {
 				t.Fatal("incorrect final activity totals")
 			}
+			_, personalRegions := notices[0].data["personalRegionActivity"]
+			_, commonRegions := notices[0].data["commonRegionActivity"]
+			if personalRegions || commonRegions {
+				t.Fatal("total activity must not include region snapshots")
+			}
 			check([]string{"LightProxyTotalActivity", "LightProxyStopped"})
 			newLightProxyEventReceiver(config).Stopped()
 			if len(notices) != 2 || notices[0].data["totalBytesUp"] != float64(0) ||
@@ -2863,6 +2948,11 @@ func TestLightProxyActivity(t *testing.T) {
 				t.Fatal("activity totals did not reset for a new run")
 			}
 			check([]string{"LightProxyTotalActivity", "LightProxyStopped"})
+
+			SetEmitDiagnosticNotices(false, false)
+			newLightProxyEventReceiver(config).Activity(&light.ActivityStats{BytesUp: 1})
+			check(activityNotices(false))
+			SetEmitDiagnosticNotices(true, false)
 		})
 	}
 }

@@ -414,6 +414,7 @@ func NewController(config *Config) (controller *Controller, err error) {
 // Run executes the controller. Run exits if a controller
 // component fails or the parent context is canceled.
 func (controller *Controller) Run(ctx context.Context) {
+	defer NoticeExiting()
 
 	// Exported Controller methods may be called after NewController and
 	// before Run, so no exported method should depend on variables that are
@@ -655,8 +656,6 @@ func (controller *Controller) Run(ctx context.Context) {
 	close(signalDoneShutdown)
 
 	NoticeInfo("exiting controller")
-
-	NoticeExiting()
 }
 
 // SignalComponentFailure notifies the controller that an associated component has failed.
@@ -1046,6 +1045,8 @@ func (controller *Controller) newLightProxy(
 				dialConfig, controller.quicTLSClientSessionCache),
 			PersonalCompartmentID: config.ProxyPersonalCompartmentID,
 		},
+		// Limitation: the hosted proxy currently has no GeoIP lookup, so its
+		// region activity is accumulated in the personal or common None bucket.
 		func(string) common.GeoIPData { return common.GeoIPData{} },
 		eventReceiver)
 	return proxy, errors.Trace(err)
@@ -4738,6 +4739,10 @@ func (controller *Controller) isStopEstablishing() bool {
 
 func (controller *Controller) runInproxyProxy() {
 	defer controller.runWaitGroup.Done()
+	stopReason, stopMessage := "shutdown", ""
+	defer func() {
+		NoticeInproxyProxyStopped(stopReason, stopMessage)
+	}()
 
 	// Keep refreshing tactics for the hosted Light proxy if the in-proxy proxy exits.
 	defer func() {
@@ -4750,6 +4755,16 @@ func (controller *Controller) runInproxyProxy() {
 			go controller.runLightProxyTactics()
 		}
 	}()
+
+	if !inproxy.Enabled() {
+		stopReason = "not_enabled"
+		if controller.config.DisableTunnels &&
+			!controller.config.EnableRunningLightProxy {
+
+			controller.SignalComponentFailure()
+		}
+		return
+	}
 
 	// Obtain and apply tactics before connecting to the broker and
 	// announcing proxies.
@@ -4823,25 +4838,19 @@ func (controller *Controller) runInproxyProxy() {
 	// recheck.
 	haveBrokerSpecs := haveInproxyProxyBrokerSpecs(controller.config)
 
-	if disallowProxy || useUpstreamProxy || !haveBrokerSpecs || !inproxy.Enabled() {
-		if disallowProxy {
-			NoticeError("inproxy proxy: not allowed")
-		}
-		if useUpstreamProxy {
-			NoticeError("inproxy proxy: not run due to upstream proxy configuration")
-		}
-		if !haveBrokerSpecs {
-			NoticeError("inproxy proxy: no proxy broker specs")
-		}
-		if !inproxy.Enabled() {
-			NoticeError("inproxy proxy: inproxy implementation is not enabled")
+	if disallowProxy || useUpstreamProxy || !haveBrokerSpecs {
+		switch {
+		case disallowProxy:
+			stopReason = "not_allowed"
+		case useUpstreamProxy:
+			stopReason = "upstream_proxy"
+		case !haveBrokerSpecs:
+			stopReason = "no_broker_specs"
 		}
 		// Shut down only when neither client tunnels nor a hosted Light proxy
 		// are enabled.
 		if controller.config.DisableTunnels &&
 			!controller.config.EnableRunningLightProxy {
-
-			NoticeError("inproxy proxy: aborting")
 			controller.SignalComponentFailure()
 		}
 		return
@@ -4892,11 +4901,10 @@ func (controller *Controller) runInproxyProxy() {
 				bytesDown,
 				personalRegionActivity,
 				commonRegionActivity)
-
-			lastAnnouncing.Store(announcing)
-			lastActivityConnectingClients.Store(connectingClients)
-			lastActivityConnectedClients.Store(connectedClients)
 		}
+		lastAnnouncing.Store(announcing)
+		lastActivityConnectingClients.Store(connectingClients)
+		lastActivityConnectedClients.Store(connectedClients)
 
 		activityTotalBytesUp.Add(bytesUp)
 		activityTotalBytesDown.Add(bytesDown)
@@ -4928,6 +4936,7 @@ func (controller *Controller) runInproxyProxy() {
 
 	proxyCtx, stopProxy := context.WithCancel(controller.runCtx)
 	defer stopProxy()
+	var stoppedByTactics atomic.Bool
 
 	waitForNetworkConnectivity := func() bool {
 		return controller.inproxyWaitForNetworkConnectivity(proxyCtx)
@@ -4936,7 +4945,10 @@ func (controller *Controller) runInproxyProxy() {
 		networkID string, compressTactics bool, tacticsPayload []byte) bool {
 
 		return controller.inproxyHandleProxyTacticsPayload(
-			stopProxy, networkID, compressTactics, tacticsPayload)
+			func() {
+				stoppedByTactics.Store(true)
+				stopProxy()
+			}, networkID, compressTactics, tacticsPayload)
 	}
 
 	config := &inproxy.ProxyConfig{
@@ -4956,7 +4968,7 @@ func (controller *Controller) runInproxyProxy() {
 
 	proxy, err := inproxy.NewProxy(config)
 	if err != nil {
-		NoticeError("inproxy.NewProxy failed: %v", errors.Trace(err))
+		stopReason, stopMessage = "initialization_failed", errors.Trace(err).Error()
 		if !controller.config.EnableRunningLightProxy {
 			controller.SignalComponentFailure()
 		}
@@ -4965,16 +4977,19 @@ func (controller *Controller) runInproxyProxy() {
 
 	err = controller.inproxyProxyAnnouncementLimits.SetProxy(proxy)
 	if err != nil {
-		NoticeError("inproxy proxy SetProxy failed: %v", errors.Trace(err))
+		stopReason, stopMessage = "announcement_limits_failed", errors.Trace(err).Error()
 		if !controller.config.EnableRunningLightProxy {
 			controller.SignalComponentFailure()
 		}
 		return
 	}
 
-	NoticeInfo("inproxy proxy: running")
+	NoticeInproxyProxyStarted()
 
 	proxy.Run(proxyCtx)
+	if stoppedByTactics.Load() {
+		stopReason = "not_allowed"
+	}
 
 	// Emit one last NoticeInproxyProxyTotalActivity with the final byte counts.
 	NoticeInproxyProxyTotalActivity(
@@ -4984,7 +4999,6 @@ func (controller *Controller) runInproxyProxy() {
 		activityTotalBytesUp.Load(),
 		activityTotalBytesDown.Load())
 
-	NoticeInfo("inproxy proxy: stopped")
 }
 
 // inproxyAwaitProxyBrokerSpecs awaits proxy broker specs or a fresh tactics
@@ -5268,18 +5282,17 @@ func (controller *Controller) inproxyHandleProxyTacticsPayload(
 
 	appliedNewTactics := payload.Tactics != nil
 	now := time.Now()
-	if !appliedNewTactics && now.Sub(controller.inproxyLastStoredTactics) > 1*time.Minute {
+	if !appliedNewTactics && now.Sub(controller.inproxyLastStoredTactics) < 1*time.Minute {
 		// Skip TTL-only disk write.
 		return false
 	}
-	controller.inproxyLastStoredTactics = now
-
 	tacticsRecord, err := tactics.HandleTacticsPayload(
 		GetTacticsStorer(controller.config), networkID, payload)
 	if err != nil {
 		NoticeError("HandleTacticsPayload failed: %v", errors.Trace(err))
 		return false
 	}
+	controller.inproxyLastStoredTactics = now
 
 	if tacticsRecord != nil {
 
@@ -5308,16 +5321,13 @@ func (controller *Controller) inproxyHandleProxyTacticsPayload(
 		p.Close()
 
 		if disallowProxy {
-			NoticeError("inproxy proxy: not allowed")
+			NoticeInproxyProxyDisallowed()
 			if controller.config.DisableTunnels {
-				NoticeError("inproxy proxy: shutdown")
-				if controller.config.EnableRunningLightProxy {
-					stopProxy()
-				} else {
+				stopProxy()
+				if !controller.config.EnableRunningLightProxy {
 					controller.SignalComponentFailure()
 				}
 			}
-
 		}
 	}
 

@@ -909,11 +909,12 @@ type Config struct {
 	// It does not start the proxy. UpstreamProxyURL must be empty.
 	EnableRunningLightProxy bool `json:",omitempty"`
 
-	// EmitLightProxyActivity enables LightProxyActivity and
-	// LightProxyConnection notices.
+	// EmitLightProxyActivity enables LightProxyActivity notices for app activity monitoring.
 	EmitLightProxyActivity bool `json:",omitempty"`
 
 	// LightProxyDialAddresses specifies the proxy's public endpoints.
+	// It may be omitted until port mapping discovers them, provided local
+	// LightProxyListenAddresses are configured. Proxy entries still need addresses.
 	LightProxyDialAddresses []light.ProxyAddress `json:",omitempty"`
 
 	// LightProxyListenAddresses specifies local endpoints paired by index
@@ -2539,14 +2540,13 @@ func (config *Config) validateRunningLightProxyConfig() error {
 			"EnableRunningLightProxy is incompatible with UpstreamProxyURL")
 	}
 
-	err := light.ValidateProxyAddresses(
-		config.LightProxyDialAddresses, config.LightProxyListenAddresses)
+	addresses, err := light.ValidateProxyConfigAddresses(
+		config.LightProxyDialAddresses, config.LightProxyListenAddresses, false)
 	if err != nil {
 		return errors.Trace(err)
 	}
-
 	hasTLS := false
-	for _, address := range config.LightProxyDialAddresses {
+	for _, address := range addresses {
 		switch address.Protocol {
 		case light.LIGHT_PROTOCOL_TLS:
 			hasTLS = true

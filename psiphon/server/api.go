@@ -362,7 +362,7 @@ func handshakeAPIRequestHandler(
 	// Omit client region and tactics updates when the original client IP reported
 	// by the Light proxy is untrusted.
 	var tacticsPayload *tactics.Payload
-	if !sshClient.isUntrustedLightProxy {
+	if !sshClient.isUntrustedClientGeoIP {
 		tacticsPayload, err = support.TacticsServer.GetTacticsPayload(
 			common.GeoIPData(clientGeoIPData), params, compressTactics)
 		if err != nil {
@@ -412,14 +412,14 @@ func handshakeAPIRequestHandler(
 	// log is mostly redundant and set to debug level.
 
 	if IsLogLevelDebug() {
-		logFields := getRequestLogFields(
+		logFields := sshClient.addUntrustedClientGeoIPLogFields(getRequestLogFields(
 			"",
 			"",
 			sshClient.sessionID,
 			clientGeoIPData,
 			handshakeStateInfo.authorizedAccessTypes,
 			params,
-			handshakeRequestParams)
+			handshakeRequestParams))
 		log.WithTraceFields(logFields).Debug("handshake")
 	}
 
@@ -432,7 +432,7 @@ func handshakeAPIRequestHandler(
 	// reported by the Light proxy is untrusted.
 
 	var encodedServerList []string
-	if !sshClient.isUntrustedLightProxy && !sshClient.getDisableDiscovery() {
+	if !sshClient.isUntrustedClientGeoIP && !sshClient.getDisableDiscovery() {
 
 		encodedServerList = support.discovery.DiscoverServers(
 			net.ParseIP(sshClient.getClientIP()))
@@ -500,7 +500,7 @@ func handshakeAPIRequestHandler(
 	}
 
 	clientRegion := clientGeoIPData.Country
-	if sshClient.isUntrustedLightProxy {
+	if sshClient.isUntrustedClientGeoIP {
 		clientRegion = ""
 		clientAddress = ""
 	}
@@ -605,7 +605,7 @@ func getProxyProtocolHeaderConfig(
 	for _, target := range targets {
 		normalizedTargets = append(
 			normalizedTargets,
-			normalizeHostAddress(target))
+			common.NormalizeHostAddress(target))
 	}
 
 	return &proxyProtocolHeaderConfig{
@@ -613,20 +613,6 @@ func getProxyProtocolHeaderConfig(
 		customTLV:                  customTLV,
 		targetDestinationAddresses: common.NewStringLookup(normalizedTargets),
 	}
-}
-
-func normalizeHostAddress(target string) string {
-
-	// Normalize IP address representation.
-	ip := net.ParseIP(target)
-	if ip != nil {
-		return ip.String()
-	}
-
-	// Normalize domain case and remove any trailing .
-	target = strings.TrimSuffix(target, ".")
-	target = strings.ToLower(target)
-	return target
 }
 
 func doHandshakeInproxyBrokerRelay(
@@ -898,14 +884,14 @@ func connectedAPIRequestHandler(
 
 	if logUniqueUser {
 		log.LogRawFieldsWithTimestamp(
-			getRequestLogFields(
+			sshClient.addUntrustedClientGeoIPLogFields(getRequestLogFields(
 				"unique_user",
 				"",
 				sshClient.sessionID,
 				sshClient.getClientGeoIPData(),
 				authorizedAccessTypes,
 				params,
-				uniqueUserParams))
+				uniqueUserParams)))
 	}
 
 	pad_response, _ := getPaddingSizeRequestParam(params, "pad_response")
@@ -1096,14 +1082,14 @@ func statusAPIRequestHandler(
 				continue
 			}
 
-			remoteServerListFields := getRequestLogFields(
+			remoteServerListFields := sshClient.addUntrustedClientGeoIPLogFields(getRequestLogFields(
 				"remote_server_list",
 				"",
 				"", // Use the session_id the client recorded with the event
 				sshClient.getClientGeoIPData(),
 				authorizedAccessTypes,
 				remoteServerListStat,
-				remoteServerListStatParams)
+				remoteServerListStatParams))
 
 			logQueue = append(logQueue, remoteServerListFields)
 		}
@@ -1148,14 +1134,14 @@ func statusAPIRequestHandler(
 				continue
 			}
 
-			failedTunnelFields := getRequestLogFields(
+			failedTunnelFields := sshClient.addUntrustedClientGeoIPLogFields(getRequestLogFields(
 				"failed_tunnel",
 				"",
 				"", // Use the session_id the client recorded with the event
 				sshClient.getClientGeoIPData(),
 				authorizedAccessTypes,
 				failedTunnelStat,
-				failedTunnelStatParams)
+				failedTunnelStatParams))
 
 			// Return a list of servers, identified by server entry tag, that are
 			// invalid and presumed to be deleted. This information is used by clients
@@ -1342,7 +1328,7 @@ func dslAPIRequestHandler(
 	}
 
 	clientIP := sshClient.getClientIP()
-	if sshClient.isUntrustedLightProxy {
+	if sshClient.isUntrustedClientGeoIP {
 		// The original client IP is untrusted.
 		clientIP = "0.0.0.0"
 	}

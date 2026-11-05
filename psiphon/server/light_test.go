@@ -26,14 +26,17 @@ import (
 	std_errors "errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/light"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/osl"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
+	"github.com/patrickmn/go-cache"
 )
 
 func TestLightTunnelConn(t *testing.T) {
@@ -159,15 +162,20 @@ func TestLightTunnelConn(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			transport := &lightCloseTrackingConn{Conn: &testConn{b: frame.Bytes()}}
 			conn := NewLightTunnelConn(
-				&testConn{b: frame.Bytes()},
+				transport,
 				testCase.egressProtocol,
 				func(context.Context) ([]byte, error) { return exporter, nil },
 				testCase.issuerPublicKey,
 				nil,
 				nil)
-			err = conn.initialize(context.Background())
+			server := &sshServer{support: &SupportServices{Config: &Config{}}}
+			result, err := server.handshakeTunnelTransport(conn)
 			if testCase.expectedError != "" {
+				if result != nil || !transport.closed.Load() {
+					t.Fatal("failed report must close transport and return nil")
+				}
 				var irregularErr *light.IrregularTunnelError
 				if !std_errors.As(err, &irregularErr) ||
 					!strings.Contains(err.Error(), testCase.expectedError) {
@@ -181,6 +189,9 @@ func TestLightTunnelConn(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatal(err)
+			}
+			if result != conn || transport.closed.Load() {
+				t.Fatal("successful report must return the live Light connection")
 			}
 			if !conn.initialized.Load() {
 				t.Fatal("tunnel not initialized")
@@ -271,4 +282,47 @@ func TestLightTunnelRejectSplitTunnel(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestUntrustedClientGeoIPLoggingAndOSL(t *testing.T) {
+	client := &sshClient{
+		isUntrustedClientGeoIP:   true,
+		clientGeoIPData:          NewGeoIPData(),
+		untrustedClientGeoIPData: GeoIPData{Country: "CA", ASN: "1234"},
+		sessionID:                "test",
+		sshServer: &sshServer{
+			oslSessionCache: cache.New(cache.NoExpiration, 0),
+			support:         &SupportServices{OSLConfig: &osl.Config{}},
+		},
+		handshakeState: handshakeState{apiParams: common.APIParameters{
+			"propagation_channel_id": "test",
+		}},
+	}
+	fields := client.addUntrustedClientGeoIPLogFields(make(LogFields))
+	if fields["client_region"] != "CA" || fields["client_asn"] != "1234" ||
+		fields["is_untrusted_client_geoip"] != true || client.clientGeoIPData != NewGeoIPData() {
+		t.Fatal("reported GeoIP must be logged without changing policy GeoIP")
+	}
+	client.setOSLConfig()
+	if client.oslClientSeedState == nil {
+		t.Fatal("untrusted client did not create OSL state")
+	}
+	cached := new(osl.ClientSeedState)
+	client.sshServer.oslSessionCache.Set(client.sessionID, cached, cache.NoExpiration)
+	client.setOSLConfig()
+	retained, ok := client.sshServer.oslSessionCache.Get(client.sessionID)
+	if client.oslClientSeedState == nil || client.oslClientSeedState == cached ||
+		!ok || retained != cached {
+		t.Fatal("untrusted client resumed or consumed cached OSL state")
+	}
+}
+
+type lightCloseTrackingConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (conn *lightCloseTrackingConn) Close() error {
+	conn.closed.Store(true)
+	return conn.Conn.Close()
 }

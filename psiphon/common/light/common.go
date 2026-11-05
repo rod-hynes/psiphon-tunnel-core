@@ -92,16 +92,17 @@ func ValidateProxyAddresses(
 		return errors.TraceNew("mismatched dial and listen address counts")
 	}
 
-	seen := make(map[ProxyAddress]bool)
+	err := ValidateProxyListenAddresses(listenAddresses)
+	if err != nil {
+		return errors.Trace(err)
+	}
 	for i, dialAddress := range dialAddresses {
-		if err := dialAddress.validate(false); err != nil {
+		err = dialAddress.validate(false)
+		if err != nil {
 			return errors.Trace(err)
 		}
 
 		listenAddress := listenAddresses[i]
-		if err := listenAddress.validate(true); err != nil {
-			return errors.Trace(err)
-		}
 		if listenAddress.Protocol != dialAddress.Protocol {
 			return errors.TraceNew("mismatched dial and listen protocols")
 		}
@@ -110,18 +111,53 @@ func ValidateProxyAddresses(
 		if dialIsIPv4 != listenIsIPv4 {
 			return errors.TraceNew("mismatched dial and listen IP address families")
 		}
+	}
+	return nil
+}
 
+// ValidateProxyConfigAddresses validates proxy endpoints and returns the
+// effective listen addresses. requireDialAddresses is false for tunnel proxies,
+// whose public addresses may not be known until port mapping completes.
+func ValidateProxyConfigAddresses(
+	dialAddresses, listenAddresses []ProxyAddress,
+	requireDialAddresses bool) ([]ProxyAddress, error) {
+
+	var err error
+	if len(dialAddresses) == 0 && !requireDialAddresses {
+		err = ValidateProxyListenAddresses(listenAddresses)
+	} else {
+		err = ValidateProxyAddresses(dialAddresses, listenAddresses)
+	}
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if len(listenAddresses) == 0 {
+		listenAddresses = dialAddresses
+	}
+	return listenAddresses, nil
+}
+
+// ValidateProxyListenAddresses validates local endpoints without requiring
+// public addresses, which may not be known until port mapping completes.
+func ValidateProxyListenAddresses(addresses []ProxyAddress) error {
+	if len(addresses) == 0 {
+		return errors.TraceNew("missing listen addresses")
+	}
+	seen := make(map[ProxyAddress]bool)
+	for _, address := range addresses {
+		err := address.validate(true)
+		if err != nil {
+			return errors.Trace(err)
+		}
 		// Port zero requests distinct, dynamically assigned listeners.
-		if listenAddress.Port != 0 {
-			listenAddress.IPAddress =
-				net.ParseIP(listenAddress.IPAddress).String()
-			if seen[listenAddress] {
+		if address.Port != 0 {
+			address.IPAddress = net.ParseIP(address.IPAddress).String()
+			if seen[address] {
 				return errors.TraceNew("duplicate listen address")
 			}
-			seen[listenAddress] = true
+			seen[address] = true
 		}
 	}
-
 	return nil
 }
 
@@ -403,11 +439,10 @@ func prepareProxyProtocolHeaderConfigs(
 		}
 		normalizedTargets := make([]string, 0, len(targets))
 		for _, target := range targets {
-			normalizedTarget, err := normalizeDestinationAddress(target)
-			if err != nil {
-				return nil, errors.Trace(err)
+			if target == "" || (net.ParseIP(target) == nil && strings.ContainsAny(target, ":[]")) {
+				return nil, errors.TraceNew("PROXY protocol target must be a host without a port")
 			}
-			normalizedTargets = append(normalizedTargets, normalizedTarget)
+			normalizedTargets = append(normalizedTargets, common.NormalizeHostAddress(target))
 		}
 		proxyProtocolHeaderConfig.targetDestinationAddresses =
 			common.NewStringLookup(normalizedTargets)
@@ -418,25 +453,11 @@ func prepareProxyProtocolHeaderConfigs(
 }
 
 func normalizeDestinationAddress(address string) (string, error) {
-
-	// TODO: make common helper and also use for
-	// psiphon/server.normalizeHostAddress.
-
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return "", errors.Trace(err)
 	}
-
-	// Normalize IP address representation.
-	ip := net.ParseIP(host)
-	if ip != nil {
-		return net.JoinHostPort(ip.String(), port), nil
-	}
-
-	// Normalize domain case and remove any trailing .
-	host = strings.TrimSuffix(host, ".")
-	host = strings.ToLower(host)
-	return net.JoinHostPort(host, port), nil
+	return net.JoinHostPort(common.NormalizeHostAddress(host), port), nil
 }
 
 func encodeClientPlatform(clientPlatform string) uint8 {

@@ -138,11 +138,6 @@ type ServerTunnel struct {
 	LightProxyIsp                                 *string                `protobuf:"bytes,215,opt,name=light_proxy_isp,json=lightProxyIsp,proto3,oneof" json:"light_proxy_isp,omitempty"`
 	LightProxyAsn                                 *string                `protobuf:"bytes,216,opt,name=light_proxy_asn,json=lightProxyAsn,proto3,oneof" json:"light_proxy_asn,omitempty"`
 	LightProxyAso                                 *string                `protobuf:"bytes,217,opt,name=light_proxy_aso,json=lightProxyAso,proto3,oneof" json:"light_proxy_aso,omitempty"`
-	LightUntrustedClientRegion                    *string                `protobuf:"bytes,218,opt,name=light_untrusted_client_region,json=lightUntrustedClientRegion,proto3,oneof" json:"light_untrusted_client_region,omitempty"`
-	LightUntrustedClientCity                      *string                `protobuf:"bytes,219,opt,name=light_untrusted_client_city,json=lightUntrustedClientCity,proto3,oneof" json:"light_untrusted_client_city,omitempty"`
-	LightUntrustedClientIsp                       *string                `protobuf:"bytes,220,opt,name=light_untrusted_client_isp,json=lightUntrustedClientIsp,proto3,oneof" json:"light_untrusted_client_isp,omitempty"`
-	LightUntrustedClientAsn                       *string                `protobuf:"bytes,221,opt,name=light_untrusted_client_asn,json=lightUntrustedClientAsn,proto3,oneof" json:"light_untrusted_client_asn,omitempty"`
-	LightUntrustedClientAso                       *string                `protobuf:"bytes,222,opt,name=light_untrusted_client_aso,json=lightUntrustedClientAso,proto3,oneof" json:"light_untrusted_client_aso,omitempty"`
 	LightEgressTlsSni                             *string                `protobuf:"bytes,223,opt,name=light_egress_tls_sni,json=lightEgressTlsSni,proto3,oneof" json:"light_egress_tls_sni,omitempty"`
 	LightEgressTlsFragmented                      *bool                  `protobuf:"varint,224,opt,name=light_egress_tls_fragmented,json=lightEgressTlsFragmented,proto3,oneof" json:"light_egress_tls_fragmented,omitempty"`
 	LightEgressTlsPadding                         *int64                 `protobuf:"varint,225,opt,name=light_egress_tls_padding,json=lightEgressTlsPadding,proto3,oneof" json:"light_egress_tls_padding,omitempty"`
@@ -983,41 +978,6 @@ func (x *ServerTunnel) GetLightProxyAso() string {
 	return ""
 }
 
-func (x *ServerTunnel) GetLightUntrustedClientRegion() string {
-	if x != nil && x.LightUntrustedClientRegion != nil {
-		return *x.LightUntrustedClientRegion
-	}
-	return ""
-}
-
-func (x *ServerTunnel) GetLightUntrustedClientCity() string {
-	if x != nil && x.LightUntrustedClientCity != nil {
-		return *x.LightUntrustedClientCity
-	}
-	return ""
-}
-
-func (x *ServerTunnel) GetLightUntrustedClientIsp() string {
-	if x != nil && x.LightUntrustedClientIsp != nil {
-		return *x.LightUntrustedClientIsp
-	}
-	return ""
-}
-
-func (x *ServerTunnel) GetLightUntrustedClientAsn() string {
-	if x != nil && x.LightUntrustedClientAsn != nil {
-		return *x.LightUntrustedClientAsn
-	}
-	return ""
-}
-
-func (x *ServerTunnel) GetLightUntrustedClientAso() string {
-	if x != nil && x.LightUntrustedClientAso != nil {
-		return *x.LightUntrustedClientAso
-	}
-	return ""
-}
-
 func (x *ServerTunnel) GetLightEgressTlsSni() string {
 	if x != nil && x.LightEgressTlsSni != nil {
 		return *x.LightEgressTlsSni
@@ -1078,7 +1038,7 @@ var File_ca_psiphon_psiphond_server_tunnel_proto protoreflect.FileDescriptor
 
 const file_ca_psiphon_psiphond_server_tunnel_proto_rawDesc = "" +
 	"\n" +
-	"'ca.psiphon.psiphond/server_tunnel.proto\x12\x13ca.psiphon.psiphond\x1a%ca.psiphon.psiphond/base_params.proto\x1a%ca.psiphon.psiphond/dial_params.proto\x1a-ca.psiphon.psiphond/inproxy_dial_params.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe4a\n" +
+	"'ca.psiphon.psiphond/server_tunnel.proto\x12\x13ca.psiphon.psiphond\x1a%ca.psiphon.psiphond/base_params.proto\x1a%ca.psiphon.psiphond/dial_params.proto\x1a-ca.psiphon.psiphond/inproxy_dial_params.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xee]\n" +
 	"\fServerTunnel\x12E\n" +
 	"\vbase_params\x18\x01 \x01(\v2\x1f.ca.psiphon.psiphond.BaseParamsH\x00R\n" +
 	"baseParams\x88\x01\x01\x12E\n" +
@@ -1199,20 +1159,15 @@ const file_ca_psiphon_psiphond_server_tunnel_proto_rawDesc = "" +
 	"\x10light_proxy_city\x18\xd6\x01 \x01(\tHlR\x0elightProxyCity\x88\x01\x01\x12,\n" +
 	"\x0flight_proxy_isp\x18\xd7\x01 \x01(\tHmR\rlightProxyIsp\x88\x01\x01\x12,\n" +
 	"\x0flight_proxy_asn\x18\xd8\x01 \x01(\tHnR\rlightProxyAsn\x88\x01\x01\x12,\n" +
-	"\x0flight_proxy_aso\x18\xd9\x01 \x01(\tHoR\rlightProxyAso\x88\x01\x01\x12G\n" +
-	"\x1dlight_untrusted_client_region\x18\xda\x01 \x01(\tHpR\x1alightUntrustedClientRegion\x88\x01\x01\x12C\n" +
-	"\x1blight_untrusted_client_city\x18\xdb\x01 \x01(\tHqR\x18lightUntrustedClientCity\x88\x01\x01\x12A\n" +
-	"\x1alight_untrusted_client_isp\x18\xdc\x01 \x01(\tHrR\x17lightUntrustedClientIsp\x88\x01\x01\x12A\n" +
-	"\x1alight_untrusted_client_asn\x18\xdd\x01 \x01(\tHsR\x17lightUntrustedClientAsn\x88\x01\x01\x12A\n" +
-	"\x1alight_untrusted_client_aso\x18\xde\x01 \x01(\tHtR\x17lightUntrustedClientAso\x88\x01\x01\x125\n" +
-	"\x14light_egress_tls_sni\x18\xdf\x01 \x01(\tHuR\x11lightEgressTlsSni\x88\x01\x01\x12C\n" +
-	"\x1blight_egress_tls_fragmented\x18\xe0\x01 \x01(\bHvR\x18lightEgressTlsFragmented\x88\x01\x01\x12=\n" +
-	"\x18light_egress_tls_padding\x18\xe1\x01 \x01(\x03HwR\x15lightEgressTlsPadding\x88\x01\x01\x12B\n" +
-	"\x1blight_egress_tls_did_resume\x18\xe2\x01 \x01(\bHxR\x17lightEgressTlsDidResume\x88\x01\x01\x127\n" +
-	"\x15light_egress_quic_sni\x18\xe3\x01 \x01(\tHyR\x12lightEgressQuicSni\x88\x01\x01\x12D\n" +
-	"\x1clight_egress_quic_did_resume\x18\xe4\x01 \x01(\bHzR\x18lightEgressQuicDidResume\x88\x01\x01\x12S\n" +
-	"#light_matched_personal_compartments\x18\xe5\x01 \x01(\bH{R lightMatchedPersonalCompartments\x88\x01\x01\x12*\n" +
-	"\x0elight_proxy_id\x18\xe6\x01 \x01(\tH|R\flightProxyId\x88\x01\x01B\x0e\n" +
+	"\x0flight_proxy_aso\x18\xd9\x01 \x01(\tHoR\rlightProxyAso\x88\x01\x01\x125\n" +
+	"\x14light_egress_tls_sni\x18\xdf\x01 \x01(\tHpR\x11lightEgressTlsSni\x88\x01\x01\x12C\n" +
+	"\x1blight_egress_tls_fragmented\x18\xe0\x01 \x01(\bHqR\x18lightEgressTlsFragmented\x88\x01\x01\x12=\n" +
+	"\x18light_egress_tls_padding\x18\xe1\x01 \x01(\x03HrR\x15lightEgressTlsPadding\x88\x01\x01\x12B\n" +
+	"\x1blight_egress_tls_did_resume\x18\xe2\x01 \x01(\bHsR\x17lightEgressTlsDidResume\x88\x01\x01\x127\n" +
+	"\x15light_egress_quic_sni\x18\xe3\x01 \x01(\tHtR\x12lightEgressQuicSni\x88\x01\x01\x12D\n" +
+	"\x1clight_egress_quic_did_resume\x18\xe4\x01 \x01(\bHuR\x18lightEgressQuicDidResume\x88\x01\x01\x12S\n" +
+	"#light_matched_personal_compartments\x18\xe5\x01 \x01(\bHvR lightMatchedPersonalCompartments\x88\x01\x01\x12*\n" +
+	"\x0elight_proxy_id\x18\xe6\x01 \x01(\tHwR\flightProxyId\x88\x01\x01B\x0e\n" +
 	"\f_base_paramsB\x0e\n" +
 	"\f_dial_paramsB\x16\n" +
 	"\x14_inproxy_dial_paramsB\x1f\n" +
@@ -1324,12 +1279,7 @@ const file_ca_psiphon_psiphond_server_tunnel_proto_rawDesc = "" +
 	"\x11_light_proxy_cityB\x12\n" +
 	"\x10_light_proxy_ispB\x12\n" +
 	"\x10_light_proxy_asnB\x12\n" +
-	"\x10_light_proxy_asoB \n" +
-	"\x1e_light_untrusted_client_regionB\x1e\n" +
-	"\x1c_light_untrusted_client_cityB\x1d\n" +
-	"\x1b_light_untrusted_client_ispB\x1d\n" +
-	"\x1b_light_untrusted_client_asnB\x1d\n" +
-	"\x1b_light_untrusted_client_asoB\x17\n" +
+	"\x10_light_proxy_asoB\x17\n" +
 	"\x15_light_egress_tls_sniB\x1e\n" +
 	"\x1c_light_egress_tls_fragmentedB\x1b\n" +
 	"\x19_light_egress_tls_paddingB\x1e\n" +
