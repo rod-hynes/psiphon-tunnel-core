@@ -183,9 +183,12 @@ func selectPacketManipulationSpec(
 		parameters.ServerProtocolPacketManipulations)
 
 	// TODO: cache merged per-protocol + "All" lists?
-	specNames, ok := protocolSpecs[targetTunnelProtocol]
-	if !ok {
-		specNames = []string{}
+	//
+	// Light listeners apply specs keyed by either ingress variant, with
+	// duplicates retained.
+	specNames := []string{}
+	for _, tunnelProtocol := range getLightTunnelProtocolIngressVariants(targetTunnelProtocol) {
+		specNames = append(specNames, protocolSpecs[tunnelProtocol]...)
 	}
 
 	allProtocolsSpecNames, ok := protocolSpecs[protocol.TUNNEL_PROTOCOLS_ALL]

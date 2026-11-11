@@ -190,8 +190,10 @@ func (server *TunnelServer) Run() error {
 				return errors.Trace(err)
 			}
 
-		} else if !protocol.TunnelProtocolUsesLight(tunnelProtocol) &&
-			protocol.TunnelProtocolUsesQUIC(tunnelProtocol) {
+			server.sshServer.registerQUICListener(
+				listener.(*lightTunnelListener).Listener.(*quic.Listener))
+
+		} else if protocol.TunnelProtocolUsesQUICOSSH(tunnelProtocol) {
 
 			usesInproxy := protocol.TunnelProtocolUsesInproxy(tunnelProtocol)
 
@@ -271,6 +273,13 @@ func (server *TunnelServer) Run() error {
 
 			if protocol.TunnelProtocolUsesLightTLSEgress(tunnelProtocol) {
 
+				// Sanity check: the tactics listener wraps this listener, so
+				// fragmentation would apply to decrypted Light frames rather
+				// than TCP segments.
+				if protocol.TunnelProtocolIsCompatibleWithFragmentor(tunnelProtocol) {
+					return errors.TraceNew("unexpected fragmentor compatible Light protocol")
+				}
+
 				listener, err = listenLightTLSTunnel(
 					support, listener, tunnelProtocol, listenPort)
 				if err != nil {
@@ -343,6 +352,9 @@ func (server *TunnelServer) Run() error {
 	case <-server.shutdownBroadcast:
 	case err = <-server.listenerError:
 	}
+
+	// Interrupt in-flight transport handshakes.
+	server.sshServer.cancelShutdownCtx()
 
 	for _, listener := range listeners {
 		listener.Close()
@@ -468,6 +480,8 @@ type sshServer struct {
 	establishLimitedCount   atomic.Int64
 	concurrentSSHHandshakes semaphore.Semaphore
 	shutdownBroadcast       <-chan struct{}
+	shutdownCtx             context.Context
+	cancelShutdownCtx       context.CancelFunc
 	sshHostKey              ssh.Signer
 	obfuscatorSeedHistory   *obfuscator.SeedHistory
 	inproxyBrokerSessions   *inproxy.ServerBrokerSessions
@@ -629,11 +643,15 @@ func newSSHServer(
 	//   this process with SIGTSTP or SIGCONT, and handlers call
 	//   sshServer.setEstablishTunnels to stop or resume accepting new clients.
 
+	shutdownCtx, cancelShutdownCtx := context.WithCancel(context.Background())
+
 	sshServer := &sshServer{
 		support:                 support,
 		establishTunnels:        1,
 		concurrentSSHHandshakes: concurrentSSHHandshakes,
 		shutdownBroadcast:       shutdownBroadcast,
+		shutdownCtx:             shutdownCtx,
+		cancelShutdownCtx:       cancelShutdownCtx,
 		sshHostKey:              signer,
 		acceptedClientCounts:    make(map[string]map[string]int64),
 		clients:                 make(map[string]*sshClient),
@@ -1892,7 +1910,10 @@ func (sshServer *sshServer) handleClient(
 
 	// Perform outer-layer transport handshakes for protocols that have not
 	// already completed it. This is done before the SSH handshake semaphore,
-	// so contention does not delay obfuscation mechanisms.
+	// so contention does not delay obfuscation mechanisms. Transport
+	// handshake load is bounded by the host limits set in
+	// configureIptablesAcceptRateLimitChain and by sshHandshakeTimeout, not
+	// by the semaphore.
 	lightTunnelConn, initializeErr :=
 		sshServer.handshakeTunnelTransport(conn)
 
@@ -2126,15 +2147,7 @@ findTunnelConn:
 	}
 
 	initializeCtx, cancelInitialize :=
-		context.WithCancel(context.Background())
-	shutdownDone := make(chan struct{})
-	go func() {
-		select {
-		case <-sshServer.shutdownBroadcast:
-			cancelInitialize()
-		case <-shutdownDone:
-		}
-	}()
+		context.WithCancel(sshServer.shutdownCtx)
 
 	// TODO: add a distinct transportHandshakeTimeout
 	var cancelTimeout context.CancelFunc
@@ -2146,7 +2159,6 @@ findTunnelConn:
 
 	err := initialize(initializeCtx)
 
-	close(shutdownDone)
 	if cancelTimeout != nil {
 		cancelTimeout()
 	}
@@ -2667,11 +2679,11 @@ func newSshClient(
 
 	// In the case of in-proxy tunnel protocols, clientIP and clientGeoIPData
 	// are not set until the original client IP is relayed from the broker
-	// during the handshake. Otherwise, default to the peer (including fronted
-	// meek). Light client GeoIP remains unknown unless handleClient obtains
-	// a trusted original client IP.
+	// during the handshake. Light client IP and GeoIP remain unknown unless
+	// handleClient obtains a trusted original client IP. Otherwise, default
+	// to the peer (including fronted meek).
 
-	if !client.isInproxyTunnelProtocol {
+	if !client.isInproxyTunnelProtocol && !client.isUntrustedClientGeoIP {
 		client.clientIP = peerIP
 		client.clientGeoIPData = peerGeoIPData
 	}
@@ -2830,13 +2842,11 @@ func (sshClient *sshClient) run(
 	// proxy, not the client, and GeoIP targeted replay will apply to the 2nd
 	// hop.
 
-	replayTunnelProtocol := sshClient.tunnelProtocol
-	if protocol.TunnelProtocolUsesLight(replayTunnelProtocol) {
-		// The same Light server listener handles tunnels with TLS or QUIC ingress.
-		// Use its configured protocol so replay writes match packet manipulation
-		// lookups.
-		replayTunnelProtocol = sshClient.sshListener.tunnelProtocol
-	}
+	// Key replay on the listener protocol, which is what the fragmentor and
+	// packet manipulation replay lookups use. sshClient.tunnelProtocol may
+	// instead be a Light ingress variant, a fronted meek HTTP/QUIC override,
+	// or demultiplexed TLS-OSSH.
+	replayTunnelProtocol := sshClient.sshListener.tunnelProtocol
 
 	isReplayCandidate, replayWaitDuration, replayTargetDuration :=
 		sshClient.sshServer.support.ReplayCache.GetReplayTargetDuration(sshClient.peerGeoIPData)
@@ -4135,9 +4145,15 @@ func (sshClient *sshClient) logTunnel(additionalMetrics []LogFields) {
 		// Target this using the client, not peer, GeoIP. In the case of
 		// in-proxy tunnel protocols, the client GeoIP fields will be None
 		// if the handshake does not complete. In that case, no bytes will
-		// have transferred.
+		// have transferred. When the client GeoIP is untrusted, use the same
+		// value as setDestinationBytesMetrics.
 
-		p, err := sshClient.sshServer.support.ServerTacticsParametersCache.Get(sshClient.clientGeoIPData)
+		clientGeoIPData := sshClient.clientGeoIPData
+		if sshClient.isUntrustedClientGeoIP {
+			clientGeoIPData = sshClient.untrustedClientGeoIPData
+		}
+
+		p, err := sshClient.sshServer.support.ServerTacticsParametersCache.Get(clientGeoIPData)
 		if err == nil && !p.IsNil() {
 			destinationBytesMetricsASNs = p.Strings(parameters.DestinationBytesMetricsASNs)
 		}
@@ -4154,7 +4170,8 @@ func (sshClient *sshClient) logTunnel(additionalMetrics []LogFields) {
 
 				sshClient.sshServer.support.destBytesLogger.AddASNBytes(
 					ASN,
-					sshClient.clientGeoIPData,
+					clientGeoIPData,
+					sshClient.isUntrustedClientGeoIP,
 					sshClient.handshakeState.apiParams,
 					destinationBytesMetrics.tcpMetrics.getBytesUp()+
 						destinationBytesMetrics.tcpMetrics.getBytesDown(),
@@ -4951,9 +4968,18 @@ func (sshClient *sshClient) setDestinationBytesMetrics() {
 	// Use the client, not peer, GeoIP data. In the case of in-proxy tunnel
 	// protocols, the client GeoIP fields will be populated using the
 	// original client IP already received, from the broker, in the handshake.
+	//
+	// When the client GeoIP is untrusted, the untrusted value is used here
+	// since this is a stats-only case: no tactics are sent to the client,
+	// and a false GeoIP reveals nothing. This is the same as logTunnel.
+
+	clientGeoIPData := sshClient.clientGeoIPData
+	if sshClient.isUntrustedClientGeoIP {
+		clientGeoIPData = sshClient.untrustedClientGeoIPData
+	}
 
 	p, err := sshClient.sshServer.support.ServerTacticsParametersCache.Get(
-		sshClient.clientGeoIPData)
+		clientGeoIPData)
 	if err != nil {
 		log.WithTraceFields(LogFields{"error": err}).Warning("get tactics failed")
 		return

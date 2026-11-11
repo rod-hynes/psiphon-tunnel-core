@@ -3624,7 +3624,8 @@ func StoreCommonLightTunnelProxyEntry(
 
 	proxyEntryHash := sha256.Sum256(encodedProxyEntry)
 	var expires [8]byte
-	binary.LittleEndian.PutUint64(expires[:], uint64(storedLightProxy.Expires.UnixNano()))
+	// Microseconds cannot wrap for any valid TTL.
+	binary.LittleEndian.PutUint64(expires[:], uint64(storedLightProxy.Expires.UnixMicro()))
 
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		err := tx.bucket(datastoreCommonLightTunnelProxyEntriesBucket).put(
@@ -3675,7 +3676,7 @@ func (iterator *CommonLightTunnelProxyEntryIterator) Reset(ctx context.Context) 
 
 	// Record the import counter before scanning so imports during Reset trigger another refresh.
 	imports := datastoreCommonLightTunnelProxyEntriesImports.Load()
-	now := time.Now().UnixNano()
+	now := time.Now().UnixMicro()
 	proxyEntryHashes := make(map[string][][]byte)
 	pruneKeys := make(map[string]struct{})
 

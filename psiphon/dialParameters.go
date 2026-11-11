@@ -492,7 +492,7 @@ func MakeDialParameters(
 	}
 
 	var commonLightProxy *StoredLightProxyEntry
-	if dialParams != nil && !dialParams.IsExchanged &&
+	if dialParams != nil &&
 		protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
 
 		// Common Light replay loads the proxy entry identified by ProxyEntryHash in
@@ -1208,8 +1208,13 @@ func MakeDialParameters(
 		if protocol.TunnelProtocolUsesLightTLSIngress(dialParams.TunnelProtocol) {
 
 			if !isReplay || !replayTLSFragmentClientHello {
-				dialParams.LightTLSFragmentClientHello = p.WeightedCoinFlip(
-					parameters.LightTunnelTLSFragmentClientHelloProbability)
+				names := []string{parameters.LightTunnelTLSFragmentClientHelloProbability}
+				limitProtocols := p.TunnelProtocols(parameters.TLSFragmentClientHelloLimitProtocols)
+				if len(limitProtocols) == 0 ||
+					common.Contains(limitProtocols, dialParams.TunnelProtocol) {
+					names = append(names, parameters.TLSFragmentClientHelloProbability)
+				}
+				dialParams.LightTLSFragmentClientHello = p.WeightedCoinFlip(names...)
 			}
 
 			// Fragmentation splits at the SNI hostname. Hostname selection can change
@@ -1296,16 +1301,14 @@ func MakeDialParameters(
 				dialParams.MeekHostHeader = net.JoinHostPort(
 					hostname, strconv.Itoa(serverEntry.MeekServerPort))
 			}
-		} else if protocol.TunnelProtocolUsesQUIC(dialParams.TunnelProtocol) &&
-			!protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
+		} else if protocol.TunnelProtocolUsesQUICOSSH(dialParams.TunnelProtocol) {
 
 			dialParams.QUICDialSNIAddress = selectHostName(dialParams.TunnelProtocol, p)
 		}
 	}
 
 	if (!isReplay || !replayQUICVersion) &&
-		protocol.TunnelProtocolUsesQUIC(dialParams.TunnelProtocol) &&
-		!protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
+		protocol.TunnelProtocolUsesQUICOSSH(dialParams.TunnelProtocol) {
 
 		isFronted := protocol.TunnelProtocolUsesFrontedMeekQUIC(dialParams.TunnelProtocol)
 		isInproxy := protocol.TunnelProtocolUsesInproxy(dialParams.TunnelProtocol)
@@ -1340,8 +1343,7 @@ func MakeDialParameters(
 	}
 
 	if quicTLSClientSessionCache != nil &&
-		protocol.TunnelProtocolUsesQUIC(dialParams.TunnelProtocol) &&
-		!protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
+		protocol.TunnelProtocolUsesQUICOSSH(dialParams.TunnelProtocol) {
 
 		sessionKey, err := serverEntry.GetTLSSessionCacheKeyAddress(dialParams.TunnelProtocol)
 		if err != nil {
@@ -1766,7 +1768,7 @@ func MakeDialParameters(
 		}
 
 		if (!isReplay || !replayInproxyWebRTC) &&
-			protocol.TunnelProtocolUsesQUIC(dialParams.TunnelProtocol) &&
+			protocol.TunnelProtocolClientUsesQUIC(dialParams.TunnelProtocol) &&
 			dialParams.InproxyWebRTCDialParameters.UseMediaStreams {
 
 			// In the in-proxy WebRTC media stream mode, QUIC packets are
@@ -2196,7 +2198,7 @@ func MakeDialParameters(
 
 	if !isTactics &&
 		protocol.TunnelProtocolUsesInproxy(dialParams.TunnelProtocol) &&
-		protocol.TunnelProtocolUsesTCP(dialParams.TunnelProtocol) {
+		protocol.TunnelProtocolClientUsesTCP(dialParams.TunnelProtocol) {
 
 		// Set DialConfig.CustomDialer to redirect all underlying TCP dials to use
 		// in-proxy as a 1st hop. Since QUIC doesn't use DialConfig or have its

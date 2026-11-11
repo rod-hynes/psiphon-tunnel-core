@@ -671,12 +671,8 @@ func newTestLightProxyEventReceiver() *testLightProxyEventReceiver {
 	}
 }
 
-func (receiver *testLightProxyEventReceiver) ListeningTCP(address string) {
-	fmt.Printf("[ListeningTCP] %s\n", address)
-}
-
-func (receiver *testLightProxyEventReceiver) ListeningUDP(address string) {
-	fmt.Printf("[ListeningUDP] %s\n", address)
+func (receiver *testLightProxyEventReceiver) Listening(address, ingressProtocol string) {
+	fmt.Printf("[Listening] %s %s\n", address, ingressProtocol)
 }
 
 func (receiver *testLightProxyEventReceiver) Started() {
@@ -3185,7 +3181,7 @@ func TestCommonLightTunnelProxyEntries(t *testing.T) {
 			t.Fatalf("load changed invalid entry: %v", err)
 		}
 		var expires [8]byte
-		binary.LittleEndian.PutUint64(expires[:], uint64(time.Now().Add(-time.Hour).UnixNano()))
+		binary.LittleEndian.PutUint64(expires[:], uint64(time.Now().Add(-time.Hour).UnixMicro()))
 		if err := setBucketValue(datastoreCommonLightTunnelProxyEntryIndexBuckets[light.LIGHT_PROTOCOL_TLS], tlsHash[:], expires[:]); err != nil {
 			t.Fatal(err)
 		}
@@ -3221,7 +3217,7 @@ func TestCommonLightTunnelProxyEntries(t *testing.T) {
 	indexBucket := datastoreCommonLightTunnelProxyEntryIndexBuckets[light.LIGHT_PROTOCOL_TLS]
 	invalidKey := []byte("invalid")
 	var expires [8]byte
-	binary.LittleEndian.PutUint64(expires[:], uint64(time.Now().Add(time.Hour).UnixNano()))
+	binary.LittleEndian.PutUint64(expires[:], uint64(time.Now().Add(time.Hour).UnixMicro()))
 	for _, record := range []struct{ key, value []byte }{
 		{invalidKey, expires[:]},
 		{quicHash[:], []byte("invalid")},
@@ -3261,7 +3257,7 @@ func setCommonLightTunnelProxyEntryExpiry(t *testing.T, hash []byte, expires tim
 		t.Fatal(err)
 	}
 	var expiry [8]byte
-	binary.LittleEndian.PutUint64(expiry[:], uint64(expires.UnixNano()))
+	binary.LittleEndian.PutUint64(expiry[:], uint64(expires.UnixMicro()))
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		if err := tx.bucket(datastoreCommonLightTunnelProxyEntriesBucket).put(hash, value); err != nil {
 			return err

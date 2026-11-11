@@ -3108,14 +3108,9 @@ func newTestProxyEventReceiver(
 	}
 }
 
-func (r *testProxyEventReceiver) ListeningTCP(address string) {
+func (r *testProxyEventReceiver) Listening(address, ingressProtocol string) {
 	r.listeningAddresses = append(r.listeningAddresses, address)
-	fmt.Printf("[ListeningTCP] %s\n", address)
-}
-
-func (r *testProxyEventReceiver) ListeningUDP(address string) {
-	r.listeningAddresses = append(r.listeningAddresses, address)
-	fmt.Printf("[ListeningUDP] %s\n", address)
+	fmt.Printf("[Listening] %s %s\n", address, ingressProtocol)
 }
 
 func (r *testProxyEventReceiver) Started() {

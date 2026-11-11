@@ -174,10 +174,7 @@ func configureIptablesAcceptRateLimitChain(config *Config, add bool) error {
 			if protocol.TunnelProtocolUsesInproxy(tunnelProtocol) ||
 				protocol.TunnelProtocolUsesLight(tunnelProtocol) {
 
-				usesTCP := protocol.TunnelProtocolUsesTCP(tunnelProtocol)
-				if protocol.TunnelProtocolUsesLight(tunnelProtocol) {
-					usesTCP = protocol.TunnelProtocolUsesLightTLSEgress(tunnelProtocol)
-				}
+				usesTCP := protocol.TunnelProtocolServerUsesTCP(tunnelProtocol)
 				networkProtocol := "tcp"
 				if !usesTCP {
 					networkProtocol = "udp"
@@ -210,7 +207,7 @@ func configureIptablesAcceptRateLimitChain(config *Config, add bool) error {
 			} else {
 
 				networkProtocol := "tcp"
-				if !protocol.TunnelProtocolUsesTCP(tunnelProtocol) {
+				if !protocol.TunnelProtocolServerUsesTCP(tunnelProtocol) {
 					networkProtocol = "udp"
 				}
 				protocolRules, err = directAcceptRateLimitRules(networkProtocol, portNumber, rateLimit)

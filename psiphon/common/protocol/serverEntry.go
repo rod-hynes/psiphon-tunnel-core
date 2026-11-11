@@ -690,7 +690,7 @@ func (serverEntry *ServerEntry) GetSupportedProtocols(
 			continue
 		}
 
-		if (TunnelProtocolUsesQUIC(tunnelProtocol) && !conditionallyEnabled.QUICEnabled()) ||
+		if (TunnelProtocolClientUsesQUIC(tunnelProtocol) && !conditionallyEnabled.QUICEnabled()) ||
 
 			(TunnelProtocolUsesRefractionNetworking(tunnelProtocol) &&
 				!conditionallyEnabled.RefractionNetworkingEnabled()) ||
@@ -717,11 +717,7 @@ func (serverEntry *ServerEntry) GetSupportedProtocols(
 		// expected to support QUICv1 and gQUIC is expected to become
 		// obsolete in general.
 
-		usesQUIC := TunnelProtocolUsesQUIC(tunnelProtocol)
-		if TunnelProtocolUsesLight(tunnelProtocol) {
-			usesQUIC = TunnelProtocolUsesLightQUICEgress(tunnelProtocol)
-		}
-		if usesQUIC && len(serverEntry.LimitQUICVersions) > 0 {
+		if TunnelProtocolServerUsesQUIC(tunnelProtocol) && len(serverEntry.LimitQUICVersions) > 0 {
 			supportedQUICVersions := SupportedQUICVersions
 			if TunnelProtocolUsesLight(tunnelProtocol) {
 				supportedQUICVersions = SupportedQUICv1Versions
@@ -933,7 +929,7 @@ func (serverEntry *ServerEntry) IsValidInproxyDialAddress(
 			continue
 		}
 
-		usesTCP := TunnelProtocolUsesTCP(tunnelProtocol)
+		usesTCP := TunnelProtocolServerUsesTCP(tunnelProtocol)
 		if (usesTCP && networkProtocol != "tcp") || (!usesTCP && networkProtocol != "udp") {
 			continue
 		}

@@ -2707,8 +2707,8 @@ type protocolSelectionConstraints struct {
 	commonLightTunnelProxyEntryIterator       *CommonLightTunnelProxyEntryIterator
 }
 
-func (p *protocolSelectionConstraints) initializeLightQUICLimits(
-	tactics parameters.ParametersAccessor) {
+func (constraints *protocolSelectionConstraints) initializeLightQUICLimits(
+	p parameters.ParametersAccessor) {
 
 	// Limitation: probabilistic ingress LimitQUICVersions are currently applied late,
 	// after selecting the tunnel protocol and common proxy entry. A limit allowing
@@ -2719,17 +2719,16 @@ func (p *protocolSelectionConstraints) initializeLightQUICLimits(
 	// dial before protocol and proxy entry selection. Use any advertised QUIC
 	// capabilities to select a proxy supporting an allowed version, and reuse
 	// the limit when choosing a version supported by that proxy.
-	p.lightIngressLimitQUICVersions = nil
-	probability := tactics.Float(parameters.LightTunnelIngressLimitQUICVersionsProbability)
-	if probability < 0 {
-		probability = tactics.Float(parameters.LimitQUICVersionsProbability)
-	}
-	if probability >= 1 {
-		p.lightIngressLimitQUICVersions = tactics.QUICVersions(
+	constraints.lightIngressLimitQUICVersions = nil
+	if p.Float(
+		parameters.LightTunnelIngressLimitQUICVersionsProbability,
+		parameters.LimitQUICVersionsProbability) >= 1 {
+
+		constraints.lightIngressLimitQUICVersions = p.QUICVersions(
 			parameters.LightTunnelIngressLimitQUICVersions,
 			parameters.LimitQUICVersions)
 	}
-	p.lightEgressLimitQUICVersions = tactics.QUICVersions(
+	constraints.lightEgressLimitQUICVersions = p.QUICVersions(
 		parameters.LightTunnelEgressLimitQUICVersions)
 }
 

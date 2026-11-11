@@ -831,7 +831,8 @@ func dialLightProxyAddresses(
 		return conn, false, errors.Trace(err)
 	}
 
-	// Dial IPv4 and IPv6 concurrently and use the first to connect.
+	// Dial IPv6 first and, after a randomized Happy Eyeballs style stagger or
+	// an IPv6 failure, IPv4. Use the first to connect.
 	//
 	// Currently, there's no check that the client has an IPv6 interface as
 	// that case is expected to simply fail fast and not generate log noise.
@@ -854,26 +855,50 @@ func dialLightProxyAddresses(
 		resultChannel <- result{conn, isIPv6, errors.Trace(err)}
 	}
 
-	go runDial(addressIPv4, false)
+	// Follow the Happy Eyeballs convention and common pattern by starting IPv6 first.
 	go runDial(addressIPv6, true)
+	pending := 1
 
-	first := <-resultChannel
-	if first.err == nil {
-		cancel()
-		second := <-resultChannel
-		if second.err == nil {
-			_ = second.conn.Close()
+	stagger := time.NewTimer(
+		prng.Period(dialStaggerMinDuration, dialStaggerMaxDuration))
+	defer stagger.Stop()
+
+	var errIPv4, errIPv6 error
+	select {
+	case resultIPv6 := <-resultChannel:
+		pending--
+		if resultIPv6.err == nil {
+			return resultIPv6.conn, resultIPv6.isIPv6, nil
 		}
-		return first.conn, first.isIPv6, nil
+		errIPv6 = resultIPv6.err
+	case <-stagger.C:
 	}
 
-	second := <-resultChannel
-	if second.err != nil {
-		return nil, false, errors.Trace(second.err)
+	go runDial(addressIPv4, false)
+	pending++
+
+	for pending > 0 {
+		next := <-resultChannel
+		pending--
+		if next.err == nil {
+			cancel()
+			for pending > 0 {
+				second := <-resultChannel
+				pending--
+				if second.err == nil {
+					_ = second.conn.Close()
+				}
+			}
+			return next.conn, next.isIPv6, nil
+		}
+		if next.isIPv6 {
+			errIPv6 = next.err
+		} else {
+			errIPv4 = next.err
+		}
 	}
 
-	cancel()
-	return second.conn, second.isIPv6, nil
+	return nil, false, errors.Tracef("IPv4: %w; IPv6: %v", errIPv4, errIPv6)
 }
 
 type ClientConn struct {

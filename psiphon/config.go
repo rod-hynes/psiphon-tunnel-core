@@ -2133,7 +2133,10 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		}
 	}
 
-	if config.UpstreamProxyURL != "" && config.IsPersonalPairingMode() {
+	if !config.DisableTunnels &&
+		config.UpstreamProxyURL != "" &&
+		config.IsPersonalPairingMode() {
+
 		return errors.TraceNew(
 			"UpstreamProxyURL is incompatible with personal pairing")
 	}

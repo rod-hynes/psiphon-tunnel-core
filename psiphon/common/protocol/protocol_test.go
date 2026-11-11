@@ -135,15 +135,28 @@ func TestLightTunnelProtocols(t *testing.T) {
 
 				t.Error("unexpected Light QUIC egress classification")
 			}
-			if TunnelProtocolUsesQUIC(testCase.tunnelProtocol) !=
+			if TunnelProtocolClientUsesQUIC(testCase.tunnelProtocol) !=
 				testCase.usesQUICIngress {
 
-				t.Error("unexpected QUIC classification")
+				t.Error("unexpected client QUIC classification")
 			}
-			if TunnelProtocolUsesTCP(testCase.tunnelProtocol) !=
+			if TunnelProtocolClientUsesTCP(testCase.tunnelProtocol) !=
 				testCase.usesTLSIngress {
 
-				t.Error("unexpected TCP classification")
+				t.Error("unexpected client TCP classification")
+			}
+			if TunnelProtocolServerUsesQUIC(testCase.tunnelProtocol) !=
+				testCase.usesQUICEgress {
+
+				t.Error("unexpected server QUIC classification")
+			}
+			if TunnelProtocolServerUsesTCP(testCase.tunnelProtocol) !=
+				testCase.usesTLSEgress {
+
+				t.Error("unexpected server TCP classification")
+			}
+			if TunnelProtocolUsesQUICOSSH(testCase.tunnelProtocol) {
+				t.Error("unexpected QUIC-OSSH classification")
 			}
 			if TunnelProtocolMayUseClientBPF(testCase.tunnelProtocol) !=
 				testCase.usesTLSIngress {

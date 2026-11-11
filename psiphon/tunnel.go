@@ -961,7 +961,7 @@ func dialTunnel(
 			return nil, errors.Trace(err)
 		}
 
-	} else if protocol.TunnelProtocolUsesQUIC(dialParams.TunnelProtocol) {
+	} else if protocol.TunnelProtocolUsesQUICOSSH(dialParams.TunnelProtocol) {
 
 		var packetConn net.PacketConn
 		var remoteAddr *net.UDPAddr
@@ -1650,7 +1650,7 @@ func dialInproxy(
 
 	networkProtocol := inproxy.NetworkProtocolUDP
 	reliableTransport := false
-	if protocol.TunnelProtocolUsesTCP(dialParams.TunnelProtocol) {
+	if protocol.TunnelProtocolServerUsesTCP(dialParams.TunnelProtocol) {
 		networkProtocol = inproxy.NetworkProtocolTCP
 		reliableTransport = true
 	}

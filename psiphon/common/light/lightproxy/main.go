@@ -62,8 +62,6 @@ func main() {
 	var providerID string
 	var dialAddresses stringListFlag
 	var listenAddresses stringListFlag
-	var dialAddressIPv4 string
-	var dialAddressIPv6 string
 	var recommendedSNI string
 	var recommendedSNIRegex string
 	var recommendedSNIProbability float64
@@ -112,18 +110,6 @@ func main() {
 		&listenAddresses,
 		"listenAddress",
 		"generate proxy listen endpoint; same format and order as dial endpoints; defaults to dial endpoints")
-
-	flag.StringVar(
-		&dialAddressIPv4,
-		"dialAddressIPv4",
-		"",
-		"generate TLS proxy IPv4 dial address; cannot combine with dialAddress")
-
-	flag.StringVar(
-		&dialAddressIPv6,
-		"dialAddressIPv6",
-		"",
-		"generate TLS proxy IPv6 dial address; optional with dialAddressIPv4")
 
 	flag.StringVar(
 		&recommendedSNI,
@@ -267,16 +253,7 @@ func main() {
 		err := func() error {
 
 			if len(dialAddresses) == 0 {
-				if dialAddressIPv4 == "" {
-					return errors.TraceNew("missing dial address")
-				}
-				dialAddresses = append(dialAddresses, dialAddressIPv4)
-				if dialAddressIPv6 != "" {
-					dialAddresses = append(dialAddresses, dialAddressIPv6)
-				}
-			} else if dialAddressIPv4 != "" || dialAddressIPv6 != "" {
-				return errors.TraceNew(
-					"cannot combine dialAddress with legacy dial address flags")
+				return errors.TraceNew("missing dial address")
 			}
 
 			parseAddresses := func(addresses []string) ([]light.ProxyAddress, error) {
@@ -699,12 +676,8 @@ func (r *proxyEventReceiver) logf(format string, args ...interface{}) {
 	fmt.Printf(format, args...)
 }
 
-func (r *proxyEventReceiver) ListeningTCP(address string) {
-	r.logf("[ListeningTCP] %s\n", address)
-}
-
-func (r *proxyEventReceiver) ListeningUDP(address string) {
-	r.logf("[ListeningUDP] %s\n", address)
+func (r *proxyEventReceiver) Listening(address, ingressProtocol string) {
+	r.logf("[Listening] %s %s\n", address, ingressProtocol)
 }
 
 func (r *proxyEventReceiver) Started() {

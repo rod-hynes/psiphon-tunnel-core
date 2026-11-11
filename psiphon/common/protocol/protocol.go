@@ -357,11 +357,6 @@ func TunnelProtocolIsCompatibleWithInproxy(protocol string) bool {
 		!TunnelProtocolUsesRefractionNetworking(protocol)
 }
 
-func TunnelProtocolUsesTCP(protocol string) bool {
-	// Light protocols are classified by their ingress transport.
-	return !TunnelProtocolUsesQUIC(protocol)
-}
-
 func TunnelProtocolUsesSSH(protocol string) bool {
 	return true
 }
@@ -424,12 +419,33 @@ func TunnelProtocolUsesObfuscatedSessionTickets(protocol string) bool {
 	return protocol == TUNNEL_PROTOCOL_UNFRONTED_MEEK_SESSION_TICKET
 }
 
-func TunnelProtocolUsesQUIC(protocol string) bool {
+func TunnelProtocolUsesQUICOSSH(protocol string) bool {
 	protocol = TunnelProtocolMinusInproxy(protocol)
-	// Light protocols are classified by their ingress transport.
 	return protocol == TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH ||
-		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH
+}
+
+// TunnelProtocolClientUsesQUIC indicates that the client dials QUIC; for
+// Light, the ingress hop.
+func TunnelProtocolClientUsesQUIC(protocol string) bool {
+	return TunnelProtocolUsesQUICOSSH(protocol) ||
 		TunnelProtocolUsesLightQUICIngress(protocol)
+}
+
+func TunnelProtocolClientUsesTCP(protocol string) bool {
+	return !TunnelProtocolClientUsesQUIC(protocol)
+}
+
+// TunnelProtocolServerUsesQUIC indicates that the server entry dial port is
+// QUIC; for Light, the egress hop. For fronted meek QUIC, this is the
+// client-to-edge hop.
+func TunnelProtocolServerUsesQUIC(protocol string) bool {
+	return TunnelProtocolUsesQUICOSSH(protocol) ||
+		TunnelProtocolUsesLightQUICEgress(protocol)
+}
+
+func TunnelProtocolServerUsesTCP(protocol string) bool {
+	return !TunnelProtocolServerUsesQUIC(protocol)
 }
 
 func TunnelProtocolUsesFrontedMeekQUIC(protocol string) bool {
@@ -462,11 +478,8 @@ func TunnelProtocolUsesShadowsocks(protocol string) bool {
 }
 
 func TunnelProtocolIsResourceIntensive(protocol string) bool {
-	if TunnelProtocolUsesLight(protocol) {
-		return TunnelProtocolUsesLightQUICIngress(protocol)
-	}
 	return TunnelProtocolUsesMeek(protocol) ||
-		TunnelProtocolUsesQUIC(protocol) ||
+		TunnelProtocolClientUsesQUIC(protocol) ||
 		TunnelProtocolUsesRefractionNetworking(protocol) ||
 		TunnelProtocolUsesInproxy(protocol)
 }
@@ -520,7 +533,7 @@ func TunnelProtocolSupportsPassthrough(protocol string) bool {
 func TunnelProtocolSupportsUpstreamProxy(protocol string) bool {
 	return !TunnelProtocolUsesInproxy(protocol) &&
 		!TunnelProtocolUsesLight(protocol) &&
-		!TunnelProtocolUsesQUIC(protocol) &&
+		!TunnelProtocolClientUsesQUIC(protocol) &&
 		// Conjure DTLS uses UDP.
 		!TunnelProtocolUsesRefractionNetworking(protocol)
 }
@@ -559,10 +572,7 @@ func TunnelProtocolMayUseClientBPF(protocol string) bool {
 	if TunnelProtocolUsesInproxy(protocol) {
 		return false
 	}
-	if TunnelProtocolUsesLight(protocol) {
-		return TunnelProtocolUsesLightTLSIngress(protocol)
-	}
-	return !TunnelProtocolUsesQUIC(protocol)
+	return !TunnelProtocolClientUsesQUIC(protocol)
 }
 
 func IsValidClientTunnelProtocol(

@@ -26,6 +26,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
@@ -39,6 +40,8 @@ const (
 	paddingMinTargetSize          = 900
 	paddingMaxTargetSize          = 1400
 	stopPaddingWriteSizeThreshold = paddingMaxTargetSize
+	dialStaggerMinDuration        = 100 * time.Millisecond
+	dialStaggerMaxDuration        = 300 * time.Millisecond
 )
 
 // lightConn wraps a TLS or QUIC connection with traffic shape obfuscation:

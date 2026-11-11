@@ -926,12 +926,8 @@ func newLightProxyEventReceiver(config *Config) *lightProxyEventReceiver {
 	}
 }
 
-func (r *lightProxyEventReceiver) ListeningTCP(address string) {
-	NoticeLightProxyListening(address, light.LIGHT_PROTOCOL_TLS)
-}
-
-func (r *lightProxyEventReceiver) ListeningUDP(address string) {
-	NoticeLightProxyListening(address, light.LIGHT_PROTOCOL_QUIC)
+func (r *lightProxyEventReceiver) Listening(address, ingressProtocol string) {
+	NoticeLightProxyListening(address, ingressProtocol)
 }
 
 func (r *lightProxyEventReceiver) Started() {

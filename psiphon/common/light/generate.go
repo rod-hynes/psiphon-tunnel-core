@@ -123,13 +123,11 @@ func Generate(
 
 	var personalCompartmentIDBytes []byte
 	if personalCompartmentID != "" {
-		personalCompartmentIDBytes, err =
-			base64.RawStdEncoding.DecodeString(personalCompartmentID)
-		if err != nil ||
-			len(personalCompartmentIDBytes) != personalCompartmentIDSize {
-
+		id, err := inproxy.IDFromString(personalCompartmentID)
+		if err != nil {
 			return nil, nil, errors.TraceNew("invalid personal compartment ID")
 		}
+		personalCompartmentIDBytes = id[:]
 	}
 
 	var dialAddressIPv4, dialAddressIPv6 string

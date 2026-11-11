@@ -272,6 +272,18 @@ func TestCommonLightProxyTunnel(t *testing.T) {
 	}
 }
 
+func TestLightProxyFallback(t *testing.T) {
+	runServer(t,
+		&runServerConfig{
+			tunnelProtocol:        "OSSH",
+			requireAuthorization:  true,
+			doTunneledWebRequest:  true,
+			doLogHostProvider:     true,
+			doLogProtobuf:         useProtobufLogging,
+			useLightProxyFallback: true,
+		})
+}
+
 func TestOSSH(t *testing.T) {
 	runServer(t,
 		&runServerConfig{
@@ -996,6 +1008,7 @@ type runServerConfig struct {
 	usePersonalLightProxyTunnel  bool
 	useCommonLightProxyTunnel    bool
 	trustedLightProxy            bool
+	useLightProxyFallback        bool
 	testDSLAccessToken           bool
 }
 
@@ -1432,8 +1445,7 @@ func runServer(t *testing.T, runConfig *runServerConfig) {
 
 	serverConfig["RunPacketManipulator"] = runConfig.doPacketManipulation
 
-	if protocol.TunnelProtocolUsesQUIC(runConfig.tunnelProtocol) &&
-		!protocol.TunnelProtocolUsesLight(runConfig.tunnelProtocol) &&
+	if protocol.TunnelProtocolUsesQUICOSSH(runConfig.tunnelProtocol) &&
 		!runConfig.limitQUICVersions &&
 		quic.GQUICEnabled() {
 
@@ -1979,6 +1991,39 @@ func runServer(t *testing.T, runConfig *runServerConfig) {
 		}
 	}
 
+	if runConfig.useLightProxyFallback {
+		// The fallback entry is configured but never dialed; only the
+		// connected request metrics are exercised.
+		proxyConfig, entry, err := light.Generate(
+			prng.HexString(8),
+			nil,
+			[]light.ProxyAddress{
+				{IPAddress: "127.0.0.1", Port: 443, Protocol: light.LIGHT_PROTOCOL_TLS},
+			},
+			"example.org",
+			"",
+			0.5,
+			protocol.TLS_PROFILE_CHROME_133,
+			0.5,
+			0,
+			0,
+			0,
+			0,
+			time.Hour,
+			nil,
+			nil,
+			nil,
+			nil,
+			psiphonServerAddress,
+			"",
+			"")
+		if err != nil {
+			t.Fatalf("error generating light proxy entry: %s", err)
+		}
+		lightProxyEntry = entry
+		lightProxyID = proxyConfig.ProxyID
+	}
+
 	// reset client datastore
 
 	_ = os.RemoveAll(filepath.Join(testDataDirName, psiphon.PsiphonDataDirectoryName))
@@ -2073,6 +2118,12 @@ func runServer(t *testing.T, runConfig *runServerConfig) {
 	// the mock.DSL backend.
 	if !doDSL {
 		clientConfig.TargetServerEntry = string(encodedServerEntry)
+	}
+
+	if runConfig.useLightProxyFallback {
+		clientConfig.EnableLightProxyFallback = true
+		clientConfig.LightProxyEntry = lightProxyEntry
+		clientConfig.LightProxyEntryTracker = lightProxyEntryTracker
 	}
 
 	var lightIngressQUICVersion, lightEgressQUICVersion string
@@ -3684,6 +3735,26 @@ func checkExpectedServerTunnelLogFields(
 			int(fields["server_entry_count"].(float64)))
 	}
 
+	if runConfig.useLightProxyFallback {
+		expected := map[string]interface{}{
+			"light_fallback_proxy_id":            expectLightProxyID,
+			"light_fallback_proxy_entry_tracker": float64(expectLightProxyEntryTracker),
+			"light_fallback_proxy_dial_IPv4":     float64(0),
+			"light_fallback_proxy_dial_failed":   float64(0),
+			"light_fallback_proxy_dial_canceled": float64(0),
+		}
+		for name, want := range expected {
+			if fields[name] != want {
+				return fmt.Errorf("%s: got %v, expected %v", name, fields[name], want)
+			}
+		}
+		if _, ok := fields["light_fallback_proxy_dial_IPv6"]; ok {
+			return fmt.Errorf("unexpected field 'light_fallback_proxy_dial_IPv6'")
+		}
+	} else if _, ok := fields["light_fallback_proxy_id"]; ok {
+		return fmt.Errorf("unexpected field 'light_fallback_proxy_id'")
+	}
+
 	if (runConfig.usePersonalLightProxyTunnel || runConfig.useCommonLightProxyTunnel) &&
 		protocol.TunnelProtocolUsesLight(clientTunnelProtocol) {
 
@@ -4045,8 +4116,7 @@ func checkExpectedServerTunnelLogFields(
 		}
 	}
 
-	if protocol.TunnelProtocolUsesQUIC(clientTunnelProtocol) &&
-		!protocol.TunnelProtocolUsesLight(clientTunnelProtocol) {
+	if protocol.TunnelProtocolUsesQUICOSSH(clientTunnelProtocol) {
 
 		for _, name := range []string{
 			"quic_version",

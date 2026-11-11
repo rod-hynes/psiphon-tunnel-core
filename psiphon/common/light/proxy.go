@@ -127,6 +127,8 @@ type ProxyQUICDialer func(
 
 // ProxyConfig specifies the configuration of a light proxy.
 // Unless noted otherwise, fields apply in both fallback and tunnel modes.
+// The Proxy retains and reads the config, which must not be modified while
+// Run is active.
 //
 // When ProxyLimits is specified, connections use the shared common or personal
 // limits according to the authenticated personal compartment ID.
@@ -387,8 +389,7 @@ type RegionActivitySnapshot struct {
 // logging and stats shipping. ProxyEventReceiver callbacks should not block
 // on processing and instead should dispatch any work that is to be performed.
 type ProxyEventReceiver interface {
-	ListeningTCP(address string)
-	ListeningUDP(address string)
+	Listening(address, ingressProtocol string)
 
 	// Started is called once per Run, after all listeners bind and their
 	// Listening callbacks complete. It is not called if setup fails.
@@ -450,15 +451,11 @@ type Proxy struct {
 	perIPMaxConcurrent               int
 	dialFallbackDelay                time.Duration
 	tunnelDialAuthorizationPublicKey ed25519.PublicKey
-	tunnelProxyPrivateKey            inproxy.SessionPrivateKey
 	tunnelTrustedProxyAuthorization  []byte
 	tunnelProxyReportPaddingMinBytes int
 	tunnelProxyReportPaddingMaxBytes int
 	tunnelProxyPlatform              uint8
-	tunnelProxyVersion               int64
 	tunnelProxyBuildRev              []byte
-	proxyTLSDialer                   ProxyTLSDialer
-	proxyQUICDialer                  ProxyQUICDialer
 	personalCompartmentID            []byte
 
 	listenConfig *net.ListenConfig
@@ -553,11 +550,11 @@ func NewProxy(
 
 	var personalCompartmentID []byte
 	if config.PersonalCompartmentID != "" {
-		personalCompartmentID, err =
-			base64.RawStdEncoding.DecodeString(config.PersonalCompartmentID)
-		if err != nil || len(personalCompartmentID) != personalCompartmentIDSize {
+		id, err := inproxy.IDFromString(config.PersonalCompartmentID)
+		if err != nil {
 			return nil, errors.TraceNew("invalid personal compartment ID")
 		}
+		personalCompartmentID = id[:]
 		if config.ProxyLimits == nil {
 			return nil, errors.TraceNew("personal pairing requires ProxyLimits")
 		}
@@ -849,17 +846,13 @@ func NewProxy(
 		tunnelDialAuthorizationPublicKey: append(
 			ed25519.PublicKey(nil),
 			config.TunnelDialAuthorizationPublicKey...),
-		tunnelProxyPrivateKey: config.TunnelProxyPrivateKey,
 		tunnelTrustedProxyAuthorization: append(
 			[]byte(nil), config.TunnelTrustedProxyAuthorization...),
 		tunnelProxyReportPaddingMinBytes: tunnelProxyReportPaddingMinBytes,
 		tunnelProxyReportPaddingMaxBytes: tunnelProxyReportPaddingMaxBytes,
 		tunnelProxyPlatform: encodeClientPlatform(
 			config.ProxyPlatform),
-		tunnelProxyVersion:    config.ProxyVersion,
 		tunnelProxyBuildRev:   append([]byte(nil), config.ProxyBuildRev...),
-		proxyTLSDialer:        config.ProxyTLSDialer,
-		proxyQUICDialer:       config.ProxyQUICDialer,
 		personalCompartmentID: personalCompartmentID,
 
 		perIPConcurrentConnections: make(map[string]int),
@@ -1131,15 +1124,16 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 	}
 
 	for _, listener := range listeners {
-		switch proxy.listenAddresses[listener.addressIndex].Protocol {
-		case LIGHT_PROTOCOL_TLS:
-			proxy.eventReceiver.ListeningTCP(listener.Addr().String())
-		case LIGHT_PROTOCOL_QUIC:
-			proxy.eventReceiver.ListeningUDP(listener.Addr().String())
-		}
+		proxy.eventReceiver.Listening(
+			listener.Addr().String(),
+			proxy.listenAddresses[listener.addressIndex].Protocol)
 	}
 
 	proxy.eventReceiver.Started()
+
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	listenerErrors := make(chan error, len(listeners))
 
 	waitGroup := new(sync.WaitGroup)
 
@@ -1148,7 +1142,7 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
-			proxy.activityUpdate(ctx)
+			proxy.activityUpdate(runCtx)
 		}()
 	}
 
@@ -1160,12 +1154,19 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 			for {
 				conn, err := listener.Accept()
 				if err != nil {
-					if ctx.Err() != nil {
+					if runCtx.Err() != nil {
 						break
 					}
-					proxy.eventReceiver.WarningLog(
-						proxy.ID, errors.Trace(err).Error())
-					continue
+					// Stop running on any non-temporary Accept error.
+					var netErr net.Error
+					if std_errors.As(err, &netErr) && netErr.Temporary() {
+						proxy.eventReceiver.WarningLog(
+							proxy.ID, errors.Trace(err).Error())
+						continue
+					}
+					listenerErrors <- errors.Trace(err)
+					cancelRun()
+					break
 				}
 				if proxy.paused.Load() {
 
@@ -1189,11 +1190,11 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 
 				// Limitation: network changes do not interrupt detached TLS passthrough
 				// relays or QUIC connections not yet returned by Accept.
-				connCtx := ctx
+				connCtx := runCtx
 				var cancel context.CancelFunc
 				if proxy.config.GetCurrentNetworkContext != nil {
 					connCtx, cancel = common.MergeContextCancel(
-						ctx, proxy.config.GetCurrentNetworkContext())
+						runCtx, proxy.config.GetCurrentNetworkContext())
 				}
 				waitGroup.Add(1)
 				go func(conn net.Conn) {
@@ -1213,7 +1214,7 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 		}()
 	}
 
-	<-ctx.Done()
+	<-runCtx.Done()
 	closeListeners()
 	waitGroup.Wait()
 
@@ -1222,7 +1223,12 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 		proxy.emitActivity()
 	}
 
-	return nil
+	select {
+	case err := <-listenerErrors:
+		return errors.Trace(err)
+	default:
+		return nil
+	}
 }
 
 func (proxy *Proxy) handleConn(
@@ -1818,14 +1824,14 @@ func (proxy *Proxy) dialTunnelServer(
 
 	switch header.EgressProtocol {
 	case TransportTLS:
-		if proxy.proxyTLSDialer == nil {
+		if proxy.config.ProxyTLSDialer == nil {
 			return nil, "", completedTCP, completedTLS, completedQUIC, errors.TraceNew("missing proxy TLS dialer")
 		}
 		conn, exporter, completedTCP, completedTLS, err =
 			proxy.dialTunnelServerTLS(
 				dialCtx, header, authorization, destinationAddress)
 	case TransportQUIC:
-		if proxy.proxyQUICDialer == nil {
+		if proxy.config.ProxyQUICDialer == nil {
 			return nil, "", completedTCP, completedTLS, completedQUIC, errors.TraceNew("missing proxy QUIC dialer")
 		}
 		conn, exporter, completedQUIC, err =
@@ -1970,7 +1976,7 @@ func (proxy *Proxy) dialTunnelServerQUIC(
 	verifyPin := base64.StdEncoding.EncodeToString(
 		authorization.VerifyPin)
 
-	conn, exporter, completedQUIC, err = proxy.proxyQUICDialer(
+	conn, exporter, completedQUIC, err = proxy.config.ProxyQUICDialer(
 		ctx,
 		destinationAddress,
 		header.EgressSNI,
@@ -2055,7 +2061,7 @@ func (proxy *Proxy) dialTunnelServerTLS(
 		authorization.VerifyPin)
 
 	// Future enhancement: client-selected egress TLS fragmentation and padding.
-	conn, exporter, completedTCP, completedTLS, err = proxy.proxyTLSDialer(
+	conn, exporter, completedTCP, completedTLS, err = proxy.config.ProxyTLSDialer(
 		ctx,
 		destinationAddress,
 		tlsProfile,
@@ -2106,7 +2112,7 @@ func (proxy *Proxy) writeTunnelProxyReport(
 		TrustedProxyAuthorization:       proxy.tunnelTrustedProxyAuthorization,
 		ClientIP:                        IP,
 		ProxyPlatform:                   proxy.tunnelProxyPlatform,
-		ProxyVersion:                    proxy.tunnelProxyVersion,
+		ProxyVersion:                    proxy.config.ProxyVersion,
 		ProxyBuildRev:                   proxy.tunnelProxyBuildRev,
 		IngressProtocol:                 encodedIngressProtocol,
 		IngressTLSProfile:               header.TLSProfile,
@@ -2122,7 +2128,7 @@ func (proxy *Proxy) writeTunnelProxyReport(
 
 	return errors.Trace(WriteTunnelProxyReport(
 		tunnelConn,
-		proxy.tunnelProxyPrivateKey,
+		proxy.config.TunnelProxyPrivateKey,
 		exporter,
 		report,
 		proxy.tunnelProxyReportPaddingMinBytes,

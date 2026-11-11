@@ -1352,7 +1352,7 @@ var defaultParameters = map[string]struct {
 	LightTunnelIngressLimitQUICVersionsProbability:          {value: -1.0, minimum: -1.0},
 	LightTunnelIngressCustomHostNameRegexes:                 {value: RegexStrings{}},
 	LightTunnelIngressCustomHostNameProbability:             {value: -1.0, minimum: -1.0},
-	LightTunnelTLSFragmentClientHelloProbability:            {value: 0.0, minimum: 0.0},
+	LightTunnelTLSFragmentClientHelloProbability:            {value: -1.0, minimum: -1.0},
 	LightTunnelTLSPaddingProbability:                        {value: 0.0, minimum: 0.0},
 	LightTunnelMinTLSPadding:                                {value: 0, minimum: 0},
 	LightTunnelMaxTLSPadding:                                {value: 0, minimum: 0},
@@ -2186,10 +2186,17 @@ func (p ParametersAccessor) Bool(name string) bool {
 	return value
 }
 
-// Float returns a float64 parameter value.
-func (p ParametersAccessor) Float(name string) float64 {
-	value := float64(0.0)
-	p.snapshot.getValue(name, &value)
+// Float returns the first non-negative float64 parameter value. If none is
+// found, it returns the last value.
+func (p ParametersAccessor) Float(names ...string) float64 {
+	var value float64
+	for _, name := range names {
+		value = 0
+		p.snapshot.getValue(name, &value)
+		if value >= 0 {
+			break
+		}
+	}
 	return value
 }
 
@@ -2197,14 +2204,7 @@ func (p ParametersAccessor) Float(name string) float64 {
 // first non-negative float parameter as the probability input. If none is
 // found, it returns false.
 func (p ParametersAccessor) WeightedCoinFlip(names ...string) bool {
-	for _, name := range names {
-		var value float64
-		p.snapshot.getValue(name, &value)
-		if value >= 0 {
-			return prng.FlipWeightedCoin(value)
-		}
-	}
-	return false
+	return prng.FlipWeightedCoin(p.Float(names...))
 }
 
 // Duration returns a time.Duration parameter value. When the duration

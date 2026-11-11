@@ -249,7 +249,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("missing meek HTTPS fields")
 	}
 
-	if protocol.TunnelProtocolUsesQUIC(tunnelProtocol) {
+	if protocol.TunnelProtocolUsesQUICOSSH(tunnelProtocol) {
 		if dialParams.QUICVersion == "" {
 			t.Fatalf("missing QUIC version field")
 		}
@@ -588,7 +588,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		identicalSeeds(replayDialParams.FragmentorSeed, dialParams.FragmentorSeed) ||
 		(protocol.TunnelProtocolUsesMeek(tunnelProtocol) &&
 			identicalSeeds(replayDialParams.MeekObfuscatorPaddingSeed, dialParams.MeekObfuscatorPaddingSeed)) ||
-		(protocol.TunnelProtocolUsesQUIC(tunnelProtocol) &&
+		(protocol.TunnelProtocolUsesQUICOSSH(tunnelProtocol) &&
 			identicalSeeds(replayDialParams.ObfuscatedQUICPaddingSeed, dialParams.ObfuscatedQUICPaddingSeed) &&
 			replayDialParams.ObfuscatedQUICPaddingSeed != nil) ||
 		identicalSeeds(replayDialParams.LivenessTestSeed, dialParams.LivenessTestSeed) ||

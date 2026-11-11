@@ -170,7 +170,10 @@ func TestLightTunnelConn(t *testing.T) {
 				testCase.issuerPublicKey,
 				nil,
 				nil)
-			server := &sshServer{support: &SupportServices{Config: &Config{}}}
+			server := &sshServer{
+				support:     &SupportServices{Config: &Config{}},
+				shutdownCtx: context.Background(),
+			}
 			result, err := server.handshakeTunnelTransport(conn)
 			if testCase.expectedError != "" {
 				if result != nil || !transport.closed.Load() {
