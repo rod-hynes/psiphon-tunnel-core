@@ -20,8 +20,10 @@
 package psiphon
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -883,21 +885,26 @@ type Config struct {
 	// neither EgressRegion nor any SplitTunnel configuration is applied.
 	EnableLightProxyFallback bool `json:",omitempty"`
 
-	// EnablePersonalLightProxyTunnels enables using LightProxyEntry as a
-	// first hop for Psiphon tunnel establishment in personal pairing mode.
-	// LightProxyEntry must contain a personal compartment ID. When
+	// EnablePersonalLightProxyTunnels enables using PersonalLightProxyEntries
+	// as first hops for Psiphon tunnel establishment in personal pairing mode.
+	// Each entry must contain a personal compartment ID. When
 	// InproxyClientPersonalCompartmentID is also configured, the client races
-	// Light and in-proxy protocols. This mode uses only the configured
-	// LightProxyEntry and does not use push-imported or stored light proxies.
+	// Light and in-proxy protocols. This mode does not use push-imported or
+	// stored light proxies.
 	EnablePersonalLightProxyTunnels bool `json:",omitempty"`
 
-	// LightProxyEntry is an optional encoded light proxy entry. When
-	// specified, the light proxy entry is always chosen; any TTL in the entry
-	// is ignored and any previously stored light proxy entry is ignored.
-	LightProxyEntry []byte `json:",omitempty"`
+	// PersonalLightProxyEntries are the encoded light proxy entries.
+	PersonalLightProxyEntries [][]byte `json:",omitempty"`
 
-	// LightProxyEntryTracker is the light proxy entry tracker value to report.
-	LightProxyEntryTracker int64 `json:",omitempty"`
+	// FallbackLightProxyEntry is an optional encoded light proxy entry for
+	// EnableLightProxyFallback. When specified, the light proxy entry is
+	// always chosen; any TTL in the entry is ignored and any previously
+	// stored light proxy entry is ignored.
+	FallbackLightProxyEntry []byte `json:",omitempty"`
+
+	// FallbackLightProxyEntryTracker is the light proxy entry tracker value
+	// to report.
+	FallbackLightProxyEntryTracker int64 `json:",omitempty"`
 
 	// LightProxyLimitDestinationAddresses limits light proxy dial attempts to
 	// the specified destination addresses, in host:port form. When empty,
@@ -953,6 +960,13 @@ type Config struct {
 	// Deprecated: Use PersonalPairingConnectionWorkerPoolSize.
 	// Ignored when that field is nonzero.
 	InproxyPersonalPairingConnectionWorkerPoolSize int `json:",omitempty"`
+
+	// Deprecated: Use FallbackLightProxyEntry.
+	// Ignored when that field is set.
+	LightProxyEntry []byte `json:",omitempty"`
+
+	// Deprecated: Use FallbackLightProxyEntryTracker.
+	LightProxyEntryTracker int64 `json:",omitempty"`
 
 	// Deprecated: Use ProxySessionPrivateKey. Ignored when that field is set.
 	InproxyProxySessionPrivateKey string `json:",omitempty"`
@@ -1557,7 +1571,7 @@ type Config struct {
 	lightFallbackDialTimeout               atomic.Int64
 	lightFallbackLimitDestinationAddresses atomic.Value
 
-	personalLightProxyProtocols []string
+	personalLightProxyEntries []personalLightProxyEntry
 }
 
 // TacticsAppliedReceiver specifies the interface for a component that is
@@ -1817,6 +1831,10 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 
 	if config.EnableLightProxy {
 		config.EnableLightProxyFallback = true
+	}
+	if len(config.FallbackLightProxyEntry) == 0 {
+		config.FallbackLightProxyEntry = config.LightProxyEntry
+		config.FallbackLightProxyEntryTracker = config.LightProxyEntryTracker
 	}
 
 	// Supply default values.
@@ -2205,26 +2223,65 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 				"EnablePersonalLightProxyTunnels is incompatible with DisableTunnels")
 		}
 
-		if len(config.LightProxyEntry) == 0 {
+		if len(config.FallbackLightProxyEntry) > 0 {
 			return errors.TraceNew(
-				"EnablePersonalLightProxyTunnels requires LightProxyEntry")
+				"EnablePersonalLightProxyTunnels is incompatible with FallbackLightProxyEntry")
 		}
 
-		lightProxyEntry, err := light.DecodeAndValidateProxyEntry(config.LightProxyEntry)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if len(lightProxyEntry.PersonalCompartmentID) == 0 {
+		if len(config.PersonalLightProxyEntries) == 0 {
 			return errors.TraceNew(
-				"EnablePersonalLightProxyTunnels requires a personal compartment ID in LightProxyEntry")
+				"EnablePersonalLightProxyTunnels requires PersonalLightProxyEntries")
 		}
 
-		if config.EnableRunningLightProxy &&
-			!GetAllowOverlappingPersonalCompartmentIDs() &&
-			config.ProxyPersonalCompartmentID ==
-				base64.RawStdEncoding.EncodeToString(lightProxyEntry.PersonalCompartmentID) {
+		config.personalLightProxyEntries = nil
+		for _, entry := range config.PersonalLightProxyEntries {
 
-			return errors.TraceNew("invalid overlapping personal compartment IDs")
+			lightProxyEntry, err := light.DecodeAndValidateProxyEntry(entry)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			if len(lightProxyEntry.PersonalCompartmentID) == 0 {
+				return errors.TraceNew(
+					"PersonalLightProxyEntries requires a personal compartment ID in each entry")
+			}
+
+			if config.EnableRunningLightProxy &&
+				!GetAllowOverlappingPersonalCompartmentIDs() &&
+				config.ProxyPersonalCompartmentID ==
+					base64.RawStdEncoding.EncodeToString(lightProxyEntry.PersonalCompartmentID) {
+
+				return errors.TraceNew("invalid overlapping personal compartment IDs")
+			}
+
+			proxyEntryHash := sha256.Sum256(entry)
+			for _, existing := range config.personalLightProxyEntries {
+				if bytes.Equal(existing.proxyEntryHash, proxyEntryHash[:]) {
+					return errors.TraceNew("duplicate PersonalLightProxyEntries entry")
+				}
+			}
+
+			var protocols []string
+			for _, address := range lightProxyEntry.DialAddresses {
+				if address.Protocol == light.LIGHT_PROTOCOL_QUIC && !quic.Enabled() {
+					continue
+				}
+				if !common.Contains(protocols, address.Protocol) {
+					protocols = append(protocols, address.Protocol)
+				}
+			}
+			if len(protocols) == 0 {
+				return errors.TraceNew("PersonalLightProxyEntries entry has no supported proxy protocols")
+			}
+
+			// config.personalLightProxyEntries supports protocol-specific Light
+			// entry iteration and replay based on the Light entry hash.
+			config.personalLightProxyEntries = append(
+				config.personalLightProxyEntries,
+				personalLightProxyEntry{
+					proxyEntry:     entry,
+					proxyEntryHash: proxyEntryHash[:],
+					protocols:      protocols,
+				})
 		}
 
 		if config.LightProxyLimitDestinationAddresses != nil {
@@ -2235,21 +2292,6 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		if config.LightProxyTestFetchAddress != "" {
 			return errors.TraceNew(
 				"EnablePersonalLightProxyTunnels is incompatible with LightProxyTestFetchAddress")
-		}
-
-		// Cache locally supported transports for personal-pairing protocol selection.
-		config.personalLightProxyProtocols = nil
-		for _, address := range lightProxyEntry.DialAddresses {
-			if address.Protocol == light.LIGHT_PROTOCOL_QUIC && !quic.Enabled() {
-				continue
-			}
-			if !common.Contains(config.personalLightProxyProtocols, address.Protocol) {
-				config.personalLightProxyProtocols = append(
-					config.personalLightProxyProtocols, address.Protocol)
-			}
-		}
-		if len(config.personalLightProxyProtocols) == 0 {
-			return errors.TraceNew("LightProxyEntry has no supported proxy protocols")
 		}
 	}
 
@@ -5188,10 +5230,6 @@ func (config *Config) setDialParametersHash() error {
 	if config.InproxyClientDisableIPv6ICECandidates != nil {
 		hash.Write([]byte("InproxyClientDisableIPv6ICECandidates"))
 		binary.Write(hash, binary.LittleEndian, *config.InproxyClientDisableIPv6ICECandidates)
-	}
-	if config.EnablePersonalLightProxyTunnels {
-		hash.Write([]byte("LightProxyEntry"))
-		hash.Write(config.LightProxyEntry)
 	}
 
 	if len(config.LightTunnelIngressLimitTLSProfiles) > 0 {

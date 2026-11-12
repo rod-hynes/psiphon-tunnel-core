@@ -178,26 +178,29 @@ func TestSSH(t *testing.T) {
 func TestPersonalLightProxyTLSTLSSSH(t *testing.T) {
 
 	for _, testCase := range []struct {
-		name              string
-		doPersonalPairing bool
-		trustedProxy      bool
+		name                    string
+		doPersonalPairing       bool
+		trustedProxy            bool
+		prependUnreachableEntry bool
 	}{
-		{"LightOnly", false, false},
-		{"InproxyBrokerUnavailable", true, false},
-		{"TrustedLightOnly", false, true},
+		{"LightOnly", false, false, false},
+		{"InproxyBrokerUnavailable", true, false, false},
+		{"TrustedLightOnly", false, true, false},
+		{"SecondPersonalEntry", false, false, true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			runServer(t,
 				&runServerConfig{
-					tunnelProtocol:              protocol.TUNNEL_PROTOCOL_LIGHT_TLS_TLS_SSH,
-					passthrough:                 true,
-					requireAuthorization:        true,
-					doTunneledWebRequest:        true,
-					doLogHostProvider:           true,
-					doLogProtobuf:               useProtobufLogging,
-					usePersonalLightProxyTunnel: true,
-					doPersonalPairing:           testCase.doPersonalPairing,
-					trustedLightProxy:           testCase.trustedProxy,
+					tunnelProtocol:                            protocol.TUNNEL_PROTOCOL_LIGHT_TLS_TLS_SSH,
+					passthrough:                               true,
+					requireAuthorization:                      true,
+					doTunneledWebRequest:                      true,
+					doLogHostProvider:                         true,
+					doLogProtobuf:                             useProtobufLogging,
+					usePersonalLightProxyTunnel:               true,
+					doPersonalPairing:                         testCase.doPersonalPairing,
+					trustedLightProxy:                         testCase.trustedProxy,
+					prependUnreachablePersonalLightProxyEntry: testCase.prependUnreachableEntry,
 				})
 		})
 	}
@@ -1010,6 +1013,8 @@ type runServerConfig struct {
 	trustedLightProxy            bool
 	useLightProxyFallback        bool
 	testDSLAccessToken           bool
+
+	prependUnreachablePersonalLightProxyEntry bool
 }
 
 var (
@@ -1970,6 +1975,10 @@ func runServer(t *testing.T, runConfig *runServerConfig) {
 
 	var lightProxyEntry []byte
 	const lightProxyEntryTracker = 0x0102030405060708
+	expectLightProxyEntryTracker := int64(lightProxyEntryTracker)
+	if runConfig.usePersonalLightProxyTunnel {
+		expectLightProxyEntryTracker = psiphon.LightProxyEntryTrackerPersonalPairing
+	}
 	var tunnelLightProxyID string
 	if useLightProxyTunnel {
 		var stopLightProxy func()
@@ -2122,16 +2131,22 @@ func runServer(t *testing.T, runConfig *runServerConfig) {
 
 	if runConfig.useLightProxyFallback {
 		clientConfig.EnableLightProxyFallback = true
-		clientConfig.LightProxyEntry = lightProxyEntry
-		clientConfig.LightProxyEntryTracker = lightProxyEntryTracker
+		clientConfig.FallbackLightProxyEntry = lightProxyEntry
+		clientConfig.FallbackLightProxyEntryTracker = lightProxyEntryTracker
 	}
 
 	var lightIngressQUICVersion, lightEgressQUICVersion string
 	if useLightProxyTunnel {
 		if runConfig.usePersonalLightProxyTunnel {
 			clientConfig.EnablePersonalLightProxyTunnels = true
-			clientConfig.LightProxyEntry = lightProxyEntry
-			clientConfig.LightProxyEntryTracker = lightProxyEntryTracker
+			if runConfig.prependUnreachablePersonalLightProxyEntry {
+				// Round robin must reach the second entry.
+				clientConfig.PersonalLightProxyEntries = append(
+					clientConfig.PersonalLightProxyEntries,
+					generateUnreachablePersonalLightProxyEntry(t, psiphonServerAddress))
+			}
+			clientConfig.PersonalLightProxyEntries = append(
+				clientConfig.PersonalLightProxyEntries, lightProxyEntry)
 		}
 		one, zero := 1.0, 0.0
 		padding := 64
@@ -3046,7 +3061,7 @@ func runServer(t *testing.T, runConfig *runServerConfig) {
 			expectReplacedProxyProtocolHeader,
 			inproxyTestConfig,
 			lightProxyID,
-			lightProxyEntryTracker,
+			expectLightProxyEntryTracker,
 			lightIngressQUICVersion,
 			lightEgressQUICVersion,
 			logFields)
@@ -6630,4 +6645,41 @@ func startLightProxy(
 	}
 
 	return proxyEntry, proxyID, stopProxy, nil
+}
+
+// generateUnreachablePersonalLightProxyEntry generates a personal tunnel
+// entry for a TLS proxy that is not running.
+func generateUnreachablePersonalLightProxyEntry(
+	t *testing.T, passthroughAddress string) []byte {
+
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	proxyPrivateKey, err := inproxy.GenerateSessionPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyID, err := light.GetTunnelProxyID(proxyPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, proxyEntry, err := light.Generate(
+		prng.HexString(8),
+		nil,
+		[]light.ProxyAddress{
+			{IPAddress: "127.0.0.1", Port: port, Protocol: light.LIGHT_PROTOCOL_TLS},
+		},
+		"example.org", "", 0.5, protocol.TLS_PROFILE_CHROME_133, 0.5, 0, 0, 0, 0,
+		time.Hour, nil, nil, nil, nil,
+		passthroughAddress,
+		base64.RawStdEncoding.EncodeToString(prng.Bytes(32)),
+		proxyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return proxyEntry
 }

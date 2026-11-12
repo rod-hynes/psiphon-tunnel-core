@@ -20,6 +20,7 @@
 package psiphon
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"sync"
@@ -50,9 +51,9 @@ import (
 // directly to the application destination over TCP.
 //
 // Personal tunnel (EnablePersonalLightProxyTunnels) uses the configured
-// LightProxyEntry and its confidential personal compartment ID. LIGHT
-// protocols participate in the personal-pairing race, alongside INPROXY when
-// configured.
+// PersonalLightProxyEntries and their confidential personal compartment IDs.
+// LIGHT protocols participate in the personal-pairing race, alongside INPROXY
+// when configured.
 //
 // Common tunnel selects entries from a separate TTL-limited datastore bucket
 // when dialing LIGHT protocols in the regular tunnel race. Fresh dials select
@@ -1046,4 +1047,80 @@ func (r *lightProxyEventReceiver) WarningLog(_ string, message string) {
 
 func (r *lightProxyEventReceiver) ErrorLog(_ string, message string) {
 	NoticeError("light proxy: %s", message)
+}
+
+// lightTunnelProxyEntryIterator iterates over Light proxy entries for tunnel
+// dials.
+type lightTunnelProxyEntryIterator interface {
+	HasNext(ingressProtocol string) bool
+	Next(ingressProtocol string) ([]byte, *StoredLightProxyEntry, error)
+	Load(proxyEntryHash []byte, ingressProtocol string) (*StoredLightProxyEntry, error)
+}
+
+// LightProxyEntryTrackerPersonalPairing is the tracker reported for
+// PersonalLightProxyEntries, which are not obtained from the Psiphon network.
+const LightProxyEntryTrackerPersonalPairing = -1
+
+type personalLightProxyEntry struct {
+	proxyEntry     []byte
+	proxyEntryHash []byte
+	protocols      []string
+}
+
+// personalLightProxyEntryIterator cycles through PersonalLightProxyEntries in
+// ordered round robin, with one cycle per ingress protocol.
+type personalLightProxyEntryIterator struct {
+	mutex   sync.Mutex
+	entries map[string][]personalLightProxyEntry
+	indexes map[string]int
+}
+
+func newPersonalLightProxyEntryIterator(config *Config) *personalLightProxyEntryIterator {
+	iterator := &personalLightProxyEntryIterator{
+		entries: make(map[string][]personalLightProxyEntry),
+		indexes: make(map[string]int),
+	}
+	for _, entry := range config.personalLightProxyEntries {
+		for _, ingressProtocol := range entry.protocols {
+			iterator.entries[ingressProtocol] = append(iterator.entries[ingressProtocol], entry)
+		}
+	}
+	return iterator
+}
+
+func (iterator *personalLightProxyEntryIterator) HasNext(ingressProtocol string) bool {
+	return len(iterator.entries[ingressProtocol]) > 0
+}
+
+func (iterator *personalLightProxyEntryIterator) Next(
+	ingressProtocol string) ([]byte, *StoredLightProxyEntry, error) {
+
+	iterator.mutex.Lock()
+	defer iterator.mutex.Unlock()
+
+	entries := iterator.entries[ingressProtocol]
+	if len(entries) == 0 {
+		return nil, nil, nil
+	}
+	index := iterator.indexes[ingressProtocol]
+	iterator.indexes[ingressProtocol] = (index + 1) % len(entries)
+	entry := entries[index]
+	return entry.proxyEntryHash, &StoredLightProxyEntry{
+		LightProxyEntry:        entry.proxyEntry,
+		LightProxyEntryTracker: LightProxyEntryTrackerPersonalPairing,
+	}, nil
+}
+
+func (iterator *personalLightProxyEntryIterator) Load(
+	proxyEntryHash []byte, ingressProtocol string) (*StoredLightProxyEntry, error) {
+
+	for _, entry := range iterator.entries[ingressProtocol] {
+		if bytes.Equal(entry.proxyEntryHash, proxyEntryHash) {
+			return &StoredLightProxyEntry{
+				LightProxyEntry:        entry.proxyEntry,
+				LightProxyEntryTracker: LightProxyEntryTrackerPersonalPairing,
+			}, nil
+		}
+	}
+	return nil, nil
 }

@@ -257,8 +257,7 @@ func MakeDialParameters(
 		serverEntry *protocol.ServerEntry,
 		isPrioritized bool,
 		prioritizeTunnelProtocol string) (string, bool),
-	selectCommonLightTunnelProxyEntry func(
-		ingressProtocol string) ([]byte, *StoredLightProxyEntry, error),
+	lightTunnelProxyEntryIterator lightTunnelProxyEntryIterator,
 	serverEntry *protocol.ServerEntry,
 	inproxyClientBrokerClientManager *InproxyBrokerClientManager,
 	inproxyClientNATStateManager *InproxyNATStateManager,
@@ -491,24 +490,20 @@ func MakeDialParameters(
 		dialParams = nil
 	}
 
-	var commonLightProxy *StoredLightProxyEntry
+	var lightProxy *StoredLightProxyEntry
 	if dialParams != nil &&
 		protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
 
-		// Common Light replay loads the proxy entry identified by ProxyEntryHash in
-		// the saved dial parameters.
-		// Personal and common replay records are not interchangeable.
-		validLightReplay := config.EnablePersonalLightProxyTunnels &&
-			len(dialParams.ProxyEntryHash) == 0
-		if !config.IsPersonalPairingMode() && len(dialParams.ProxyEntryHash) > 0 {
-			commonLightProxy, err = LoadCommonLightTunnelProxyEntry(
+		// Replay reloads the proxy entry identified by ProxyEntryHash. Personal
+		// and common replay records are not interchangeable.
+		if lightTunnelProxyEntryIterator != nil && len(dialParams.ProxyEntryHash) > 0 {
+			lightProxy, err = lightTunnelProxyEntryIterator.Load(
 				dialParams.ProxyEntryHash, getLightTunnelIngressProtocol(dialParams.TunnelProtocol))
 			if err != nil {
-				NoticeWarning("LoadCommonLightTunnelProxyEntry failed: %s", err)
+				NoticeWarning("load Light proxy entry failed: %s", err)
 			}
-			validLightReplay = commonLightProxy != nil
 		}
-		if !validLightReplay {
+		if lightProxy == nil {
 			err = DeleteDialParameters(serverEntry.IpAddress, networkID)
 			if err != nil {
 				NoticeWarning("DeleteDialParameters failed: %s", err)
@@ -1030,31 +1025,19 @@ func MakeDialParameters(
 	if protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
 
 		ingressProtocol := getLightTunnelIngressProtocol(dialParams.TunnelProtocol)
-		if config.IsPersonalPairingMode() {
-			if !config.EnablePersonalLightProxyTunnels {
+		if !isReplay {
+			if lightTunnelProxyEntryIterator == nil {
 				return nil, nil
 			}
-			// Personal tunnels use only the configured entry.
-			if !common.Contains(config.personalLightProxyProtocols, ingressProtocol) {
-				return nil, errors.TraceNew(
-					"Light proxy does not support ingress protocol")
+			// TODO: move Light entry reads outside concurrentEstablishTunnelsMutex.
+			dialParams.ProxyEntryHash, lightProxy, err =
+				lightTunnelProxyEntryIterator.Next(ingressProtocol)
+			if err != nil {
+				return nil, errors.Trace(err)
 			}
-		} else {
-			// Common Light tunnels use the saved proxy entry for replay and select
-			// one for other dials.
-			if !isReplay {
-				if selectCommonLightTunnelProxyEntry == nil {
-					return nil, errors.TraceNew("missing common Light proxy entry selector")
-				}
-				dialParams.ProxyEntryHash, commonLightProxy, err =
-					selectCommonLightTunnelProxyEntry(ingressProtocol)
-				if err != nil {
-					return nil, errors.Trace(err)
-				}
-			}
-			if commonLightProxy == nil {
-				return nil, nil
-			}
+		}
+		if lightProxy == nil {
+			return nil, nil
 		}
 
 		if !isReplay || !replayTLSProfile {
@@ -2213,20 +2196,14 @@ func MakeDialParameters(
 
 		// Future enhancement: allow tactics, RSL/OSL, and untunneled DSL requests
 		// to use Light proxies.
-		proxyEntry := config.LightProxyEntry
-		proxyEntryTracker := config.LightProxyEntryTracker
-		if commonLightProxy != nil {
-			proxyEntry = commonLightProxy.LightProxyEntry
-			proxyEntryTracker = commonLightProxy.LightProxyEntryTracker
-		}
 		dialParams.lightProxyClient, err = makeLightProxyClient(
 			config,
 			dialParams.dialConfig,
 			quicTLSClientSessionCache,
 			tlsClientSessionCache,
 			true,
-			proxyEntry,
-			proxyEntryTracker)
+			lightProxy.LightProxyEntry,
+			lightProxy.LightProxyEntryTracker)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}

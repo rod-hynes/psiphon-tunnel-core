@@ -320,15 +320,15 @@ func NewController(config *Config) (controller *Controller, err error) {
 
 		var err error
 
-		if len(config.LightProxyEntry) > 0 {
+		if len(config.FallbackLightProxyEntry) > 0 {
 
 			// Any TTL in the light proxy entry is ignored. When
-			// LightProxyEntry is configured, this entry is always chosen.
+			// FallbackLightProxyEntry is configured, this entry is always chosen.
 
 			err = initLightFallbackProxyClient(
 				controller,
-				config.LightProxyEntry,
-				config.LightProxyEntryTracker)
+				config.FallbackLightProxyEntry,
+				config.FallbackLightProxyEntryTracker)
 		} else {
 
 			// LoadLightFallbackProxy will enforce the light proxy entry TTL, if any,
@@ -1243,7 +1243,8 @@ func (controller *Controller) ImportPushPayload(payload []byte) bool {
 		lightProxyEntry := lightProxyEntries[prng.Intn(len(lightProxyEntries))]
 
 		// Push-imported light proxies are persisted for potential future
-		// use as fallbacks. Personal tunnels continue to use config.LightProxyEntry.
+		// use as fallbacks. Personal tunnels continue to use
+		// PersonalLightProxyEntries.
 		ok := StoreLightFallbackProxy(&StoredLightProxyEntry{
 			LightProxyEntry:        lightProxyEntry.ProxyEntry,
 			LightProxyEntryTracker: lightProxyEntry.ProxyEntryTracker,
@@ -2704,7 +2705,7 @@ type protocolSelectionConstraints struct {
 	replayCandidateCount                      int
 	inproxyClientDialRateLimiter              *rate.Limiter
 	nextPersonalPairingProtocolFamily         personalPairingProtocolFamily
-	commonLightTunnelProxyEntryIterator       *CommonLightTunnelProxyEntryIterator
+	lightTunnelProxyEntryIterator             lightTunnelProxyEntryIterator
 }
 
 func (constraints *protocolSelectionConstraints) initializeLightQUICLimits(
@@ -2771,10 +2772,9 @@ func (p *protocolSelectionConstraints) canReplay(
 		return false
 	}
 
-	// MakeDialParameters validates common Light replay against the proxy entry
+	// MakeDialParameters validates Light replay against the proxy entry
 	// identified by ProxyEntryHash in the saved dial parameters.
 	if protocol.TunnelProtocolUsesLight(replayProtocol) &&
-		p.config.IsPersonalPairingMode() &&
 		!p.supportsLightProtocol(getLightTunnelIngressProtocol(replayProtocol)) {
 
 		return false
@@ -2897,20 +2897,12 @@ func (p *protocolSelectionConstraints) filterLightProtocols(
 }
 
 func (p *protocolSelectionConstraints) supportsLightProtocol(ingressProtocol string) bool {
-
-	// Personal pairing uses only its configured Light proxy, never common entries.
-	if p.config.IsPersonalPairingMode() {
-		if !p.config.EnablePersonalLightProxyTunnels {
-			return false
-		}
-		return common.Contains(p.config.personalLightProxyProtocols, ingressProtocol)
-	}
-
-	// Common tunnel entries are independent of the configured fallback client.
-	if p.commonLightTunnelProxyEntryIterator == nil {
+	// Personal pairing uses only its configured Light proxies, never common
+	// entries, which are independent of the fallback client.
+	if p.lightTunnelProxyEntryIterator == nil {
 		return false
 	}
-	return p.commonLightTunnelProxyEntryIterator.HasNext(ingressProtocol)
+	return p.lightTunnelProxyEntryIterator.HasNext(ingressProtocol)
 }
 
 // selectPersonalPairingProtocolFamily chooses between Light and in-proxy
@@ -3427,8 +3419,11 @@ func (controller *Controller) launchEstablishing() {
 
 	p.Close()
 
-	if !controller.config.IsPersonalPairingMode() {
-		// Candidate scans and workers use the common Light proxy iterator to check
+	if controller.config.EnablePersonalLightProxyTunnels {
+		controller.protocolSelectionConstraints.lightTunnelProxyEntryIterator =
+			newPersonalLightProxyEntryIterator(controller.config)
+	} else if !controller.config.IsPersonalPairingMode() {
+		// Candidate scans and workers use the Light proxy entry source to check
 		// which ingress protocols have available proxy entries. Initialize it first.
 		iterator, err := NewCommonLightTunnelProxyEntryIterator(controller.establishCtx)
 		if err != nil {
@@ -3439,7 +3434,7 @@ func (controller *Controller) launchEstablishing() {
 			controller.SignalComponentFailure()
 			return
 		}
-		controller.protocolSelectionConstraints.commonLightTunnelProxyEntryIterator = iterator
+		controller.protocolSelectionConstraints.lightTunnelProxyEntryIterator = iterator
 	}
 
 	// Trigger CandidateServers and AvailableEgressRegions notices. By default,
@@ -3682,7 +3677,7 @@ func (controller *Controller) stopEstablishing() {
 	controller.serverAffinityDoneBroadcast = nil
 	controller.establishSignalForceTacticsFetch = nil
 	if controller.protocolSelectionConstraints != nil {
-		controller.protocolSelectionConstraints.commonLightTunnelProxyEntryIterator = nil
+		controller.protocolSelectionConstraints.lightTunnelProxyEntryIterator = nil
 	}
 
 	controller.concurrentEstablishTunnelsMutex.Lock()
@@ -4081,8 +4076,10 @@ loop:
 
 		// Reset the common Light proxy entry iterator when imports or renewals
 		// may have changed the set of available proxy entries.
-		if commonLightIterator := controller.protocolSelectionConstraints.commonLightTunnelProxyEntryIterator; commonLightIterator != nil &&
-			commonLightIterator.imports.Load() != datastoreCommonLightTunnelProxyEntriesImports.Load() {
+		commonLightIterator, ok := controller.protocolSelectionConstraints.
+			lightTunnelProxyEntryIterator.(*CommonLightTunnelProxyEntryIterator)
+		if ok && commonLightIterator.imports.Load() !=
+			datastoreCommonLightTunnelProxyEntriesImports.Load() {
 
 			if err := commonLightIterator.Reset(controller.establishCtx); err != nil {
 				if controller.isStopEstablishing() {
@@ -4472,20 +4469,6 @@ loop:
 			return selectedProtocol, ok
 		}
 
-		selectCommonLightTunnelProxyEntry := func(
-			ingressProtocol string) ([]byte, *StoredLightProxyEntry, error) {
-
-			iterator := controller.protocolSelectionConstraints.commonLightTunnelProxyEntryIterator
-			if iterator == nil {
-				return nil, nil, nil
-			}
-			// TODO: move common Light entry reads outside concurrentEstablishTunnelsMutex.
-			// Datastore access is read-only; iterator Reset prunes expired entries.
-			proxyEntryHash, entry, err := iterator.Next(
-				controller.establishCtx, ingressProtocol)
-			return proxyEntryHash, entry, errors.Trace(err)
-		}
-
 		// MakeDialParameters may return a replay instance, if the server
 		// entry has a previous, recent successful connection and
 		// tactics/config has not changed.
@@ -4518,7 +4501,7 @@ loop:
 			beginProtocolSelection,
 			canReplay,
 			selectProtocol,
-			selectCommonLightTunnelProxyEntry,
+			controller.protocolSelectionConstraints.lightTunnelProxyEntryIterator,
 			candidateServerEntry.serverEntry,
 			controller.inproxyClientBrokerClientManager,
 			controller.inproxyNATStateManager,

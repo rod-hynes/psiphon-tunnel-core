@@ -3784,24 +3784,18 @@ func (iterator *CommonLightTunnelProxyEntryIterator) HasNext(ingressProtocol str
 // ProxyEntryHash. TLS and QUIC independently cycle through the shuffled keys.
 // It returns nil values when no matching entry is found in one full pass.
 func (iterator *CommonLightTunnelProxyEntryIterator) Next(
-	ctx context.Context, ingressProtocol string) (
+	ingressProtocol string) (
 	proxyEntryHash []byte, storedLightProxy *StoredLightProxyEntry, err error) {
 
 	iterator.mutex.Lock()
 	defer iterator.mutex.Unlock()
 
-	if ctx.Err() != nil {
-		return nil, nil, errors.Trace(ctx.Err())
-	}
 	hashes, ok := iterator.proxyEntryHashes[ingressProtocol]
 	if !ok {
 		return nil, nil, errors.TraceNew("invalid ingress protocol")
 	}
 
 	for len(hashes) > 0 {
-		if ctx.Err() != nil {
-			return nil, nil, errors.Trace(ctx.Err())
-		}
 		index := iterator.indexes[ingressProtocol] % len(hashes)
 		proxyEntryHash := hashes[index]
 		storedLightProxy, err := LoadCommonLightTunnelProxyEntry(proxyEntryHash, ingressProtocol)
@@ -3818,6 +3812,12 @@ func (iterator *CommonLightTunnelProxyEntryIterator) Next(
 		return append([]byte(nil), proxyEntryHash...), storedLightProxy, nil
 	}
 	return nil, nil, nil
+}
+
+func (iterator *CommonLightTunnelProxyEntryIterator) Load(
+	proxyEntryHash []byte, ingressProtocol string) (*StoredLightProxyEntry, error) {
+
+	return LoadCommonLightTunnelProxyEntry(proxyEntryHash, ingressProtocol)
 }
 
 // LoadCommonLightTunnelProxyEntry loads an entry without extending its TTL.

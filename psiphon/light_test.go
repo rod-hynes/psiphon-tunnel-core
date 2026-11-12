@@ -1287,11 +1287,15 @@ func TestPersonalPairingProtocolSelection(t *testing.T) {
 	config := &Config{
 		EnablePersonalLightProxyTunnels:    true,
 		InproxyClientPersonalCompartmentID: "personal",
-		personalLightProxyProtocols:        []string{light.LIGHT_PROTOCOL_TLS},
+		personalLightProxyEntries: []personalLightProxyEntry{
+			{proxyEntryHash: []byte{1}, protocols: []string{light.LIGHT_PROTOCOL_TLS}},
+			{proxyEntryHash: []byte{2}, protocols: []string{light.LIGHT_PROTOCOL_TLS}},
+		},
 	}
 
 	constraints := &protocolSelectionConstraints{
-		config: config,
+		config:                        config,
+		lightTunnelProxyEntryIterator: newPersonalLightProxyEntryIterator(config),
 		limitTunnelProtocols: protocol.TunnelProtocols{
 			lightProtocol,
 			inproxyProtocol,
@@ -1342,6 +1346,23 @@ func TestPersonalPairingProtocolSelection(t *testing.T) {
 		personalPairingProtocolInproxy
 	selectFamily(inproxyServerEntry, personalPairingProtocolInproxy)
 	selectFamily(dualServerEntry, personalPairingProtocolLight)
+
+	// Test: personal entries are selected in ordered round robin and loaded by
+	// hash.
+
+	entryIterator := constraints.lightTunnelProxyEntryIterator
+	for _, expected := range [][]byte{{1}, {2}, {1}} {
+		hash, stored, err := entryIterator.Next(light.LIGHT_PROTOCOL_TLS)
+		if err != nil || stored == nil || !bytes.Equal(hash, expected) {
+			t.Fatalf("unexpected personal entry selection: %v", err)
+		}
+	}
+	if stored, err := entryIterator.Load([]byte{2}, light.LIGHT_PROTOCOL_TLS); err != nil || stored == nil {
+		t.Fatal("failed to load personal entry by hash")
+	}
+	if stored, err := entryIterator.Load([]byte{2}, light.LIGHT_PROTOCOL_QUIC); err != nil || stored != nil {
+		t.Fatal("loaded personal entry for unsupported ingress protocol")
+	}
 }
 
 func TestPersonalPairingConnectionWorkerPoolSize(t *testing.T) {
@@ -1555,8 +1576,7 @@ func TestRunningLightProxyConfig(t *testing.T) {
 			config.EnablePersonalLightProxyTunnels = true
 			config.ProxyPersonalCompartmentID =
 				base64.RawStdEncoding.EncodeToString(personalCompartmentID)
-			var err error
-			config.LightProxyEntry, err = protocol.CBOREncoding.Marshal(&light.SignedProxyEntry{
+			entry, err := protocol.CBOREncoding.Marshal(&light.SignedProxyEntry{
 				ProxyEntry: light.ProxyEntry{
 					ProxyID:               base64.RawStdEncoding.EncodeToString(prng.Bytes(32)),
 					DialAddresses:         config.LightProxyDialAddresses,
@@ -1568,6 +1588,7 @@ func TestRunningLightProxyConfig(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			config.PersonalLightProxyEntries = [][]byte{entry}
 			err = config.Commit(false)
 			if testCase.expectedError == "" {
 				if err != nil {
@@ -2161,6 +2182,16 @@ func newRunningLightProxyTestConfig(t *testing.T) *Config {
 	}
 }
 
+type testLightProxyEntryIterator struct {
+	lightTunnelProxyEntryIterator
+	next func(string) ([]byte, *StoredLightProxyEntry, error)
+}
+
+func (s testLightProxyEntryIterator) Next(
+	ingressProtocol string) ([]byte, *StoredLightProxyEntry, error) {
+	return s.next(ingressProtocol)
+}
+
 func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 	if err := SetNoticeWriter(io.Discard); err != nil {
 		t.Fatal(err)
@@ -2221,9 +2252,13 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 				NetworkID:                       "WIFI-test",
 				EnablePersonalLightProxyTunnels: !testCase.common,
 				EnableLightProxyFallback:        testCase.common,
-				LightProxyEntry:                 entry,
-				LightProxyEntryTracker:          2,
 				IPv6Synthesizer:                 lightTestIPv6Synthesizer{},
+			}
+			if testCase.common {
+				config.FallbackLightProxyEntry = entry
+				config.FallbackLightProxyEntryTracker = 2
+			} else {
+				config.PersonalLightProxyEntries = [][]byte{entry}
 			}
 			if err := config.Commit(false); err != nil {
 				t.Fatal(err)
@@ -2253,20 +2288,18 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			var entryIterator lightTunnelProxyEntryIterator = iterator
+			if !testCase.common {
+				entryIterator = newPersonalLightProxyEntryIterator(config)
+			}
 			constraints := &protocolSelectionConstraints{
-				config:                              config,
-				limitTunnelProtocols:                protocol.TunnelProtocols{tunnelProtocol},
-				replayCandidateCount:                -1,
-				commonLightTunnelProxyEntryIterator: iterator,
+				config:                        config,
+				limitTunnelProtocols:          protocol.TunnelProtocols{tunnelProtocol},
+				replayCandidateCount:          -1,
+				lightTunnelProxyEntryIterator: entryIterator,
 			}
 			canReplay := func(serverEntry *protocol.ServerEntry, p string) bool {
 				return constraints.canReplay(0, false, true, serverEntry, p)
-			}
-			selectCommonEntry := func(ingress string) ([]byte, *StoredLightProxyEntry, error) {
-				if !testCase.common {
-					t.Error("personal mode selected a common entry")
-				}
-				return iterator.Next(context.Background(), ingress)
 			}
 
 			serverEntry := makeMockServerEntries(tunnelProtocol, "CA", "", "", 1)[0]
@@ -2304,7 +2337,7 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 				t.Helper()
 				dialParams, err := MakeDialParameters(
 					config, nil, controller.quicTLSClientSessionCache, controller.tlsClientSessionCache, nil, nil,
-					canReplay, selectProtocol, selectCommonEntry, serverEntry, nil, nil, false, 0)
+					canReplay, selectProtocol, entryIterator, serverEntry, nil, nil, false, 0)
 				if err != nil || dialParams == nil {
 					t.Fatalf("MakeDialParameters: %v", err)
 				}
@@ -2520,13 +2553,13 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 				t.Fatal("missing ingress QUIC nonce transform")
 			}
 			dialParams.Succeeded()
-			savedSelectCommonEntry := selectCommonEntry
-			selectCommonEntry = func(string) ([]byte, *StoredLightProxyEntry, error) {
-				return nil, nil, errors.TraceNew("replay selected a common entry")
-			}
+			savedEntryIterator := entryIterator
+			entryIterator = testLightProxyEntryIterator{entryIterator, func(string) ([]byte, *StoredLightProxyEntry, error) {
+				return nil, nil, errors.TraceNew("replay selected an entry")
+			}}
 			seedSessions()
 			replayed := makeParams()
-			selectCommonEntry = savedSelectCommonEntry
+			entryIterator = savedEntryIterator
 			checkSessions(true)
 			if !replayed.IsReplay || !reflect.DeepEqual(dialParams.GetLightTunnelMetrics(), replayed.GetLightTunnelMetrics()) ||
 				dialParams.LightQUICDisablePathMTUDiscovery != replayed.LightQUICDisablePathMTUDiscovery ||
@@ -2538,13 +2571,9 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 			if !bytes.Equal(dialParams.ProxyEntryHash, replayed.ProxyEntryHash) {
 				t.Fatal("replay changed the entry")
 			}
-			if testCase.common {
-				entryHash := sha256.Sum256(entry)
-				if !bytes.Equal(dialParams.ProxyEntryHash, entryHash[:]) {
-					t.Fatal("common dial did not retain its entry hash")
-				}
-			} else if len(dialParams.ProxyEntryHash) != 0 {
-				t.Fatal("personal dial retained a common entry hash")
+			entryHash := sha256.Sum256(entry)
+			if !bytes.Equal(dialParams.ProxyEntryHash, entryHash[:]) {
+				t.Fatal("dial did not retain its entry hash")
 			}
 
 			var group sync.WaitGroup
@@ -2555,7 +2584,7 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 					defer group.Done()
 					params, err := MakeDialParameters(
 						config, nil, nil, nil, nil, nil,
-						canReplay, selectProtocol, selectCommonEntry, serverEntry, nil, nil, false, 0)
+						canReplay, selectProtocol, entryIterator, serverEntry, nil, nil, false, 0)
 					if err != nil || params == nil || !params.IsReplay ||
 						!bytes.Equal(params.ProxyEntryHash, dialParams.ProxyEntryHash) {
 
@@ -2580,7 +2609,7 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 
 			// Test: handshake and failed-tunnel stats identify the selected proxy.
 
-			expectedTracker := strconv.FormatInt(config.LightProxyEntryTracker, 10)
+			expectedTracker := strconv.FormatInt(LightProxyEntryTrackerPersonalPairing, 10)
 			if testCase.common {
 				expectedTracker = "1"
 			}
@@ -2744,10 +2773,10 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 					dialParams.Succeeded()
 					replacementHash := sha256.Sum256(replacement)
 					// Select only the replacement after replay rejects the old version.
-					selectCommonEntry = func(ingress string) ([]byte, *StoredLightProxyEntry, error) {
+					entryIterator = testLightProxyEntryIterator{iterator, func(ingress string) ([]byte, *StoredLightProxyEntry, error) {
 						stored, err := LoadCommonLightTunnelProxyEntry(replacementHash[:], ingress)
 						return replacementHash[:], stored, err
-					}
+					}}
 					dialParams = makeParams()
 					if dialParams.IsReplay || !bytes.Equal(dialParams.ProxyEntryHash, replacementHash[:]) ||
 						dialParams.LightProxyID != signedEntry.ProxyEntry.ProxyID ||
@@ -2766,7 +2795,7 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 				apply()
 				dialParams, err := MakeDialParameters(
 					config, nil, nil, nil, nil, nil,
-					canReplay, selectProtocol, selectCommonEntry, serverEntry, nil, nil, false, 0)
+					canReplay, selectProtocol, entryIterator, serverEntry, nil, nil, false, 0)
 				if err != nil || dialParams != nil {
 					t.Fatalf("unexpected dial with incompatible egress QUIC limits: %v", err)
 				}
@@ -3003,8 +3032,8 @@ func TestCommonLightTunnelProxyEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	constraints := &protocolSelectionConstraints{
-		config:                              config,
-		commonLightTunnelProxyEntryIterator: iterator,
+		config:                        config,
+		lightTunnelProxyEntryIterator: iterator,
 	}
 
 	// Test: common Light tunnel selection ignores the configured fallback entry.
@@ -3087,11 +3116,11 @@ func TestCommonLightTunnelProxyEntries(t *testing.T) {
 
 		t.Fatal("unexpected snapshot or consuming availability check")
 	}
-	constraints.config = &Config{EnablePersonalLightProxyTunnels: true}
+	constraints.lightTunnelProxyEntryIterator = nil
 	if constraints.supportsLightProtocol(light.LIGHT_PROTOCOL_TLS) {
-		t.Fatal("personal mode used a common entry")
+		t.Fatal("missing entry entryIterator made Light eligible")
 	}
-	constraints.config = config
+	constraints.lightTunnelProxyEntryIterator = iterator
 
 	// Test: concurrent workers and resets preserve transport filtering.
 
@@ -3105,7 +3134,7 @@ func TestCommonLightTunnelProxyEntries(t *testing.T) {
 				ingress = light.LIGHT_PROTOCOL_QUIC
 			}
 			for j := 0; j < 10; j++ {
-				hash, stored, err := iterator.Next(ctx, ingress)
+				hash, stored, err := iterator.Next(ingress)
 				validHash := bytes.Equal(hash, quicHash[:]) ||
 					(ingress == light.LIGHT_PROTOCOL_TLS && bytes.Equal(hash, tlsHash[:]))
 				if err != nil || stored == nil || !validHash {
@@ -3137,7 +3166,7 @@ func TestCommonLightTunnelProxyEntries(t *testing.T) {
 		t.Fatalf("expired index entry was not deleted: %v", err)
 	}
 	for i := 0; i < 2; i++ {
-		if hash, stored, err := iterator.Next(ctx, light.LIGHT_PROTOCOL_TLS); err != nil ||
+		if hash, stored, err := iterator.Next(light.LIGHT_PROTOCOL_TLS); err != nil ||
 			stored == nil || !bytes.Equal(hash, quicHash[:]) {
 
 			t.Fatalf("expired entry prevented selecting a live entry: %v", err)
@@ -3146,7 +3175,7 @@ func TestCommonLightTunnelProxyEntries(t *testing.T) {
 	if value, err := copyBucketValue(datastoreCommonLightTunnelProxyEntriesBucket, tlsHash[:]); err != nil || value != nil {
 		t.Fatalf("expired entry was not deleted: %v", err)
 	}
-	if hash, stored, err := iterator.Next(ctx, light.LIGHT_PROTOCOL_QUIC); err != nil ||
+	if hash, stored, err := iterator.Next(light.LIGHT_PROTOCOL_QUIC); err != nil ||
 		stored == nil || !bytes.Equal(hash, quicHash[:]) {
 
 		t.Fatalf("live entry hidden by expired entry: %v", err)
@@ -3172,7 +3201,7 @@ func TestCommonLightTunnelProxyEntries(t *testing.T) {
 		if !iterator.HasNext(light.LIGHT_PROTOCOL_TLS) {
 			t.Fatal("invalid entry prevented availability")
 		}
-		if hash, stored, err := iterator.Next(ctx, light.LIGHT_PROTOCOL_TLS); err != nil ||
+		if hash, stored, err := iterator.Next(light.LIGHT_PROTOCOL_TLS); err != nil ||
 			stored == nil || !bytes.Equal(hash, quicHash[:]) {
 
 			t.Fatalf("invalid entry prevented selecting a live entry: %v", err)
@@ -3234,7 +3263,7 @@ func TestCommonLightTunnelProxyEntries(t *testing.T) {
 			t.Fatalf("malformed index was not deleted: %v", err)
 		}
 	}
-	if hash, stored, err := iterator.Next(ctx, light.LIGHT_PROTOCOL_QUIC); err != nil ||
+	if hash, stored, err := iterator.Next(light.LIGHT_PROTOCOL_QUIC); err != nil ||
 		stored == nil || !bytes.Equal(hash, quicHash[:]) {
 
 		t.Fatalf("malformed index cleanup deleted a live entry: %v", err)
