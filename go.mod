@@ -4,11 +4,6 @@ go 1.26.0
 
 toolchain go1.26.10
 
-// The following replaces are required only when the build tag
-// PSIPHON_ENABLE_REFRACTION_NETWORKING is specified.
-
-replace gitlab.com/yawning/obfs4.git => github.com/jmwample/obfs4 v0.0.0-20230725223418-2d2e5b4a16ba
-
 replace github.com/pion/dtls/v2 => ./replace/dtls
 
 // pion/dtls v2 uses a local replace (replace/dtls) with [Psiphon] patches
@@ -75,11 +70,11 @@ require (
 	github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85
 	github.com/wlynxg/anet v0.0.5
 	github.com/zeebo/blake3 v0.2.4
-	golang.org/x/crypto v0.54.0
-	golang.org/x/net v0.56.0
-	golang.org/x/sync v0.22.0
-	golang.org/x/sys v0.47.0
-	golang.org/x/term v0.45.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/net v0.62.0
+	golang.org/x/sync v0.24.0
+	golang.org/x/sys v0.49.0
+	golang.org/x/term v0.47.0
 	golang.org/x/time v0.14.0
 	golang.zx2c4.com/wireguard v0.0.0-20230325221338-052af4a8072b
 	golang.zx2c4.com/wireguard/windows v0.5.3
@@ -146,8 +141,8 @@ require (
 	gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib v1.5.0 // indirect
 	go.uber.org/mock v0.4.0 // indirect
 	golang.org/x/exp v0.0.0-20240110193028-0dcbfd608b1e // indirect
-	golang.org/x/mod v0.37.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
-	golang.org/x/tools v0.47.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/tools v0.51.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

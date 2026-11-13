@@ -22,6 +22,7 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
+	"math"
 	"net"
 	"regexp"
 	"strconv"
@@ -41,8 +42,10 @@ import (
 )
 
 const (
-	MAX_API_PARAM_ARRAY_ENTRIES = 256
-	PADDING_MAX_BYTES           = 16 * 1024
+	MAX_API_PARAM_ARRAY_ENTRIES       = 256
+	MAX_API_PARAM_STRING_LENGTH       = 1024
+	MAX_API_PARAM_STRING_ARRAY_LENGTH = 8 * 1024
+	PADDING_MAX_BYTES                 = 16 * 1024
 
 	PERSISTENT_STATS_MAX_LOGS_PER_TUNNEL         = 1024
 	PERSISTENT_STATS_MAX_DROPPED_LOGS_PER_TUNNEL = 16
@@ -707,6 +710,11 @@ var uniqueUserParams = append(
 var connectedRequestParams = append(
 	[]requestParamSpec{
 		{"establishment_duration", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"upstream_bytes_fragmented", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"upstream_min_bytes_written", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"upstream_max_bytes_written", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"upstream_min_delayed", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"upstream_max_delayed", isIntString, requestParamOptional | requestParamLogStringAsInt},
 		{"light_proxy_id", isAnyString, requestParamOptional},
 		{"light_proxy_entry_tracker", isIntString, requestParamOptional | requestParamLogStringAsInt},
 		{"light_proxy_dial_IPv4", isIntString, requestParamOptional | requestParamLogStringAsInt},
@@ -1418,6 +1426,8 @@ var sessionBaseParams = append(
 // and are populated by the server; other fields, such as last_connected, are
 // only sent by the client for certain API requests.
 //
+// Returned strings and string arrays use the same size limits as log fields.
+//
 // Overall request size is not checked here; packedParams is already
 // deserialized, and the caller's transport is expected to enforce a
 // maximum message size.
@@ -1722,7 +1732,8 @@ func validateStringRequestParam(
 		return errors.Tracef("unexpected string param type: %s", expectedParam.name)
 	}
 	if !expectedParam.validator(strValue) {
-		return errors.Tracef("invalid param: %s: %s", expectedParam.name, strValue)
+		return errors.Tracef("invalid param: %s: %s", expectedParam.name,
+			common.TruncateUTF8String(strValue, MAX_API_PARAM_STRING_LENGTH))
 	}
 	return nil
 }
@@ -1914,8 +1925,10 @@ func getRequestLogFields(
 					logFields[name] = intValue
 
 				} else if expectedParam.flags&requestParamLogStringAsFloat != 0 {
-					floatValue, _ := strconv.ParseFloat(strValue, 64)
-					logFields[name] = floatValue
+					floatValue, err := strconv.ParseFloat(strValue, 64)
+					if err == nil && !math.IsNaN(floatValue) && !math.IsInf(floatValue, 0) {
+						logFields[name] = floatValue
+					}
 
 				} else if expectedParam.flags&requestParamLogStringLengthAsInt != 0 {
 					logFields[name] = len(strValue)
@@ -1938,12 +1951,35 @@ func getRequestLogFields(
 		case []interface{}:
 			if expectedParam.name == tactics.SPEED_TEST_SAMPLES_PARAMETER_NAME {
 				logFields[name] = makeSpeedTestSamplesLogField(v)
+			} else if expectedParam.flags&requestParamArray != 0 {
+				// Apply per-string and total byte limits to the logged copy.
+				remainingBytes := MAX_API_PARAM_STRING_ARRAY_LENGTH
+				values := make([]interface{}, 0, len(v))
+				for _, value := range v {
+					strValue, ok := value.(string)
+					if !ok {
+						continue
+					}
+					strValue = common.TruncateUTF8String(
+						strValue, min(MAX_API_PARAM_STRING_LENGTH, remainingBytes))
+					values = append(values, strValue)
+					remainingBytes -= len(strValue)
+					if remainingBytes == 0 {
+						break
+					}
+				}
+				logFields[name] = values
 			} else {
 				logFields[name] = v
 			}
 
 		default:
 			logFields[name] = v
+		}
+
+		strValue, ok := logFields[name].(string)
+		if ok {
+			logFields[name] = common.TruncateUTF8String(strValue, MAX_API_PARAM_STRING_LENGTH)
 		}
 	}
 
@@ -2191,8 +2227,8 @@ func isIntString(value string) bool {
 }
 
 func isFloatString(value string) bool {
-	_, err := strconv.ParseFloat(value, 64)
-	return err == nil
+	floatValue, err := strconv.ParseFloat(value, 64)
+	return err == nil && !math.IsNaN(floatValue) && !math.IsInf(floatValue, 0)
 }
 
 func isClientPlatform(value string) bool {
