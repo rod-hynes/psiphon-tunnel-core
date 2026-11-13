@@ -1008,6 +1008,11 @@ func (controller *Controller) newLightProxy(
 	reportPaddingMinBytes := p.Int(parameters.LightTunnelProxyReportPaddingMinBytes)
 	reportPaddingMaxBytes := p.Int(parameters.LightTunnelProxyReportPaddingMaxBytes)
 
+	lookupGeoIP := config.LightProxyLookupGeoIP
+	if lookupGeoIP == nil {
+		lookupGeoIP = func(string) common.GeoIPData { return common.GeoIPData{} }
+	}
+
 	proxy, err := light.NewProxy(
 		&light.ProxyConfig{
 			DialAddresses:                config.LightProxyDialAddresses,
@@ -1045,9 +1050,7 @@ func (controller *Controller) newLightProxy(
 				dialConfig, controller.quicTLSClientSessionCache),
 			PersonalCompartmentID: config.ProxyPersonalCompartmentID,
 		},
-		// Limitation: the hosted proxy currently has no GeoIP lookup, so its
-		// region activity is accumulated in the personal or common None bucket.
-		func(string) common.GeoIPData { return common.GeoIPData{} },
+		lookupGeoIP,
 		eventReceiver)
 	return proxy, errors.Trace(err)
 }

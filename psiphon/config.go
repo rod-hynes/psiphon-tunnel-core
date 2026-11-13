@@ -953,6 +953,11 @@ type Config struct {
 	// LightProxyAllowBogons permits upstream connections to bogon addresses.
 	LightProxyAllowBogons bool `json:",omitempty"`
 
+	// LightProxyLookupGeoIP is an optional callback providing GeoIP lookup for
+	// the hosted Light proxy. When nil, proxy activity is reported in the
+	// None region bucket.
+	LightProxyLookupGeoIP func(IP string) common.GeoIPData `json:"-"`
+
 	//
 	// The following parameters are deprecated.
 	//

@@ -40,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1610,6 +1611,11 @@ func TestControllerLightProxyLifecycle(t *testing.T) {
 	for _, earlyReturn := range []bool{false, true} {
 		t.Run(fmt.Sprintf("EarlyReturn=%t", earlyReturn), func(t *testing.T) {
 			config := newRunningLightProxyTestConfig(t)
+			var lookedUpGeoIP atomic.Bool
+			config.LightProxyLookupGeoIP = func(string) common.GeoIPData {
+				lookedUpGeoIP.Store(true)
+				return common.GeoIPData{}
+			}
 			if earlyReturn {
 				config.ListenInterface = "missing-light-test-interface"
 				config.ProxySessionPrivateKey = ""
@@ -1870,6 +1876,9 @@ func TestControllerLightProxyLifecycle(t *testing.T) {
 				case <-time.After(5 * time.Second):
 					t.Fatal("timeout awaiting closed connection accounting")
 				}
+			}
+			if !lookedUpGeoIP.Load() {
+				t.Fatal("GeoIP lookup was not used")
 			}
 
 			// Test: Controller.Run cleanup interrupts an incomplete ingress handshake.
