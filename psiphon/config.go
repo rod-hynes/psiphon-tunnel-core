@@ -2238,6 +2238,17 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 				"EnablePersonalLightProxyTunnels requires PersonalLightProxyEntries")
 		}
 
+		// Split tunnel requires the server to know the client's region. A
+		// Light proxy's reported client IP is trusted only for trusted
+		// proxies, which aren't guaranteed here, and an untrusted proxy could
+		// misreport it to control which traffic is sent untunneled.
+		if config.IsSplitTunnelEnabled() &&
+			!config.IsInproxyClientPersonalPairingMode() {
+
+			return errors.TraceNew(
+				"EnablePersonalLightProxyTunnels is incompatible with split tunnel")
+		}
+
 		config.personalLightProxyEntries = nil
 		for _, entry := range config.PersonalLightProxyEntries {
 
@@ -2248,6 +2259,12 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 			if len(lightProxyEntry.PersonalCompartmentID) == 0 {
 				return errors.TraceNew(
 					"PersonalLightProxyEntries requires a personal compartment ID in each entry")
+			}
+
+			_, err = inproxy.IDFromString(lightProxyEntry.ProxyID)
+			if err != nil {
+				return errors.TraceNew(
+					"PersonalLightProxyEntries requires a tunnel proxy ID in each entry")
 			}
 
 			if config.EnableRunningLightProxy &&

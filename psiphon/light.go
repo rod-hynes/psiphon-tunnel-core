@@ -626,8 +626,9 @@ func dialLightFallbackProxy(
 		nil)
 	if err != nil {
 		// Retain replay parameters when the dial was canceled, including by a
-		// network change. Clear on dial timeout or other failures.
-		if ctx.Err() != context.Canceled {
+		// network change. Clear on dial timeout or other failures. A fresh
+		// dial doesn't clear replay parameters from a concurrent dial.
+		if isReplay && ctx.Err() != context.Canceled {
 			config.SetLightFallbackDialParameters(&lightFallbackDialParameters{})
 		}
 		// Annotate the error with the interrupt cause such as "network changed".

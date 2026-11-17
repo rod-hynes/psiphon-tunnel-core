@@ -35,6 +35,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/obfuscator"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/quic"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/transforms"
 )
 
@@ -773,6 +774,9 @@ func (client *Client) Dial(
 		connectionNum: connectionNum,
 		bytesCounter:  bytesCounter,
 	}
+	if !client.config.TunnelMode {
+		clientConn.quicConn, _ = dialConn.(*quic.Conn)
+	}
 
 	client.metricsMutex.Lock()
 	if isIPv6 {
@@ -909,6 +913,7 @@ type ClientConn struct {
 	client        *Client
 	connectionNum int64
 	bytesCounter  *bytesCounter
+	quicConn      *quic.Conn
 
 	closeOnce sync.Once
 	closeErr  error
@@ -937,6 +942,10 @@ func (conn *ClientConn) Write(b []byte) (int, error) {
 
 func (conn *ClientConn) Close() error {
 	conn.closeOnce.Do(func() {
+		if conn.quicConn != nil {
+			// See the comment at the proxy's GracefulShutdown call.
+			conn.quicConn.GracefulShutdown(gracefulShutdownTimeout)
+		}
 		conn.closeErr = errors.Trace(conn.lightConn.Close())
 
 		conn.logFields["bytesRead"] = conn.bytesCounter.bytesRead.Load()

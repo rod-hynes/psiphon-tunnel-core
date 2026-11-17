@@ -326,7 +326,7 @@ type packConverter struct {
 func packInt(v interface{}) (interface{}, error) {
 	switch value := v.(type) {
 	case string:
-		i, err := strconv.Atoi(value)
+		i, err := strconv.ParseInt(value, 10, 64)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -334,7 +334,7 @@ func packInt(v interface{}) (interface{}, error) {
 	case float64:
 		// Decoding server entry JSON from the local datastore may produce
 		// float64 field types.
-		return int(value), nil
+		return int64(value), nil
 	default:
 		return nil, errors.TraceNew(
 			"expected string or float type")
@@ -933,9 +933,24 @@ func init() {
 	// - local-only fields are also packed, to allow for future use of packed
 	//   encodings in the local datastore.
 	//
-	// Known limitation: sshShadowsocksPort, sshShadowsocksKey,
-	// disableShadowsocksPrefix, and inproxyShadowsocksPort are not assigned
-	// packed field keys and fall through to UnrecognizedFields.
+	// Known limitations:
+	//
+	// - sshShadowsocksPort, sshShadowsocksKey, disableShadowsocksPrefix, and
+	//   inproxyShadowsocksPort were not assigned packed field keys and fall
+	//   through to UnrecognizedFields.
+	//
+	// - allowUpstreamProxy, lightDialAuthorization, lightTlsSSHPort,
+	//   lightQuicSSHPort are also not assigned packed field keys, due to
+	//   this design issue: DecodePackedServerEntryFields is strict and fails
+	//   on an unknown key; full signature checking and JSON format
+	//   reconstruction requires knowledge of the full field names.
+	//
+	//   Originally, unpacking was only performed by brokers, on in-proxy
+	//   destination check packed server entries, and brokers could be kept
+	//   up to date. With the introduction of the DSL protocol using packed
+	//   server entries, now clients call DecodePackedServerEntryFields and
+	//   we can no longer guarantee that all decoders are compatible. Packing
+	//   of new fields will require client/decoder version awareness.
 
 	packedServerEntryFieldSpecs := []packSpec{
 		{1, "tag", base64Converter},
@@ -985,10 +1000,6 @@ func init() {
 		{45, "localSource", nil},
 		{46, "localTimestamp", nil},
 		{47, "isLocalDerivedTag", nil},
-		{48, "allowUpstreamProxy", nil},
-		{49, "lightDialAuthorization", base64Converter},
-		{50, "lightTlsSSHPort", nil},
-		{51, "lightQuicSSHPort", nil},
 	}
 
 	for _, spec := range packedServerEntryFieldSpecs {

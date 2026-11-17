@@ -631,6 +631,8 @@ const (
 	LightTunnelEgressLimitQUICVersions                      = "LightTunnelEgressLimitQUICVersions"
 	LightTunnelEgressCustomHostNameRegexes                  = "LightTunnelEgressCustomHostNameRegexes"
 	LightTunnelEgressCustomHostNameProbability              = "LightTunnelEgressCustomHostNameProbability"
+	LightTunnelPersonalPairingDialRateLimitQuantity         = "LightTunnelPersonalPairingDialRateLimitQuantity"
+	LightTunnelPersonalPairingDialRateLimitInterval         = "LightTunnelPersonalPairingDialRateLimitInterval"
 	HomepageURLQueryParameterClientFeatures                 = "HomepageURLQueryParameterClientFeatures"
 
 	// Retired parameters
@@ -1361,6 +1363,8 @@ var defaultParameters = map[string]struct {
 	LightTunnelEgressLimitQUICVersions:                      {value: protocol.QUICVersions{}},
 	LightTunnelEgressCustomHostNameRegexes:                  {value: RegexStrings{}},
 	LightTunnelEgressCustomHostNameProbability:              {value: 0.0, minimum: 0.0},
+	LightTunnelPersonalPairingDialRateLimitQuantity:         {value: 2, minimum: 0},
+	LightTunnelPersonalPairingDialRateLimitInterval:         {value: 2 * time.Second, minimum: time.Duration(0)},
 
 	HomepageURLQueryParameterClientFeatures: {value: KeyStrings{}, flags: serverSideOnly},
 }

@@ -26,6 +26,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"time"
 
 	tls "github.com/Psiphon-Labs/psiphon-tls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
@@ -89,6 +90,9 @@ func Dial(
 
 type Conn struct {
 	net.Conn
+}
+
+func (*Conn) GracefulShutdown(_ time.Duration) {
 }
 
 func (*Conn) ExportKeyingMaterial(

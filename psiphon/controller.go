@@ -1243,15 +1243,35 @@ func (controller *Controller) ImportPushPayload(payload []byte) bool {
 
 	if importOK && len(lightProxyEntries) > 0 {
 
-		lightProxyEntry := lightProxyEntries[prng.Intn(len(lightProxyEntries))]
+		// Select a random, usable/dialable entry.
+		var lightProxyEntry *push.LightProxyEntry
+		for _, i := range prng.Perm(len(lightProxyEntries)) {
+			_, err := makeLightProxyClient(
+				controller.config,
+				controller.untunneledDialConfig,
+				controller.quicTLSClientSessionCache,
+				controller.tlsClientSessionCache,
+				false,
+				lightProxyEntries[i].ProxyEntry,
+				lightProxyEntries[i].ProxyEntryTracker)
+			if err == nil {
+				lightProxyEntry = lightProxyEntries[i]
+				break
+			}
+		}
 
 		// Push-imported light proxies are persisted for potential future
 		// use as fallbacks. Personal tunnels continue to use
 		// PersonalLightProxyEntries.
-		ok := StoreLightFallbackProxy(&StoredLightProxyEntry{
-			LightProxyEntry:        lightProxyEntry.ProxyEntry,
-			LightProxyEntryTracker: lightProxyEntry.ProxyEntryTracker,
-		})
+		ok := false
+		if lightProxyEntry == nil {
+			NoticeWarning("push payload: no usable light proxy entries")
+		} else {
+			ok = StoreLightFallbackProxy(&StoredLightProxyEntry{
+				LightProxyEntry:        lightProxyEntry.ProxyEntry,
+				LightProxyEntryTracker: lightProxyEntry.ProxyEntryTracker,
+			})
+		}
 		if !ok {
 			importOK = false
 		} else {
@@ -2707,6 +2727,7 @@ type protocolSelectionConstraints struct {
 	lightEgressLimitQUICVersions              protocol.QUICVersions
 	replayCandidateCount                      int
 	inproxyClientDialRateLimiter              *rate.Limiter
+	personalLightDialRateLimiter              *rate.Limiter
 	nextPersonalPairingProtocolFamily         personalPairingProtocolFamily
 	lightTunnelProxyEntryIterator             lightTunnelProxyEntryIterator
 }
@@ -3011,6 +3032,26 @@ func (p *protocolSelectionConstraints) selectProtocol(
 	// protocols could lead to that protocol never being selected.
 	if selectedProtocol == "" {
 		selectedProtocol = candidateProtocols[prng.Intn(len(candidateProtocols))]
+	}
+
+	// Rate limit personal Light dials, to avoid rapidly redialing a proxy
+	// that fails fast, such as when at capacity. As with in-proxy, the delay
+	// is returned and applied outside of the lock.
+
+	if protocol.TunnelProtocolUsesLight(selectedProtocol) &&
+		p.config.EnablePersonalLightProxyTunnels &&
+		p.personalLightDialRateLimiter != nil {
+
+		r := p.personalLightDialRateLimiter.Reserve()
+		if !r.OK() {
+			NoticeInfo("Light protocol selection rate limited: burst size exceeded")
+			return "", 0, false
+		}
+		delay := r.Delay()
+		if delay > 0 {
+			NoticeInfo("Light protocol selection rate limited: %v", delay)
+		}
+		return selectedProtocol, delay, true
 	}
 
 	if !protocol.TunnelProtocolUsesInproxy(selectedProtocol) ||
@@ -3351,6 +3392,10 @@ func (controller *Controller) launchEstablishing() {
 		// An empty limit would allow protocols outside personal pairing. Use all
 		// enabled personal pairing protocols if no limit was set or filtering
 		// removed every protocol.
+		//
+		// Otherwise the limit is honored as-is. With both in-proxy and Light
+		// personal pairing enabled, a limit naming protocols from only one
+		// family intentionally disables the other.
 		if len(controller.protocolSelectionConstraints.limitTunnelProtocols) == 0 {
 			controller.protocolSelectionConstraints.limitTunnelProtocols =
 				personalPairingTunnelProtocols
@@ -3373,6 +3418,16 @@ func (controller *Controller) launchEstablishing() {
 		controller.protocolSelectionConstraints.inproxyClientDialRateLimiter = rate.NewLimiter(
 			rate.Limit(float64(inproxyRateLimitQuantity)/inproxyRateLimitInterval.Seconds()),
 			inproxyRateLimitQuantity)
+	}
+
+	// Initialize the personal Light dial rate limiter in the same manner.
+
+	lightRateLimitQuantity := p.Int(parameters.LightTunnelPersonalPairingDialRateLimitQuantity)
+	lightRateLimitInterval := p.Duration(parameters.LightTunnelPersonalPairingDialRateLimitInterval)
+	if lightRateLimitQuantity > 0 && lightRateLimitInterval > 0 {
+		controller.protocolSelectionConstraints.personalLightDialRateLimiter = rate.NewLimiter(
+			rate.Limit(float64(lightRateLimitQuantity)/lightRateLimitInterval.Seconds()),
+			lightRateLimitQuantity)
 	}
 
 	// InproxyTunnelProtocolForceSelectionCount forces the specified number of
@@ -3479,6 +3534,7 @@ func (controller *Controller) launchEstablishing() {
 	} else {
 		copyConstraints := *controller.protocolSelectionConstraints
 		copyConstraints.inproxyClientDialRateLimiter = nil
+		copyConstraints.personalLightDialRateLimiter = nil
 		controller.signalServerEntriesReporter(
 			&serverEntriesReportRequest{
 				constraints: &copyConstraints,
@@ -4394,7 +4450,10 @@ loop:
 				return false
 			}
 
-			if protocol.TunnelProtocolUsesInproxy(replayProtocol) {
+			if protocol.TunnelProtocolUsesInproxy(replayProtocol) ||
+				(protocol.TunnelProtocolUsesLight(replayProtocol) &&
+					controller.config.EnablePersonalLightProxyTunnels) {
+
 				// Since replay skips selectProtocol, call it here to invoke the rate limiter.
 				// Since concurrentEstablishTunnelsMutex remains held, selectProtocol should
 				// return replayProtocol on success.
@@ -4402,7 +4461,7 @@ loop:
 					controller.establishConnectTunnelCount,
 					excludeIntensive,
 					selectedPersonalPairingProtocolFamily,
-					true,
+					protocol.TunnelProtocolUsesInproxy(replayProtocol),
 					replayProtocol,
 					serverEntry)
 				if !ok || selectedProtocol != replayProtocol {

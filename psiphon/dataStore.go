@@ -3684,10 +3684,10 @@ func (iterator *CommonLightTunnelProxyEntryIterator) Reset(ctx context.Context) 
 		for ingressProtocol, bucketName := range datastoreCommonLightTunnelProxyEntryIndexBuckets {
 			proxyEntryHashes[ingressProtocol] = nil
 			cursor := tx.bucket(bucketName).cursor()
-			defer cursor.close()
 
 			for key, value := cursor.first(); key != nil; key, value = cursor.next() {
 				if ctx.Err() != nil {
+					cursor.close()
 					return errors.Trace(ctx.Err())
 				}
 				if len(key) != sha256.Size || len(value) != 8 {
@@ -3702,6 +3702,7 @@ func (iterator *CommonLightTunnelProxyEntryIterator) Reset(ctx context.Context) 
 				proxyEntryHashes[ingressProtocol] = append(
 					proxyEntryHashes[ingressProtocol], append([]byte(nil), key...))
 			}
+			cursor.close()
 		}
 		return nil
 	})

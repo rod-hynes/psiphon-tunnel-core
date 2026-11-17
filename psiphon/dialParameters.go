@@ -492,11 +492,12 @@ func MakeDialParameters(
 
 	var lightProxy *StoredLightProxyEntry
 	if dialParams != nil &&
-		protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
+		protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) &&
+		lightTunnelProxyEntryIterator != nil {
 
 		// Replay reloads the proxy entry identified by ProxyEntryHash. Personal
 		// and common replay records are not interchangeable.
-		if lightTunnelProxyEntryIterator != nil && len(dialParams.ProxyEntryHash) > 0 {
+		if len(dialParams.ProxyEntryHash) > 0 {
 			lightProxy, err = lightTunnelProxyEntryIterator.Load(
 				dialParams.ProxyEntryHash, getLightTunnelIngressProtocol(dialParams.TunnelProtocol))
 			if err != nil {
@@ -683,6 +684,13 @@ func MakeDialParameters(
 		}
 
 		dialParams.TunnelProtocol = selectedProtocol
+	}
+
+	// A Light dial requires a proxy entry.
+	if protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) &&
+		lightTunnelProxyEntryIterator == nil {
+
+		return nil, nil
 	}
 
 	if isTactics && !protocol.TunnelProtocolSupportsTactics(dialParams.TunnelProtocol) {
@@ -1026,9 +1034,6 @@ func MakeDialParameters(
 
 		ingressProtocol := getLightTunnelIngressProtocol(dialParams.TunnelProtocol)
 		if !isReplay {
-			if lightTunnelProxyEntryIterator == nil {
-				return nil, nil
-			}
 			// TODO: move Light entry reads outside concurrentEstablishTunnelsMutex.
 			dialParams.ProxyEntryHash, lightProxy, err =
 				lightTunnelProxyEntryIterator.Next(ingressProtocol)

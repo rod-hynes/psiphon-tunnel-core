@@ -763,6 +763,36 @@ func (conn *Conn) Close() error {
 	return err
 }
 
+// GracefulShutdown sends a stream FIN, which follows all written data, and
+// waits up to timeout for the peer to close the connection. Close alone
+// discards any data the peer has not yet read. The caller must still call
+// Close.
+func (conn *Conn) GracefulShutdown(timeout time.Duration) {
+
+	conn.acceptMutex.Lock()
+	stream := conn.stream
+	conn.acceptMutex.Unlock()
+
+	ietfConnection, ok := conn.connection.(*ietfQUICConnection)
+	if stream == nil || !ok || conn.IsClosed() {
+		return
+	}
+
+	// Interrupt any blocked Write, as the stream Close must not be
+	// concurrent with Write.
+	_ = stream.SetWriteDeadline(time.Now())
+	conn.writeMutex.Lock()
+	_ = stream.Close()
+	conn.writeMutex.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ietfConnection.Context().Done():
+	case <-timer.C:
+	}
+}
+
 func (conn *Conn) IsClosed() bool {
 	return atomic.LoadInt32(&conn.isClosed) == 1
 }

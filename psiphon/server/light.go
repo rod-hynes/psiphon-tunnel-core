@@ -518,6 +518,11 @@ func (conn *LightTunnelConn) GetMetrics() common.LogFields {
 	logFields["light_proxy_is_trusted"] = conn.trustedProxy
 
 	// These egress values are observed by the server, not reported by the proxy.
+	//
+	// TODO: as a future enhancement, other tunnel protocols where the server
+	// terminates the client's TLS or QUIC, such as TLS-OSSH and unfronted
+	// meek, could also log the SNI observed on the wire, rather than relying
+	// on client-reported values.
 	switch conn.expectedEgressProtocol {
 	case light.TransportTLS:
 		transportConn, ok := conn.Conn.(*tls.Conn)
@@ -528,7 +533,8 @@ func (conn *LightTunnelConn) GetMetrics() common.LogFields {
 
 		state := transportConn.ConnectionState()
 		metrics := transportConn.ConnectionMetrics()
-		logFields["light_egress_tls_sni"] = state.ServerName
+		logFields["light_egress_tls_sni"] = common.TruncateUTF8String(
+			state.ServerName, MAX_API_PARAM_STRING_LENGTH)
 		logFields["light_egress_tls_fragmented"] = metrics.ClientHelloFragmented
 		logFields["light_egress_tls_padding"] = metrics.ClientHelloPaddingLength
 		logFields["light_egress_tls_did_resume"] = state.DidResume
@@ -546,7 +552,8 @@ func (conn *LightTunnelConn) GetMetrics() common.LogFields {
 				"Light QUIC metrics failed")
 			break
 		}
-		logFields["light_egress_quic_sni"] = state.ServerName
+		logFields["light_egress_quic_sni"] = common.TruncateUTF8String(
+			state.ServerName, MAX_API_PARAM_STRING_LENGTH)
 		logFields["light_egress_quic_did_resume"] = state.DidResume
 
 	default:

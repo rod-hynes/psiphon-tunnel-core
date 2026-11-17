@@ -41,8 +41,10 @@ import (
 )
 
 const (
-	MAX_API_PARAM_ARRAY_ENTRIES = 256
-	PADDING_MAX_BYTES           = 16 * 1024
+	MAX_API_PARAM_ARRAY_ENTRIES       = 256
+	MAX_API_PARAM_STRING_LENGTH       = 1024
+	MAX_API_PARAM_STRING_ARRAY_LENGTH = 8 * 1024
+	PADDING_MAX_BYTES                 = 16 * 1024
 
 	PERSISTENT_STATS_MAX_LOGS_PER_TUNNEL         = 1024
 	PERSISTENT_STATS_MAX_DROPPED_LOGS_PER_TUNNEL = 16
@@ -950,7 +952,7 @@ var remoteServerListStatParams = append(
 		{"fronting_provider_id", isAnyString, requestParamOptional},
 		{"meek_dial_address", isDialAddress, requestParamOptional},
 		{"meek_resolved_ip_address", isIPAddress, requestParamOptional},
-		{"meek_sni_server_name", isDomain, requestParamOptional},
+		{"meek_sni_server_name", isAnyString, requestParamOptional},
 		{"meek_host_header", isHostHeader, requestParamOptional},
 		{"meek_transformed_host_name", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
 		{"user_agent", isAnyString, requestParamOptional},
@@ -1554,7 +1556,7 @@ var baseDialParams = []requestParamSpec{
 	{"fronting_provider_id", isAnyString, requestParamOptional},
 	{"meek_dial_address", isDialAddress, requestParamOptional | requestParamLogOnlyForFrontedMeekOrConjure},
 	{"meek_resolved_ip_address", isIPAddress, requestParamOptional | requestParamLogOnlyForFrontedMeekOrConjure},
-	{"meek_sni_server_name", isDomain, requestParamOptional},
+	{"meek_sni_server_name", isAnyString, requestParamOptional},
 	{"meek_host_header", isHostHeader, requestParamOptional | requestParamNotLoggedForUnfrontedMeekNonTransformedHeader},
 	{"meek_transformed_host_name", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
 	{"user_agent", isAnyString, requestParamOptional},
@@ -1612,7 +1614,7 @@ var baseDialParams = []requestParamSpec{
 	{"shadowsocks_prefix", isAnyString, requestParamOptional},
 	{"tls_fragmented", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
 	{"tls_padding", isIntString, requestParamOptional | requestParamLogStringAsInt},
-	{"tls_ossh_sni_server_name", isDomain, requestParamOptional},
+	{"tls_ossh_sni_server_name", isAnyString, requestParamOptional},
 	{"tls_ossh_transformed_host_name", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
 	{"steering_ip", isIPAddress, requestParamOptional | requestParamLogOnlyForFrontedMeekOrConjure},
 	{"tls_sent_ticket", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
@@ -1625,12 +1627,12 @@ var baseDialParams = []requestParamSpec{
 	{"unique_candidate_estimate", isIntString, requestParamOptional | requestParamLogStringAsInt},
 	{"candidates_moved_to_front", isIntString, requestParamOptional | requestParamLogStringAsInt},
 	{"first_fronted_meek_candidate", isIntString, requestParamOptional | requestParamLogStringAsInt},
-	{"light_sni", isDomainOrEmpty, requestParamOptional},
+	{"light_sni", isAnyString, requestParamOptional},
 	{"light_tls_profile", isAnyString, requestParamOptional},
 	{"light_tls_fragmented", isBooleanFlag, requestParamOptional | requestParamLogFlagAsBool},
 	{"light_tls_padding", isIntString, requestParamOptional | requestParamLogStringAsInt},
 	{"light_quic_version", isAnyString, requestParamOptional},
-	{"light_egress_sni", isDomainOrEmpty, requestParamOptional},
+	{"light_egress_sni", isAnyString, requestParamOptional},
 	{"light_egress_tls_profile", isAnyString, requestParamOptional},
 	{"light_egress_quic_version", isAnyString, requestParamOptional},
 	{"light_tcp_duration", isIntString, requestParamOptional | requestParamLogStringAsInt},
@@ -2346,10 +2348,6 @@ func isDomain(value string) bool {
 		}
 	}
 	return true
-}
-
-func isDomainOrEmpty(value string) bool {
-	return value == "" || isDomain(value)
 }
 
 func isHostHeader(value string) bool {

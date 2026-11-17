@@ -1908,6 +1908,83 @@ func (sshServer *sshServer) handleClient(
 
 	peerAddr := conn.RemoteAddr()
 
+	// For in-proxy and Light tunnel protocols, accepted client GeoIP reflects
+	// the proxy address, not the client.
+
+	peerGeoIPData := sshServer.support.GeoIPService.Lookup(
+		common.IPAddressFromAddr(peerAddr))
+
+	// Get any packet manipulation values from GetAppliedSpecName as soon as
+	// possible due to the expiring TTL.
+	//
+	// In the case of in-proxy tunnel protocols, the remote address will be
+	// the proxy, not the client, and GeoIP targeted packet manipulation will
+	// apply to the 2nd hop.
+
+	serverPacketManipulation := ""
+	replayedServerPacketManipulation := false
+
+	if sshServer.support.Config.RunPacketManipulator &&
+		protocol.TunnelProtocolMayUseServerPacketManipulation(tunnelProtocol) {
+
+		// A meekConn has synthetic address values, including the original client
+		// address in cases where the client uses an upstream proxy to connect to
+		// Psiphon. For meekConn, and any other conn implementing
+		// UnderlyingTCPAddrSource, get the underlying TCP connection addresses.
+		//
+		// Limitation: a meek tunnel may consist of several TCP connections. The
+		// server_packet_manipulation metric will reflect the packet manipulation
+		// applied to the _first_ TCP connection only.
+
+		var localAddr, remoteAddr *net.TCPAddr
+		var ok bool
+		underlying, ok := conn.(common.UnderlyingTCPAddrSource)
+		if ok {
+			localAddr, remoteAddr, ok = underlying.GetUnderlyingTCPAddrs()
+		} else {
+			localAddr, ok = conn.LocalAddr().(*net.TCPAddr)
+			if ok {
+				remoteAddr, ok = conn.RemoteAddr().(*net.TCPAddr)
+			}
+		}
+
+		if ok {
+			specName, extraData, err := sshServer.support.PacketManipulator.
+				GetAppliedSpecName(localAddr, remoteAddr)
+			if err == nil {
+				serverPacketManipulation = specName
+				replayedServerPacketManipulation, _ = extraData.(bool)
+			}
+		}
+	}
+
+	// Count a replay failure case when a tunnel used replay parameters
+	// (excluding OSSH fragmentation, which doesn't use the ReplayCache) and
+	// failed to complete the API handshake. Replay is keyed on the listener
+	// protocol.
+	//
+	// Limitation: FailedReplayParameters isn't called for meek, or for
+	// TLS-OSSH demultiplexed from meek, when the transport handshake fails,
+	// as handleClient isn't invoked.
+
+	failedReplay := func() {
+		var fragmentorSeed *prng.Seed
+		replayedFragmentation := false
+		if fragmentor, ok := conn.(common.FragmentorAccessor); ok {
+			fragmentorSeed, replayedFragmentation = fragmentor.GetReplay()
+		}
+		if tunnelProtocol == protocol.TUNNEL_PROTOCOL_OBFUSCATED_SSH {
+			replayedFragmentation = false
+		}
+		if replayedFragmentation || replayedServerPacketManipulation {
+			sshServer.support.ReplayCache.FailedReplayParameters(
+				sshListener.tunnelProtocol,
+				peerGeoIPData,
+				serverPacketManipulation,
+				fragmentorSeed)
+		}
+	}
+
 	// Perform outer-layer transport handshakes for protocols that have not
 	// already completed it. This is done before the SSH handshake semaphore,
 	// so contention does not delay obfuscation mechanisms. Transport
@@ -1921,6 +1998,7 @@ func (sshServer *sshServer) handleClient(
 		log.WithTraceFields(
 			LogFields{"error": initializeErr}).Debug(
 			"Tunnel transport initialization failed")
+		failedReplay()
 		var irregularErr *light.IrregularTunnelError
 		if std_errors.As(initializeErr, &irregularErr) {
 			logIrregularTunnel(
@@ -1972,56 +2050,6 @@ func (sshServer *sshServer) handleClient(
 
 		return
 	}
-
-	// Get any packet manipulation values from GetAppliedSpecName as soon as
-	// possible due to the expiring TTL.
-	//
-	// In the case of in-proxy tunnel protocols, the remote address will be
-	// the proxy, not the client, and GeoIP targeted packet manipulation will
-	// apply to the 2nd hop.
-
-	serverPacketManipulation := ""
-	replayedServerPacketManipulation := false
-
-	if sshServer.support.Config.RunPacketManipulator &&
-		protocol.TunnelProtocolMayUseServerPacketManipulation(tunnelProtocol) {
-
-		// A meekConn has synthetic address values, including the original client
-		// address in cases where the client uses an upstream proxy to connect to
-		// Psiphon. For meekConn, and any other conn implementing
-		// UnderlyingTCPAddrSource, get the underlying TCP connection addresses.
-		//
-		// Limitation: a meek tunnel may consist of several TCP connections. The
-		// server_packet_manipulation metric will reflect the packet manipulation
-		// applied to the _first_ TCP connection only.
-
-		var localAddr, remoteAddr *net.TCPAddr
-		var ok bool
-		underlying, ok := conn.(common.UnderlyingTCPAddrSource)
-		if ok {
-			localAddr, remoteAddr, ok = underlying.GetUnderlyingTCPAddrs()
-		} else {
-			localAddr, ok = conn.LocalAddr().(*net.TCPAddr)
-			if ok {
-				remoteAddr, ok = conn.RemoteAddr().(*net.TCPAddr)
-			}
-		}
-
-		if ok {
-			specName, extraData, err := sshServer.support.PacketManipulator.
-				GetAppliedSpecName(localAddr, remoteAddr)
-			if err == nil {
-				serverPacketManipulation = specName
-				replayedServerPacketManipulation, _ = extraData.(bool)
-			}
-		}
-	}
-
-	// For in-proxy and Light tunnel protocols, accepted client GeoIP reflects
-	// the proxy address, not the client.
-
-	peerGeoIPData := sshServer.support.GeoIPService.Lookup(
-		common.IPAddressFromAddr(peerAddr))
 
 	sshServer.registerAcceptedClient(tunnelProtocol, peerGeoIPData.Country)
 	defer sshServer.unregisterAcceptedClient(tunnelProtocol, peerGeoIPData.Country)
@@ -2107,6 +2135,11 @@ func (sshServer *sshServer) handleClient(
 	// completed.
 
 	sshClient.run(conn, onSSHHandshakeFinished)
+
+	completed, _ := sshClient.getHandshaked()
+	if !completed {
+		failedReplay()
+	}
 }
 
 // handshakeTunnelTransport completes any pending outer transport handshake.
@@ -2205,11 +2238,15 @@ func (sshServer *sshServer) monitorPortForwardDialError(err error) {
 // protocol and TLS-OSSH over the same port.
 func (sshServer *sshServer) tunnelProtocolUsesTLSDemux(tunnelProtocol string) bool {
 
-	// Only use meek/TLS-OSSH demux if unfronted meek HTTPS with non-legacy
-	// passthrough, and not in-proxy.
+	// The meek/TLS-OSSH demux runs only on an unfronted meek HTTPS listener
+	// with non-legacy passthrough. It does not run on in-proxy variant
+	// listeners. It also does not run in in-proxy broker-only mode, where no
+	// tunnel protocols are running and the demux would otherwise accept
+	// TLS-OSSH tunnels.
 	if protocol.TunnelProtocolUsesMeekHTTPS(tunnelProtocol) &&
 		!protocol.TunnelProtocolUsesFrontedMeek(tunnelProtocol) &&
-		!protocol.TunnelProtocolUsesInproxy(tunnelProtocol) {
+		!protocol.TunnelProtocolUsesInproxy(tunnelProtocol) &&
+		!sshServer.support.Config.MeekServerInproxyBrokerOnly {
 		_, passthroughEnabled := sshServer.support.Config.TunnelProtocolPassthroughAddresses[tunnelProtocol]
 		return passthroughEnabled && !sshServer.support.Config.LegacyPassthrough
 	}
@@ -2830,10 +2867,10 @@ func (sshClient *sshClient) run(
 	// the strict targets at the single check time will trigger replay; however,
 	// this replay will impact all clients with similar GeoIP data.
 	//
-	// A deferred function cancels the timer and also increments the replay
-	// failure counter, which will ultimately clear replay parameters, when the
-	// tunnel fails before the API handshake is completed (this includes any
-	// liveness test).
+	// A deferred function cancels the timer. handleClient increments the
+	// replay failure counter, which will ultimately clear replay parameters,
+	// when the tunnel fails before the API handshake is completed (this
+	// includes any liveness test).
 	//
 	// A tunnel which fails to meet the targets but successfully completes any
 	// liveness test and the API handshake is ignored in terms of replay scoring.
@@ -2882,41 +2919,7 @@ func (sshClient *sshClient) run(
 				}
 			})
 
-		defer func() {
-
-			// When panicking, propagate the panic instead of trying to
-			// acquire the sshClient lock. Intentional panics may arise from
-			// the protobuf code path in logTunnel.
-			if r := recover(); r != nil {
-				panic(r)
-			}
-
-			setReplayAfterFunc.Stop()
-			completed, _ := sshClient.getHandshaked()
-			if !completed {
-
-				// Count a replay failure case when a tunnel used replay parameters
-				// (excluding OSSH fragmentation, which doesn't use the ReplayCache) and
-				// failed to complete the API handshake.
-
-				replayedFragmentation := false
-				if sshClient.tunnelProtocol != protocol.TUNNEL_PROTOCOL_OBFUSCATED_SSH {
-					fragmentor, ok := baseConn.(common.FragmentorAccessor)
-					if ok {
-						_, replayedFragmentation = fragmentor.GetReplay()
-					}
-				}
-				usedReplay := replayedFragmentation || sshClient.replayedServerPacketManipulation
-
-				if usedReplay {
-					sshClient.sshServer.support.ReplayCache.FailedReplayParameters(
-						replayTunnelProtocol,
-						sshClient.peerGeoIPData,
-						sshClient.serverPacketManipulation,
-						getFragmentorSeed())
-				}
-			}
-		}()
+		defer setReplayAfterFunc.Stop()
 	}
 
 	// Run the initial [obfuscated] SSH handshake in a goroutine so we can both

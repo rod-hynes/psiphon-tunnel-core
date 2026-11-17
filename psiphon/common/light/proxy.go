@@ -548,6 +548,15 @@ func NewProxy(
 		return nil, errors.TraceNew("missing obfuscation key")
 	}
 
+	// The obfuscation key is used as a hex string. Clients generate
+	// lowercase hex from the key bytes in the proxy entry, so the proxy must
+	// use the same format.
+	_, err = hex.DecodeString(config.ObfuscationKey)
+	if err != nil {
+		return nil, errors.TraceNew("invalid obfuscation key")
+	}
+	config.ObfuscationKey = strings.ToLower(config.ObfuscationKey)
+
 	var personalCompartmentID []byte
 	if config.PersonalCompartmentID != "" {
 		id, err := inproxy.IDFromString(config.PersonalCompartmentID)
@@ -1093,6 +1102,11 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 						peerAddress string,
 						err error,
 						_ common.LogFields) {
+
+						// Limitation: as in psiphond, this callback, including the
+						// GeoIP lookup, runs inline on the QUIC listener's new
+						// connection goroutine. Hosts are expected to rate limit
+						// inbound packets, as psiphond does with iptables.
 
 						// Remove QUIC's error trace for consistency with TLS, which reports
 						// irregularities without a trace.
@@ -1649,8 +1663,18 @@ func (proxy *Proxy) handleConn(
 		completedUpstreamTCP = time.Now().UTC()
 	}
 
+	// Avoid unbounded upstream stalls. Without a timeout, a blocked upstream
+	// write keeps the connection open after the client is gone. activeOnWrite
+	// is true since this timeout only needs to detect no progress.
+	upstreamActivityConn, err := common.NewActivityMonitoredConn(
+		upstreamConn, proxy.inactivityTimeout, true, nil)
+	if err != nil {
+		upstreamConn.Close()
+		return errors.Trace(err)
+	}
+
 	throttledConn := common.NewThrottledConn(
-		upstreamConn, true, common.RateLimits{})
+		upstreamActivityConn, true, common.RateLimits{})
 	defer throttledConn.Close()
 
 	unassociateAfter = context.AfterFunc(handleCtx, func() {
@@ -1733,7 +1757,11 @@ func (proxy *Proxy) handleConn(
 
 	upstreamConn = throttledConn
 	if proxy.config.TunnelMode {
-		upstreamConn = NewLightFramingConn(upstreamConn)
+		framingConn := newLightConn(upstreamConn, nil)
+		// Limit client-driven padding on the proxy's upstream writes.
+		framingConn.maxPaddedWrites = prng.Range(
+			maxPaddedWritesMin, maxPaddedWritesMax)
+		upstreamConn = framingConn
 	}
 
 	if activity != nil {
@@ -1767,6 +1795,14 @@ func (proxy *Proxy) handleConn(
 			if proxy.config.EnableDebugLogs {
 				err = common.RedactNetError(err)
 				proxy.eventReceiver.DebugLog(proxy.ID, errors.Trace(err).Error())
+			}
+		}
+		if !proxy.config.TunnelMode {
+			// Unlike other QUIC uses, which carry end-to-end SSH, fallback
+			// mode relies on the stream EOF to signal end of data, and a
+			// QUIC Close discards data the client has not yet read.
+			if quicConn, ok := conn.(*quic.Conn); ok {
+				quicConn.GracefulShutdown(gracefulShutdownTimeout)
 			}
 		}
 		lightConn.Close()

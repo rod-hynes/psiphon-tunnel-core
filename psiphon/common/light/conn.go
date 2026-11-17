@@ -42,6 +42,9 @@ const (
 	stopPaddingWriteSizeThreshold = paddingMaxTargetSize
 	dialStaggerMinDuration        = 100 * time.Millisecond
 	dialStaggerMaxDuration        = 300 * time.Millisecond
+	gracefulShutdownTimeout       = 1 * time.Second
+	maxPaddedWritesMin            = 64
+	maxPaddedWritesMax            = 128
 )
 
 // lightConn wraps a TLS or QUIC connection with traffic shape obfuscation:
@@ -59,6 +62,8 @@ type lightConn struct {
 	doneWriteHeader         bool
 	doneWritePadding        bool
 	stopWritePaddingPending bool
+	paddedWrites            int
+	maxPaddedWrites         int
 	writeBuffer             bytes.Buffer
 }
 
@@ -317,7 +322,9 @@ func (conn *lightConn) Write(b []byte) (int, error) {
 	size := conn.writeBuffer.Len() + len(b) + 2 + 17
 	if !conn.doneWritePadding {
 		if conn.stopWritePaddingPending ||
-			size > stopPaddingWriteSizeThreshold {
+			size > stopPaddingWriteSizeThreshold ||
+			(conn.maxPaddedWrites > 0 &&
+				conn.paddedWrites >= conn.maxPaddedWrites) {
 
 			var wirePaddingSize [2]byte
 			binary.BigEndian.PutUint16(wirePaddingSize[:], stopPadding)
@@ -351,6 +358,7 @@ func (conn *lightConn) Write(b []byte) (int, error) {
 			conn.writeBuffer.Write(wirePaddingSize[:])
 			conn.writeBuffer.Write(wirePayloadSize[:])
 			conn.writeBuffer.Write(padding)
+			conn.paddedWrites += 1
 		}
 	}
 
