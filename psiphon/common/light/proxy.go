@@ -226,8 +226,10 @@ type ProxyConfig struct {
 	DNSResolverCacheTTL string `json:",omitempty"`
 
 	// SplitUpstreamInterfaceName binds non-tunnel TCP, DNS, and non-loopback
-	// TLS passthrough traffic to an interface. ProxyTLSDialer and
-	// ProxyQUICDialer are responsible for binding their own sockets.
+	// TLS passthrough traffic to an interface. SplitUpstreamInterfaceName
+	// cannot be set in tunnel mode, where ProxyTLSDialer, ProxyQUICDialer,
+	// and TLSPassthroughDialer bypass it and are responsible for binding
+	// their own sockets.
 	SplitUpstreamInterfaceName string `json:",omitempty"`
 
 	// SplitDownstreamInterfaceName binds ingress traffic to an interface.
@@ -308,6 +310,11 @@ type ProxyConfig struct {
 	// ProxyQUICDialer establishes the proxy-to-server QUIC connection.
 	// Tunnel mode only.
 	ProxyQUICDialer ProxyQUICDialer `json:"-"`
+
+	// TLSPassthroughDialer dials non-loopback TLS passthrough connections,
+	// allowing the host to apply its own device binding and DNS resolution.
+	// Tunnel mode only, where it is required.
+	TLSPassthroughDialer func(network, address string) (net.Conn, error) `json:"-"`
 
 	// PersonalCompartmentID is the unpadded base64 personal pairing secret.
 	// Used in both modes; requires ProxyLimits.
@@ -722,7 +729,13 @@ func NewProxy(
 	}
 
 	listenConfig := &net.ListenConfig{}
-	dialer := &net.Dialer{}
+
+	// In tunnel mode, the host's dialers are used for all dials, and the
+	// proxy's own dialer and DNS resolver are not initialized.
+	var dialer *net.Dialer
+	if !config.TunnelMode {
+		dialer = &net.Dialer{}
+	}
 
 	splitInterfaceMode := config.SplitUpstreamInterfaceName != "" ||
 		config.SplitDownstreamInterfaceName != ""
@@ -736,15 +749,19 @@ func NewProxy(
 				"SplitDownstreamInterfaceName must differ from SplitUpstreamInterfaceName")
 		}
 
+		// In tunnel mode, SplitUpstreamInterfaceName is not set, and no
+		// upstream interface is selected or bound.
+		bindUpstream := dialer != nil
+
 		upstreamInterfaceName := config.SplitUpstreamInterfaceName
 		downstreamInterfaceName := config.SplitDownstreamInterfaceName
-		if upstreamInterfaceName == "" {
+		if bindUpstream && upstreamInterfaceName == "" {
 			upstreamInterfaceName = common.FindInterfaceExcluding(downstreamInterfaceName)
 		}
 		if downstreamInterfaceName == "" {
 			downstreamInterfaceName = common.FindInterfaceExcluding(upstreamInterfaceName)
 		}
-		if upstreamInterfaceName == "" {
+		if bindUpstream && upstreamInterfaceName == "" {
 			return nil, errors.TraceNew(
 				"unable to determine upstream interface; set SplitUpstreamInterfaceName")
 		}
@@ -754,7 +771,9 @@ func NewProxy(
 		}
 
 		listenConfig.Control = makeBindToDeviceControl(downstreamInterfaceName)
-		dialer.Control = makeBindToDeviceControl(upstreamInterfaceName)
+		if bindUpstream {
+			dialer.Control = makeBindToDeviceControl(upstreamInterfaceName)
+		}
 	}
 
 	// Initialize the DNS resolver and optional cache following the pattern in
@@ -775,26 +794,29 @@ func NewProxy(
 	// avoid any cases where Go's resolver fails over to the cgo-based
 	// resolver while will consume an OS thread.
 
-	dnsResolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, network, address)
-			return conn, errors.Trace(err)
-		},
-	}
-
-	// Route hostname lookups performed by the dialer itself, which happens
-	// when PassthroughAddress is a hostname, through dnsResolver to ensure
-	// dialer.Control is applied. Limitation: currently this doesn't use the
-	// DNS cache.
-	dialer.Resolver = dnsResolver
-
+	var dnsResolver *net.Resolver
 	var dnsCache *lrucache.Cache
-	if dnsResolverCacheMaxSize > 0 && dnsResolverCacheTTL > 0 {
-		dnsCache = lrucache.NewWithLRU(
-			dnsResolverCacheTTL,
-			dnsResolverCacheReapFrequency,
-			dnsResolverCacheMaxSize)
+	if dialer != nil {
+		dnsResolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				conn, err := dialer.DialContext(ctx, network, address)
+				return conn, errors.Trace(err)
+			},
+		}
+
+		// Route hostname lookups performed by the dialer itself, which happens
+		// when PassthroughAddress is a hostname, through dnsResolver to ensure
+		// dialer.Control is applied. Limitation: currently this doesn't use the
+		// DNS cache.
+		dialer.Resolver = dnsResolver
+
+		if dnsResolverCacheMaxSize > 0 && dnsResolverCacheTTL > 0 {
+			dnsCache = lrucache.NewWithLRU(
+				dnsResolverCacheTTL,
+				dnsResolverCacheReapFrequency,
+				dnsResolverCacheMaxSize)
+		}
 	}
 
 	proxyGeoIPData := make([]common.GeoIPData, len(listenAddresses))
@@ -882,6 +904,8 @@ func NewProxy(
 			// SplitPassthroughInterfaceName and dedicated dialer for independently
 			// routing passthrough through the upstream, downstream, or default route.
 			tlsConfig.PassthroughDialer = net.Dial
+		} else if config.TLSPassthroughDialer != nil {
+			tlsConfig.PassthroughDialer = config.TLSPassthroughDialer
 		} else {
 			tlsConfig.PassthroughDialer = proxy.dialer.Dial
 		}
@@ -938,7 +962,8 @@ func validateTunnelProxyConfig(config *ProxyConfig) error {
 			config.ProxyVersion != 0 ||
 			len(config.ProxyBuildRev) != 0 ||
 			config.ProxyTLSDialer != nil ||
-			config.ProxyQUICDialer != nil {
+			config.ProxyQUICDialer != nil ||
+			config.TLSPassthroughDialer != nil {
 
 			return errors.TraceNew("unexpected tunnel proxy configuration")
 		}
@@ -963,6 +988,15 @@ func validateTunnelProxyConfig(config *ProxyConfig) error {
 	}
 	if config.ProxyTLSDialer == nil && config.ProxyQUICDialer == nil {
 		return errors.TraceNew("missing proxy tunnel dialer")
+	}
+	if config.TLSPassthroughDialer == nil {
+		return errors.TraceNew("missing TLS passthrough dialer")
+	}
+	// ProxyTLSDialer, ProxyQUICDialer, and TLSPassthroughDialer bypass
+	// SplitUpstreamInterfaceName.
+	if config.SplitUpstreamInterfaceName != "" {
+		return errors.TraceNew(
+			"SplitUpstreamInterfaceName is unsupported in tunnel mode")
 	}
 	if config.ProxyVersion < 0 {
 		return errors.TraceNew("invalid proxy version")
@@ -1151,6 +1185,16 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 
 	waitGroup := new(sync.WaitGroup)
 
+	// Connection handlers are tracked separately. On stop, the handlers,
+	// which close their connections, are awaited before the listeners are
+	// closed. Closing a QUIC listener closes its UDP socket, after which
+	// QUIC clients would not receive a connection close and would instead
+	// wait for an idle timeout. Once stopping, any newly accepted connection
+	// is immediately closed.
+	var handlersMutex sync.Mutex
+	handlersStopping := false
+	handlersWaitGroup := new(sync.WaitGroup)
+
 	if proxy.config.EmitActivity {
 		proxy.lastActivityUpdate = time.Now()
 		waitGroup.Add(1)
@@ -1202,6 +1246,15 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 					continue
 				}
 
+				handlersMutex.Lock()
+				if handlersStopping {
+					handlersMutex.Unlock()
+					conn.Close()
+					continue
+				}
+				handlersWaitGroup.Add(1)
+				handlersMutex.Unlock()
+
 				// Limitation: network changes do not interrupt detached TLS passthrough
 				// relays or QUIC connections not yet returned by Accept.
 				connCtx := runCtx
@@ -1210,9 +1263,8 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 					connCtx, cancel = common.MergeContextCancel(
 						runCtx, proxy.config.GetCurrentNetworkContext())
 				}
-				waitGroup.Add(1)
 				go func(conn net.Conn) {
-					defer waitGroup.Done()
+					defer handlersWaitGroup.Done()
 					if cancel != nil {
 						defer cancel()
 					}
@@ -1229,6 +1281,12 @@ func (proxy *Proxy) Run(ctx context.Context) error {
 	}
 
 	<-runCtx.Done()
+
+	handlersMutex.Lock()
+	handlersStopping = true
+	handlersMutex.Unlock()
+	handlersWaitGroup.Wait()
+
 	closeListeners()
 	waitGroup.Wait()
 
@@ -1801,8 +1859,13 @@ func (proxy *Proxy) handleConn(
 			// Unlike other QUIC uses, which carry end-to-end SSH, fallback
 			// mode relies on the stream EOF to signal end of data, and a
 			// QUIC Close discards data the client has not yet read.
+			//
+			// There is no timeout, so a slow client can read all the data.
+			// The wait ends when the client closes the connection, or when
+			// the client relay ends, including on inactivity timeout, and
+			// the handleCtx AfterFunc closes lightConn.
 			if quicConn, ok := conn.(*quic.Conn); ok {
-				quicConn.GracefulShutdown(gracefulShutdownTimeout)
+				quicConn.GracefulShutdown(0)
 			}
 		}
 		lightConn.Close()
@@ -1851,9 +1914,11 @@ func (proxy *Proxy) dialTunnelServer(
 		return nil, "", completedTCP, completedTLS, completedQUIC, errors.Trace(err)
 	}
 
-	_, _, err = proxy.resolve(dialCtx, destinationAddress)
-	if err != nil {
-		return nil, "", completedTCP, completedTLS, completedQUIC, errors.Trace(err)
+	// The destination is the IP address in the dial authorization.
+	if !proxy.config.AllowBogons &&
+		common.IsBogon(net.IP(authorization.IPAddress)) {
+
+		return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.TraceNew("IP is bogon")
 	}
 
 	var exporter []byte
@@ -1861,34 +1926,34 @@ func (proxy *Proxy) dialTunnelServer(
 	switch header.EgressProtocol {
 	case TransportTLS:
 		if proxy.config.ProxyTLSDialer == nil {
-			return nil, "", completedTCP, completedTLS, completedQUIC, errors.TraceNew("missing proxy TLS dialer")
+			return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.TraceNew("missing proxy TLS dialer")
 		}
 		conn, exporter, completedTCP, completedTLS, err =
 			proxy.dialTunnelServerTLS(
 				dialCtx, header, authorization, destinationAddress)
 	case TransportQUIC:
 		if proxy.config.ProxyQUICDialer == nil {
-			return nil, "", completedTCP, completedTLS, completedQUIC, errors.TraceNew("missing proxy QUIC dialer")
+			return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.TraceNew("missing proxy QUIC dialer")
 		}
 		conn, exporter, completedQUIC, err =
 			proxy.dialTunnelServerQUIC(
 				dialCtx, header, authorization, destinationAddress)
 	default:
-		return nil, "", completedTCP, completedTLS, completedQUIC, errors.TraceNew("unsupported egress protocol")
+		return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.TraceNew("unsupported egress protocol")
 	}
 	if err != nil {
 		if conn != nil {
 			conn.Close()
 		}
-		return nil, "", completedTCP, completedTLS, completedQUIC, errors.Trace(err)
+		return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.Trace(err)
 	}
 	if conn == nil {
-		return nil, "", completedTCP, completedTLS, completedQUIC, errors.TraceNew(
+		return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.TraceNew(
 			"missing proxy tunnel connection")
 	}
 	if err := validateTunnelProxyReportExporter(exporter); err != nil {
 		conn.Close()
-		return nil, "", completedTCP, completedTLS, completedQUIC, errors.Trace(err)
+		return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.Trace(err)
 	}
 	exporter = append([]byte(nil), exporter...)
 
@@ -1917,7 +1982,7 @@ func (proxy *Proxy) dialTunnelServer(
 	}
 	if err != nil {
 		conn.Close()
-		return nil, "", completedTCP, completedTLS, completedQUIC, errors.Trace(err)
+		return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.Trace(err)
 	}
 
 	return conn, destinationAddress, completedTCP, completedTLS, completedQUIC, nil
@@ -2096,7 +2161,10 @@ func (proxy *Proxy) dialTunnelServerTLS(
 	verifyPin := base64.StdEncoding.EncodeToString(
 		authorization.VerifyPin)
 
-	// Future enhancement: client-selected egress TLS fragmentation and padding.
+	// Future enhancement: egress TLS fragmentation and padding. These should
+	// be selected by the proxy, using its own tactics, which are appropriate
+	// for the proxy's location, and not by the client. A client-supplied
+	// seed could make the proxy's selection replayable.
 	conn, exporter, completedTCP, completedTLS, err = proxy.config.ProxyTLSDialer(
 		ctx,
 		destinationAddress,

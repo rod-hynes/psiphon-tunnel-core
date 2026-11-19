@@ -374,6 +374,13 @@ func TunnelProtocolUsesObfuscatedSSH(protocol string) bool {
 	return protocol != TUNNEL_PROTOCOL_SSH
 }
 
+// TunnelProtocolUsesPlainSSH indicates that the tunnel protocol is plain SSH
+// on the wire, with no obfuscation or transport layer over SSH.
+func TunnelProtocolUsesPlainSSH(protocol string) bool {
+	protocol = TunnelProtocolMinusInproxy(protocol)
+	return protocol == TUNNEL_PROTOCOL_SSH
+}
+
 // NOTE: breaks the naming convention of dropping the OSSH suffix because
 // UsesTLS is ambiguous by itself as there are other protocols which use
 // a TLS layer, e.g. UNFRONTED-MEEK-HTTPS-OSSH.

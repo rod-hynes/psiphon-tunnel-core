@@ -56,10 +56,14 @@ func (address ProxyAddress) String() string {
 	return net.JoinHostPort(address.IPAddress, strconv.Itoa(address.Port))
 }
 
-func (address ProxyAddress) validate(listen bool) error {
-	if address.Protocol != LIGHT_PROTOCOL_TLS &&
-		address.Protocol != LIGHT_PROTOCOL_QUIC {
+// isSupported indicates whether the address protocol is supported.
+func (address ProxyAddress) isSupported() bool {
+	return address.Protocol == LIGHT_PROTOCOL_TLS ||
+		address.Protocol == LIGHT_PROTOCOL_QUIC
+}
 
+func (address ProxyAddress) validate(listen bool) error {
+	if !address.isSupported() {
 		return errors.TraceNew("unsupported proxy protocol")
 	}
 
@@ -243,14 +247,23 @@ func DecodeAndValidateProxyEntry(encodedSignedProxyEntry []byte) (*ProxyEntry, e
 		}
 	}
 
-	if len(proxyEntry.DialAddresses) == 0 {
-		return nil, errors.TraceNew("missing dial addresses")
-	}
+	// Skip dial addresses with unsupported protocols, so that entries may
+	// add addresses for future protocols without being rejected by existing
+	// clients.
+	var dialAddresses []ProxyAddress
 	for _, address := range proxyEntry.DialAddresses {
+		if !address.isSupported() {
+			continue
+		}
 		if err := address.validate(false); err != nil {
 			return nil, errors.Trace(err)
 		}
+		dialAddresses = append(dialAddresses, address)
 	}
+	if len(dialAddresses) == 0 {
+		return nil, errors.TraceNew("missing dial addresses")
+	}
+	proxyEntry.DialAddresses = dialAddresses
 
 	if len(proxyEntry.ObfuscationKey) == 0 {
 		return nil, errors.TraceNew("missing obfuscation key")

@@ -239,7 +239,8 @@ func (conn *saltReader) init() error {
 			err = errors.TraceNew("client replay detected")
 		}
 
-		conn.server.irregularTunnelLogger(conn.RemoteAddr().String(), err, nil)
+		conn.server.irregularTunnelLogger(
+			common.IPAddressFromAddr(conn.RemoteAddr()), err, nil)
 
 		return err
 	}

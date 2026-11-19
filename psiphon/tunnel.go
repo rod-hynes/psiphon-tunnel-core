@@ -1215,21 +1215,20 @@ func dialTunnel(
 		// Ensure SSH algorithm selection conforms to the obfuscated SSH
 		// expectation that everything after the obfuscated KEX is fully
 		// random.
-		//
-		// TUNNEL_PROTOCOL_SSH is excepted since its KEX appears in
-		// plaintext, and the protocol is intended to look like SSH on the
-		// wire. Light tunnels also omit OSSH and carry SSH inside TLS or QUIC.
 		sshClientConfig.ObfuscatedSSHMode = true
-	} else {
-		// For protocols without OSSH, the server randomizes its KEX;
-		// PeerKEXPRNGSeed ensures successful negotiation between two
-		// randomized KEXes.
+	} else if protocol.TunnelProtocolUsesPlainSSH(dialParams.TunnelProtocol) {
+		// The plain SSH KEX appears in plaintext, and the protocol is
+		// intended to look like SSH on the wire, so the server randomizes
+		// its KEX; PeerKEXPRNGSeed ensures successful negotiation between
+		// two randomized KEXes.
 		sshClientConfig.PeerKEXPRNGSeed, err = protocol.DeriveSSHServerKEXPRNGSeed(
 			dialParams.ServerEntry.SshObfuscatedKey)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
 	}
+	// Otherwise, SSH runs within another secure transport and neither
+	// ObfuscatedSSHMode nor server KEX randomization is applied.
 
 	// The ssh session establishment (via ssh.NewClientConn) is wrapped
 	// in a timeout to ensure it won't hang. We've encountered firewalls

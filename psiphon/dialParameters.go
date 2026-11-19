@@ -2219,7 +2219,7 @@ func MakeDialParameters(
 		dialParams.lightQUICTLSClientSessionCache = quicTLSClientSessionCache
 		dialParams.lightTLSClientSessionCache = tlsClientSessionCache
 		if !isReplay {
-			removeLightTunnelSessionCacheEntries(config, dialParams)
+			removeLightTunnelSessionCacheEntries(dialParams)
 		}
 	}
 
@@ -2437,7 +2437,7 @@ func (dialParams *DialParameters) Failed(config *Config, dialErr error) {
 	}
 
 	if dialParams.lightProxyClient != nil {
-		removeLightTunnelSessionCacheEntries(config, dialParams)
+		removeLightTunnelSessionCacheEntries(dialParams)
 	}
 }
 

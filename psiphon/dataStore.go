@@ -38,6 +38,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/dsl"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/light"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
@@ -1506,7 +1507,7 @@ func (iterator *ServerEntryIterator) Next(ctx context.Context) (*protocol.Server
 			if err != nil {
 				// Do not stop.
 				NoticeWarning(
-					"ServerEntryIterator.Next: update server entry failed: %s",
+					"ServerEntryIterator.Next: update server entry failed: %v",
 					errors.Trace(err))
 			}
 		}
@@ -3746,8 +3747,11 @@ func (iterator *CommonLightTunnelProxyEntryIterator) Reset(ctx context.Context) 
 			}
 			return nil
 		})
-		if err != nil {
-			return errors.Trace(err)
+		if err != nil && ctx.Err() == nil {
+			// Do not stop.
+			NoticeWarning(
+				"CommonLightTunnelProxyEntryIterator.Reset: prune failed: %v",
+				errors.Trace(err))
 		}
 	}
 
@@ -3879,6 +3883,10 @@ func decodeCommonLightTunnelProxyEntry(encodedProxyEntry []byte) (*light.ProxyEn
 	}
 	if proxyEntry.TTLSeconds <= 0 {
 		return nil, errors.TraceNew("common Light proxy entry requires a positive TTL")
+	}
+	_, err = inproxy.IDFromString(proxyEntry.ProxyID)
+	if err != nil {
+		return nil, errors.TraceNew("common Light proxy entry requires a tunnel proxy ID")
 	}
 	return proxyEntry, nil
 }

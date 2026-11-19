@@ -678,6 +678,9 @@ type Conn struct {
 	readMutex  sync.Mutex
 	writeMutex sync.Mutex
 
+	shutdownMutex  sync.Mutex
+	isShuttingDown bool
+
 	isClosed int32
 }
 
@@ -764,9 +767,9 @@ func (conn *Conn) Close() error {
 }
 
 // GracefulShutdown sends a stream FIN, which follows all written data, and
-// waits up to timeout for the peer to close the connection. Close alone
-// discards any data the peer has not yet read. The caller must still call
-// Close.
+// waits up to timeout for the connection to close; when timeout is 0, there
+// is no time limit. Close alone discards any data the peer has not yet read.
+// The caller must still call Close.
 func (conn *Conn) GracefulShutdown(timeout time.Duration) {
 
 	conn.acceptMutex.Lock()
@@ -779,17 +782,26 @@ func (conn *Conn) GracefulShutdown(timeout time.Duration) {
 	}
 
 	// Interrupt any blocked Write, as the stream Close must not be
-	// concurrent with Write.
+	// concurrent with Write. After isShuttingDown is set, SetDeadline and
+	// SetWriteDeadline, called, e.g., by a wrapping ActivityMonitoredConn,
+	// no longer extend the write deadline.
+	conn.shutdownMutex.Lock()
+	conn.isShuttingDown = true
 	_ = stream.SetWriteDeadline(time.Now())
+	conn.shutdownMutex.Unlock()
 	conn.writeMutex.Lock()
 	_ = stream.Close()
 	conn.writeMutex.Unlock()
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+	var timeoutC <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		timeoutC = timer.C
+	}
 	select {
 	case <-ietfConnection.Context().Done():
-	case <-timer.C:
+	case <-timeoutC:
 	}
 }
 
@@ -814,6 +826,11 @@ func (conn *Conn) SetDeadline(t time.Time) error {
 		}
 	}
 
+	conn.shutdownMutex.Lock()
+	defer conn.shutdownMutex.Unlock()
+	if conn.isShuttingDown {
+		return conn.stream.SetReadDeadline(t)
+	}
 	return conn.stream.SetDeadline(t)
 }
 
@@ -838,6 +855,11 @@ func (conn *Conn) SetWriteDeadline(t time.Time) error {
 		}
 	}
 
+	conn.shutdownMutex.Lock()
+	defer conn.shutdownMutex.Unlock()
+	if conn.isShuttingDown {
+		return nil
+	}
 	return conn.stream.SetWriteDeadline(t)
 }
 

@@ -61,9 +61,14 @@ type TCPDialer func(
 // The specified tlsProfile must be a utls TLS 1.3 ClientHello parrot
 // fingerprint, or a randomized fingerprint that produces a TLS 1.3
 // ClientHello with the given randomizedTLSProfileSeed.
+//
+// dialAddress is the proxy entry dial address used for underlyingConn, which
+// may differ from the connected address, and is suitable for use as a TLS
+// session cache key.
 type ClientTLSDialer func(
 	ctx context.Context,
 	underlyingConn net.Conn,
+	dialAddress string,
 	tlsProfile string,
 	randomizedTLSProfileSeed *prng.Seed,
 	sni string,
@@ -129,19 +134,20 @@ type ClientConfig struct {
 
 // Client is a light proxy client which supports multiple concurrent dials.
 type Client struct {
-	config            *ClientConfig
-	sponsorID         []byte
-	clientPlatform    uint8
-	clientBuildRev    []byte
-	sessionID         []byte
-	proxyEntry        *ProxyEntry
-	proxyEntryTracker string
-	proxyID           string
-	obfuscationKey    string
-	verifyPin         string
-	protocols         []string
-	hasIPv6           bool
-	connectionNumber  atomic.Int64
+	config              *ClientConfig
+	sponsorID           []byte
+	clientPlatform      uint8
+	clientBuildRev      []byte
+	sessionID           []byte
+	proxyEntry          *ProxyEntry
+	proxyEntryTracker   string
+	proxyID             string
+	obfuscationKey      string
+	verifyPin           string
+	protocols           []string
+	selectProtocolCount atomic.Uint32
+	hasIPv6             bool
+	connectionNumber    atomic.Int64
 
 	metricsMutex      sync.Mutex
 	dialIPv4Count     int
@@ -249,6 +255,8 @@ func NewClient(config *ClientConfig) (*Client, error) {
 		protocols:         supportedProtocols,
 		hasIPv6:           hasIPv6,
 	}
+	client.selectProtocolCount.Store(
+		uint32(prng.Intn(len(supportedProtocols))))
 
 	return client, nil
 }
@@ -319,10 +327,13 @@ func (client *Client) SupportsProtocol(protocol string) bool {
 	return common.Contains(client.protocols, protocol)
 }
 
-// SelectProtocol selects at random one protocol advertised by the proxy entry
-// and supported by the configured client dialers.
+// SelectProtocol selects one protocol advertised by the proxy entry and
+// supported by the configured client dialers. Selection is round-robin, from
+// a random start, so that consecutive or concurrent fresh dials try each
+// protocol.
 func (client *Client) SelectProtocol() string {
-	return client.protocols[prng.Intn(len(client.protocols))]
+	n := client.selectProtocolCount.Add(1)
+	return client.protocols[int(n%uint32(len(client.protocols)))]
 }
 
 // GetMetrics returns ClientMetrics stats for the light client. If
@@ -686,9 +697,14 @@ func (client *Client) Dial(
 		}
 
 		start = time.Now()
+		dialAddress := dialAddressIPv4
+		if isIPv6 {
+			dialAddress = dialAddressIPv6
+		}
 		ingressConn, err = client.config.TLSDialer(
 			ctx,
 			activityConn,
+			dialAddress,
 			tlsProfile,
 			randomizedTLSProfileSeed,
 			sni,
@@ -944,6 +960,12 @@ func (conn *ClientConn) Close() error {
 	conn.closeOnce.Do(func() {
 		if conn.quicConn != nil {
 			// See the comment at the proxy's GracefulShutdown call.
+			//
+			// The proxy closes the connection once it has relayed all
+			// written data upstream, so this typically returns early.
+			// Limitation: Close blocks for at most gracefulShutdownTimeout,
+			// kept short as callers expect a prompt Close, and written data
+			// not yet relayed by then may be discarded.
 			conn.quicConn.GracefulShutdown(gracefulShutdownTimeout)
 		}
 		conn.closeErr = errors.Trace(conn.lightConn.Close())

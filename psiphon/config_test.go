@@ -32,6 +32,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/deviceregion"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/resolver"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
 	"github.com/stretchr/testify/suite"
@@ -860,6 +861,9 @@ func TestControllerProxyReducedLimits(t *testing.T) {
 		{"Combined", true, true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
+			if testCase.inproxy && !inproxy.Enabled() {
+				t.Skip("In-proxy is not enabled")
+			}
 			config := newRunningLightProxyTestConfig(t)
 			config.InproxyEnableProxy = testCase.inproxy
 			config.EnableRunningLightProxy = testCase.light

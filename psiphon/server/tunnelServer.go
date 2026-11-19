@@ -993,7 +993,8 @@ func runListener(
 		}
 
 		if err != nil {
-			if e, ok := err.(net.Error); ok && e.Temporary() {
+			var netErr net.Error
+			if std_errors.As(err, &netErr) && netErr.Temporary() {
 				log.WithTraceFields(LogFields{"error": err}).Error("accept failed")
 				// Temporary error, keep running
 				continue
@@ -1970,11 +1971,10 @@ func (sshServer *sshServer) handleClient(
 	failedReplay := func() {
 		var fragmentorSeed *prng.Seed
 		replayedFragmentation := false
-		if fragmentor, ok := conn.(common.FragmentorAccessor); ok {
-			fragmentorSeed, replayedFragmentation = fragmentor.GetReplay()
-		}
-		if tunnelProtocol == protocol.TUNNEL_PROTOCOL_OBFUSCATED_SSH {
-			replayedFragmentation = false
+		if !protocol.TunnelProtocolIsObfuscatedSSH(sshListener.tunnelProtocol) {
+			if fragmentor, ok := conn.(common.FragmentorAccessor); ok {
+				fragmentorSeed, replayedFragmentation = fragmentor.GetReplay()
+			}
 		}
 		if replayedFragmentation || replayedServerPacketManipulation {
 			sshServer.support.ReplayCache.FailedReplayParameters(
@@ -2891,6 +2891,11 @@ func (sshClient *sshClient) run(
 	if isReplayCandidate {
 
 		getFragmentorSeed := func() *prng.Seed {
+			// OSSH fragmentation is seeded by the client and doesn't use the
+			// ReplayCache.
+			if protocol.TunnelProtocolIsObfuscatedSSH(replayTunnelProtocol) {
+				return nil
+			}
 			fragmentor, ok := baseConn.(common.FragmentorAccessor)
 			if ok {
 				fragmentorSeed, _ := fragmentor.GetReplay()
@@ -2960,14 +2965,11 @@ func (sshClient *sshClient) run(
 			// random. Full compliance depends on clients with the latest
 			// ObfuscatedSSHMode logic; for legacy client compatibility, the
 			// server allows non-conforming selections.
-			//
-			// The exception is TUNNEL_PROTOCOL_SSH, which is intended to appear
-			// like SSH on the wire. Light tunnels also omit OSSH and carry SSH
-			// inside TLS or QUIC.
 			sshServerConfig.ObfuscatedSSHMode = true
 
-		} else {
-			// Randomize KEX for protocols without OSSH.
+		} else if protocol.TunnelProtocolUsesPlainSSH(sshClient.tunnelProtocol) {
+			// Randomize the KEX for plain SSH, which is intended to appear
+			// like SSH on the wire.
 			if sshClient.sshServer.support.Config.ObfuscatedSSHKey != "" {
 				sshServerConfig.KEXPRNGSeed, err = protocol.DeriveSSHServerKEXPRNGSeed(
 					sshClient.sshServer.support.Config.ObfuscatedSSHKey)
@@ -2976,6 +2978,8 @@ func (sshClient *sshClient) run(
 				}
 			}
 		}
+		// Otherwise, SSH runs within another secure transport and neither
+		// ObfuscatedSSHMode nor KEX randomization is applied.
 
 		result := &sshNewServerConnResult{}
 

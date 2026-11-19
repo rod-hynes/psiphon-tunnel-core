@@ -2242,8 +2242,10 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		// Light proxy's reported client IP is trusted only for trusted
 		// proxies, which aren't guaranteed here, and an untrusted proxy could
 		// misreport it to control which traffic is sent untunneled.
-		if config.IsSplitTunnelEnabled() &&
-			!config.IsInproxyClientPersonalPairingMode() {
+		//
+		// This applies even when in-proxy personal pairing is also configured,
+		// since, with split tunnel enabled, every Light candidate is skipped.
+		if config.IsSplitTunnelEnabled() {
 
 			return errors.TraceNew(
 				"EnablePersonalLightProxyTunnels is incompatible with split tunnel")
@@ -2677,6 +2679,10 @@ func (config *Config) getLightProxyDialAuthorizationPublicKey() (
 	return ed25519.PublicKey(publicKey), nil
 }
 
+// The authorization is not validated against the proxy key or its validity
+// period. An invalid or expired authorization is presented to the server,
+// which fails the tunnel, and irregular tunnel events may be monitored for
+// this case.
 func (config *Config) getLightProxyTrustedProxyAuthorization() ([]byte, error) {
 	if config.LightProxyTrustedProxyAuthorization == "" {
 		return nil, nil

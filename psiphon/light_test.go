@@ -2261,7 +2261,6 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 				NetworkID:                       "WIFI-test",
 				EnablePersonalLightProxyTunnels: !testCase.common,
 				EnableLightProxyFallback:        testCase.common,
-				IPv6Synthesizer:                 lightTestIPv6Synthesizer{},
 			}
 			if testCase.common {
 				config.FallbackLightProxyEntry = entry
@@ -2320,9 +2319,6 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 				return tunnelProtocol, true
 			}
 			cacheKeys := []string{"127.0.0.1:443", "[::1]:443"}
-			if !ingressQUIC {
-				cacheKeys = append(cacheKeys, "[64:ff9b::7f00:1]:443")
-			}
 			cacheKeys = append(cacheKeys, "unrelated:443")
 			seedSessions := func() {
 				for _, key := range cacheKeys {
@@ -2811,12 +2807,6 @@ func TestLightTunnelDialParametersAndReplay(t *testing.T) {
 			}
 		})
 	}
-}
-
-type lightTestIPv6Synthesizer struct{}
-
-func (lightTestIPv6Synthesizer) IPv6Synthesize(IPv4Addr string) string {
-	return "64:ff9b::" + IPv4Addr
 }
 
 func TestLightProxyActivity(t *testing.T) {

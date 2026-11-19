@@ -1013,6 +1013,27 @@ func (controller *Controller) newLightProxy(
 		lookupGeoIP = func(string) common.GeoIPData { return common.GeoIPData{} }
 	}
 
+	// Apply the device binder and resolver to TLS passthrough dials. In
+	// split interface mode, the device binder is the upstream binder.
+	tlsPassthroughDialTimeout := p.Duration(
+		parameters.LightTunnelProxyUpstreamDialTimeout)
+	tlsPassthroughTCPDialer := NewTCPDialer(&DialConfig{
+		DeviceBinder:    config.deviceBinder(),
+		IPv6Synthesizer: config.IPv6Synthesizer,
+		ResolveIP: func(ctx context.Context, hostname string) ([]net.IP, error) {
+			IPs, err := UntunneledResolveIP(
+				ctx, config, controller.resolver, hostname, "")
+			return IPs, errors.Trace(err)
+		},
+	})
+	tlsPassthroughDialer := func(network, address string) (net.Conn, error) {
+		ctx, cancel := context.WithTimeout(
+			controller.runCtx, tlsPassthroughDialTimeout)
+		defer cancel()
+		conn, err := tlsPassthroughTCPDialer(ctx, network, address)
+		return conn, errors.Trace(err)
+	}
+
 	proxy, err := light.NewProxy(
 		&light.ProxyConfig{
 			DialAddresses:                config.LightProxyDialAddresses,
@@ -1021,6 +1042,7 @@ func (controller *Controller) newLightProxy(
 			TLSCertificate:               []byte(config.LightProxyTLSCertificate),
 			TLSPrivateKey:                []byte(config.LightProxyTLSPrivateKey),
 			PassthroughAddress:           config.LightProxyPassthroughAddress,
+			TLSPassthroughDialer:         tlsPassthroughDialer,
 			PreHeaderDeadlineMin:         p.Duration(parameters.LightTunnelProxyPreHeaderDeadlineMin).String(),
 			PreHeaderDeadlineMax:         p.Duration(parameters.LightTunnelProxyPreHeaderDeadlineMax).String(),
 			InactivityTimeout:            p.Duration(parameters.LightTunnelProxyRelayInactivityTimeout).String(),
@@ -1028,7 +1050,6 @@ func (controller *Controller) newLightProxy(
 			PerIPRateLimitQuantity:       &perIPRateLimitQuantity,
 			PerIPRateLimitInterval:       p.Duration(parameters.LightTunnelProxyPerIPRateLimitInterval).String(),
 			PerIPMaxConcurrent:           &perIPMaxConcurrent,
-			SplitUpstreamInterfaceName:   config.splitInterfaceUpstreamInterfaceName(),
 			SplitDownstreamInterfaceName: config.splitInterfaceDownstreamInterfaceName(),
 			ProxyLimits:                  controller.proxyLimits,
 			GetCurrentNetworkContext:     controller.getCurrentNetworkContext,
@@ -3851,6 +3872,11 @@ func (controller *Controller) establishCandidateGenerator() {
 	}
 
 	inproxyAwaitBrokerSpecsEmitted := false
+	// Limitation: in combined in-proxy and Light personal pairing mode,
+	// broker specs are not awaited even when no Light candidate can be
+	// selected, such as when no known server entry supports LIGHT protocols.
+	// In that case, in-proxy candidates fail with "no broker specs" until
+	// tactics are fetched.
 	inproxyAwaitBrokerSpecs :=
 		(controller.config.IsInproxyClientPersonalPairingMode() &&
 			!controller.config.EnablePersonalLightProxyTunnels) ||

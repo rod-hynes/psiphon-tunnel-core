@@ -1296,7 +1296,10 @@ func NoticeLightProxyListenError(listenAddress, message string) {
 // Limitation: aggregate counts include pre-header and passthrough activity
 // without personal/common attribution. Independently sampled aggregate and
 // region counters may also differ at interval boundaries.
-// Requested by EmitLightProxyActivity, this notice is excluded from diagnostics.
+//
+// This is not a diagnostic notice: the user app has requested this notice
+// with EmitLightProxyActivity for functionality such as traffic display;
+// and this frequent notice is not intended to be included with feedback.
 func NoticeLightProxyActivity(
 	currentConnectionCount int64,
 	bytesUp int64,

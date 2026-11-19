@@ -402,7 +402,9 @@ func (conn *LightTunnelConn) initialize(ctx context.Context) error {
 	trustedProxy := false
 	if len(report.TrustedProxyAuthorization) > 0 {
 		// Reject a supplied trusted proxy authorization if it cannot be verified,
-		// including when no verification key is configured.
+		// including when no verification key is configured. The tunnel fails,
+		// instead of downgrading to untrusted, and irregular tunnel events may
+		// be monitored for invalid or expired authorizations.
 		_, err := light.VerifyTunnelTrustedProxyAuthorization(
 			conn.trustedProxyPublicKey,
 			report.ProxyPublicKey,

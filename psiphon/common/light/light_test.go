@@ -289,8 +289,6 @@ func runTestLightProxy(
 		return errors.Trace(err)
 	}
 
-	// Test: legacy certificate names do not constrain pin verification.
-	entry.VerifyServerName = "mismatched.invalid"
 	entry.Protocol = ""
 	entry.DialAddressIPv4 = ""
 	entry.DialAddressIPv6 = ""
@@ -379,6 +377,7 @@ func runTestLightProxy(
 			TLSDialer: func(
 				ctx context.Context,
 				underlyingConn net.Conn,
+				_ string,
 				tlsProfile string,
 				randomizedTLSProfileSeed *prng.Seed,
 				sni string,
@@ -884,6 +883,7 @@ func runTestLightProxyTunnel() error {
 		return errors.Trace(err)
 	}
 	var upstreamDials atomic.Int64
+	proxyConfig.TLSPassthroughDialer = net.Dial
 	proxyConfig.ProxyTLSDialer = func(
 		ctx context.Context,
 		address string,
@@ -1136,9 +1136,6 @@ func runTestLightProxyTunnel() error {
 		return errors.TraceNew("tunnel entry includes legacy endpoints")
 	}
 
-	// Test: personal and common tunnels ignore legacy certificate names.
-	entry.VerifyServerName = "mismatched.invalid"
-
 	for i, listenAddress := range proxyConfig.ListenAddresses {
 		boundAddress, err := parseProxyAddress(
 			receiver.listeningAddresses[i], listenAddress.Protocol)
@@ -1179,6 +1176,7 @@ func runTestLightProxyTunnel() error {
 		TLSDialer: func(
 			ctx context.Context,
 			underlyingConn net.Conn,
+			_ string,
 			tlsProfile string,
 			randomizedTLSProfileSeed *prng.Seed,
 			sni string,

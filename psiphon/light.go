@@ -159,7 +159,7 @@ func makeLightProxyClient(
 
 // removeLightTunnelSessionCacheEntries clears Light ingress TLS session
 // cache entries after failed dials and before dials that do not use replay.
-func removeLightTunnelSessionCacheEntries(config *Config, dialParams *DialParameters) {
+func removeLightTunnelSessionCacheEntries(dialParams *DialParameters) {
 
 	// Limitation: light.Client selects addresses and may race IPv4 and IPv6
 	// dials. DialParameters does not record which addresses were tried, so clear
@@ -185,18 +185,7 @@ func removeLightTunnelSessionCacheEntries(config *Config, dialParams *DialParame
 			continue
 		}
 
-		// TLS session cache keys use the connected address, including NAT64;
-		// QUIC keys use the original dial address.
-		ipAddress := net.ParseIP(address.IPAddress)
-		address.IPAddress = ipAddress.String()
 		dialParams.lightTLSClientSessionCache.Put(address.String(), nil)
-		if ipAddress.To4() != nil && config.IPv6Synthesizer != nil {
-			synthesized := net.ParseIP(config.IPv6Synthesizer.IPv6Synthesize(address.IPAddress))
-			if synthesized != nil {
-				address.IPAddress = synthesized.String()
-				dialParams.lightTLSClientSessionCache.Put(address.String(), nil)
-			}
-		}
 	}
 }
 
@@ -207,6 +196,7 @@ func makeLightClientTLSDialer(
 	return func(
 		ctx context.Context,
 		underlyingConn net.Conn,
+		dialAddress string,
 		tlsProfile string,
 		randomizedTLSProfileSeed *prng.Seed,
 		sni string,
@@ -220,6 +210,7 @@ func makeLightClientTLSDialer(
 			config,
 			tlsClientSessionCache,
 			underlyingConn,
+			dialAddress,
 			tlsProfile,
 			randomizedTLSProfileSeed,
 			sni,
@@ -264,6 +255,7 @@ func makeLightProxyTLSDialer(
 			config,
 			tlsClientSessionCache,
 			underlyingConn,
+			address,
 			tlsProfile,
 			randomizedTLSProfileSeed,
 			sni,
@@ -414,6 +406,7 @@ func dialLightTLS(
 	config *Config,
 	tlsClientSessionCache utls.ClientSessionCache,
 	underlyingConn net.Conn,
+	dialAddress string,
 	tlsProfile string,
 	randomizedTLSProfileSeed *prng.Seed,
 	sni string,
@@ -421,6 +414,29 @@ func dialLightTLS(
 	tlsPadding int,
 	passthroughMessage []byte,
 	verifyPin string) (net.Conn, error) {
+
+	// Derive NoDefaultTLSSessionID from the randomized TLS profile seed, so
+	// that a replayed seed reproduces the same ClientHello. Without a seed,
+	// the TLS profile is not randomized and, as Light TLS is TLS 1.3,
+	// NoDefaultTLSSessionID doesn't apply. For proxy egress dials, the seed
+	// is client-selected while the probability is from the proxy's tactics,
+	// which are appropriate for the proxy's location.
+	//
+	// Limitation: unlike other TLS tunnel protocols, the value is not stored
+	// in dial parameters or reported in metrics.
+	var noDefaultTLSSessionID *bool
+	if randomizedTLSProfileSeed != nil {
+		PRNG, err := prng.NewPRNGWithSaltedSeed(
+			randomizedTLSProfileSeed, "light-no-default-tls-session-id")
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		p := config.GetParameters().Get()
+		value := PRNG.FlipWeightedCoin(
+			p.Float(parameters.NoDefaultTLSSessionIDProbability))
+		p.Close()
+		noDefaultTLSSessionID = &value
+	}
 
 	return tlsdialer.Dial(
 		ctx,
@@ -436,13 +452,15 @@ func dialLightTLS(
 			VerifyPins:               []string{verifyPin},
 			VerifyPinsOnly:           true,
 			TLSProfile:               tlsProfile,
+			NoDefaultTLSSessionID:    noDefaultTLSSessionID,
 			RandomizedTLSProfileSeed: randomizedTLSProfileSeed,
 			FragmentClientHello:      fragmentClientHello,
 			TLSPadding:               tlsPadding,
 			PassthroughMessage:       passthroughMessage,
+			// The session cache key is the dial address, not the connected
+			// address, which may be a synthesized NAT64 address.
 			ClientSessionCache: common.WrapUtlsClientSessionCache(
-				tlsClientSessionCache,
-				underlyingConn.RemoteAddr().String()),
+				tlsClientSessionCache, dialAddress),
 		})
 }
 
@@ -523,6 +541,10 @@ func makeLightFallbackDialParameters(
 		}
 
 	case light.LIGHT_PROTOCOL_QUIC:
+		// Limitation: when tactics LimitQUICVersions leaves no supported
+		// Light QUIC version, this dial fails instead of selecting TLS,
+		// even when the proxy entry has a TLS address. This case is not
+		// expected in practice.
 		dialParams.QUICVersion = selectLightQUICVersion(
 			nil, p.QUICVersions(parameters.LimitQUICVersions))
 		if dialParams.QUICVersion == "" {

@@ -457,6 +457,7 @@ func runTestLightProxy(
 	tlsDialer := func(
 		ctx context.Context,
 		underlyingConn net.Conn,
+		_ string,
 		tlsProfile string,
 		randomizedTLSProfileSeed *prng.Seed,
 		sni string,
@@ -611,11 +612,16 @@ func lightProxyTestFetch(
 		Path:   "",
 	}
 
+	requestCtx, cancel := context.WithTimeout(ctx, lightProxyFetchTimeout)
+	defer cancel()
+
 	transport := &http.Transport{
 		DisableKeepAlives: true,
-		DialContext: func(dialCtx context.Context, _, address string) (net.Conn, error) {
+		DialContext: func(_ context.Context, _, address string) (net.Conn, error) {
+			// Use requestCtx, as the QUIC dial requires a context with a
+			// deadline.
 			conn, err := lightClient.Dial(
-				dialCtx,
+				requestCtx,
 				nil,
 				0,
 				"UNKNOWN",
@@ -645,9 +651,6 @@ func lightProxyTestFetch(
 			return http.ErrUseLastResponse
 		},
 	}
-
-	requestCtx, cancel := context.WithTimeout(ctx, lightProxyFetchTimeout)
-	defer cancel()
 
 	request, err := http.NewRequestWithContext(
 		requestCtx, http.MethodGet, testURL.String(), nil)
