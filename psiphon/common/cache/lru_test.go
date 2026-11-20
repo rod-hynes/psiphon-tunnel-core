@@ -277,3 +277,123 @@ func TestLRUCacheConcurrentOperations(t *testing.T) {
 		t.Fatal("Flush retained entries")
 	}
 }
+
+func TestLRUCacheInsertionOrderEviction(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const maxEntries = 100
+		type event struct {
+			key    int
+			reason EvictionReason
+		}
+		events := make(chan event, 20*maxEntries)
+		c := NewLRUCache(LRUCacheConfig[int, int]{
+			MaxEntries:             maxEntries,
+			InsertionOrderEviction: true,
+			OnEvicted: func(key, _ int, reason EvictionReason) {
+				events <- event{key, reason}
+			},
+		})
+		defer c.cache.StopAllGoroutines()
+
+		// Keys are written once and not read before the check.
+		for i := range 10 * maxEntries {
+			c.Add(i, i, NoExpiration)
+			if c.EstimatedSize() > maxEntries {
+				t.Fatal("limit exceeded")
+			}
+		}
+		for i := range 10 * maxEntries {
+			_, ok := c.Get(i)
+			if ok != (i >= 9*maxEntries) {
+				t.Fatalf("unexpected presence for key %d: %v", i, ok)
+			}
+		}
+		synctest.Wait()
+		for i := range 9 * maxEntries {
+			select {
+			case e := <-events:
+				if e.reason != Capacity || e.key >= 9*maxEntries {
+					t.Fatalf("unexpected eviction: %+v", e)
+				}
+			default:
+				t.Fatalf("missing capacity notification %d", i)
+			}
+		}
+
+		// A deleted and rewritten key is evicted by its latest write, and
+		// its deleted entry stops counting once older entries are gone.
+		c.Delete(9 * maxEntries)
+		c.Set(9*maxEntries, 0, NoExpiration)
+		for i := range maxEntries - 1 {
+			c.Set(-1-i, 0, NoExpiration)
+		}
+		if _, ok := c.Get(9 * maxEntries); !ok {
+			t.Fatal("rewritten key evicted by its earlier write")
+		}
+		if c.EstimatedSize() != maxEntries {
+			t.Fatalf("unexpected size: %d", c.EstimatedSize())
+		}
+
+		// Expired entries do not count, and are reported once, as Expired.
+		c.Flush()
+		synctest.Wait()
+		for len(events) > 0 {
+			<-events
+		}
+		for i := range maxEntries {
+			c.Set(i, i, time.Second)
+		}
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		for i := range maxEntries {
+			c.Set(maxEntries+i, i, NoExpiration)
+		}
+		synctest.Wait()
+		if len(c.writes)-c.oldestWrite != maxEntries {
+			t.Fatalf("unexpected record count: %d",
+				len(c.writes)-c.oldestWrite)
+		}
+		if len(events) != maxEntries {
+			t.Fatalf("unexpected notification count: %d", len(events))
+		}
+		for len(events) > 0 {
+			if e := <-events; e.reason != Expired || e.key >= maxEntries {
+				t.Fatalf("unexpected eviction: %+v", e)
+			}
+		}
+	})
+}
+
+func TestLRUCacheInsertionOrderConcurrent(t *testing.T) {
+	const maxEntries = 50
+	c := NewLRUCache(LRUCacheConfig[int, int]{
+		MaxEntries:             maxEntries,
+		InsertionOrderEviction: true,
+	})
+	defer c.cache.StopAllGoroutines()
+	var wait sync.WaitGroup
+	for worker := range 8 {
+		wait.Go(func() {
+			for i := range 2000 {
+				key := worker*10000 + i
+				c.Add(key, key, time.Minute)
+				c.Set(key%300, key, NoExpiration)
+				c.Get(key)
+				if i%7 == 0 {
+					c.Delete(key)
+				}
+				if i%500 == 0 {
+					c.Flush()
+				}
+			}
+		})
+	}
+	wait.Wait()
+	c.Set(-1, 0, NoExpiration)
+	if size := c.EstimatedSize(); size > maxEntries {
+		t.Fatalf("limit exceeded: %d", size)
+	}
+	if len(c.writes)-c.oldestWrite > maxEntries {
+		t.Fatal("record limit exceeded")
+	}
+}

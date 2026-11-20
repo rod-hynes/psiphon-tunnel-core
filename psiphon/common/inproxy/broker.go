@@ -353,6 +353,9 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 	b.pendingServerReports = lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *pendingServerReport]{
 		DefaultTTL: common.ValueOrDefault(config.PendingServerReportsTTL, brokerPendingServerReportsTTL),
 		MaxEntries: brokerPendingServerReportsMaxSize,
+
+		// Each pending server report is written once and read once.
+		InsertionOrderEviction: true,
 	})
 
 	b.proxyAnnounceTimeout.Store(int64(config.ProxyAnnounceTimeout))

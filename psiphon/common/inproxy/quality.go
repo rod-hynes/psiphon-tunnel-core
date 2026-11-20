@@ -90,6 +90,11 @@ func NewProxyQuality() *ProxyQualityState {
 		lrucache.LRUCacheConfig[string, pendingFailedMatch]{
 			MaxEntries: proxyQualityMaxPendingFailedMatches,
 			OnEvicted:  q.addFailedMatch,
+
+			// Pending failed matches are added once and never read. When
+			// the cache is full, the oldest, which is the nearest to its
+			// deadline, is evicted and recorded as a failed match.
+			InsertionOrderEviction: true,
 		})
 
 	return q

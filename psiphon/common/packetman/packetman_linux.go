@@ -116,6 +116,9 @@ func NewManipulator(config *Config) (*Manipulator, error) {
 	m.appliedSpecCache = lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, appliedSpec]{
 		DefaultTTL: appliedSpecCacheTTL,
 		MaxEntries: appliedSpecCacheMaxEntries,
+
+		// Each applied spec is written once and read once.
+		InsertionOrderEviction: true,
 	})
 
 	return m, nil

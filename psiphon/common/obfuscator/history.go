@@ -91,15 +91,21 @@ func NewSeedHistory(config *SeedHistoryConfig) *SeedHistory {
 		}
 	}
 
+	// Seeds are written once and read only when a duplicate arrives, so
+	// both caches evict in insertion order: when full, the oldest seeds
+	// are forgotten first.
+
 	return &SeedHistory{
 		seedToTime: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, time.Time]{
-			DefaultTTL: useConfig.SeedTTL,
-			MaxEntries: useConfig.SeedMaxEntries,
+			DefaultTTL:             useConfig.SeedTTL,
+			MaxEntries:             useConfig.SeedMaxEntries,
+			InsertionOrderEviction: true,
 		}),
 
 		seedToClientIP: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, string]{
-			DefaultTTL: useConfig.ClientIPTTL,
-			MaxEntries: useConfig.ClientIPMaxEntries,
+			DefaultTTL:             useConfig.ClientIPTTL,
+			MaxEntries:             useConfig.ClientIPMaxEntries,
+			InsertionOrderEviction: true,
 		}),
 	}
 }

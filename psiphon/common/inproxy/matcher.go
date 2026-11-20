@@ -401,6 +401,9 @@ func NewMatcher(config *MatcherConfig) *Matcher {
 		pendingAnswers: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *pendingAnswer]{
 			DefaultTTL: matcherPendingAnswersTTL,
 			MaxEntries: matcherPendingAnswersMaxSize,
+
+			// Each pending answer is written once and read once.
+			InsertionOrderEviction: true,
 		}),
 	}
 
