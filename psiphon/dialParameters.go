@@ -34,6 +34,7 @@ import (
 
 	tls "github.com/Psiphon-Labs/psiphon-tls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/fragmentor"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
@@ -47,7 +48,6 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/transforms"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/values"
 	utls "github.com/Psiphon-Labs/utls"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"golang.org/x/net/bpf"
 )
 
@@ -179,9 +179,9 @@ type DialParameters struct {
 
 	HTTPTransformerParameters *transforms.HTTPTransformerParameters `json:",omitempty"`
 
-	SteeringIP         string          `json:",omitempty"`
-	steeringIPCache    *lrucache.Cache `json:"-"`
-	steeringIPCacheKey string          `json:"-"`
+	SteeringIP         string                             `json:",omitempty"`
+	steeringIPCache    *lrucache.LRUCache[string, string] `json:"-"`
+	steeringIPCacheKey string                             `json:"-"`
 
 	DSLPendingPrioritizeDialTimestamp time.Time `json:",omitempty"`
 	DSLPrioritizedDial                bool      `json:",omitempty"`
@@ -228,7 +228,7 @@ type DialParameters struct {
 // when establishment is cancelled.
 func MakeDialParameters(
 	config *Config,
-	steeringIPCache *lrucache.Cache,
+	steeringIPCache *lrucache.LRUCache[string, string],
 	quicTLSClientSessionCache tls.ClientSessionCache,
 	tlsClientSessionCache utls.ClientSessionCache,
 	upstreamProxyErrorCallback func(error),
@@ -1749,7 +1749,7 @@ func MakeDialParameters(
 		steeringIPValue, ok := dialParams.steeringIPCache.Get(
 			dialParams.steeringIPCacheKey)
 		if ok {
-			currentSteeringIP = steeringIPValue.(string)
+			currentSteeringIP = steeringIPValue
 		}
 
 		// A steering IP probability is applied and may be used to gradually

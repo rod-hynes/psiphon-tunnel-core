@@ -24,15 +24,14 @@ import (
 	"sync"
 	"time"
 
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
-	lrucache "github.com/cognusion/go-cache-lru"
 )
 
 const (
-	REPLAY_CACHE_MAX_ENTRIES      = 100000
-	REPLAY_CACHE_CLEANUP_INTERVAL = 1 * time.Minute
+	REPLAY_CACHE_MAX_ENTRIES = 100000
 )
 
 // ReplayCache is a cache of recently used and successful network obfuscation
@@ -51,7 +50,7 @@ const (
 type ReplayCache struct {
 	support    *SupportServices
 	cacheMutex sync.Mutex
-	cache      *lrucache.Cache
+	cache      *lrucache.LRUCache[string, *replayParameters]
 	metrics    *replayCacheMetrics
 }
 
@@ -78,10 +77,10 @@ func NewReplayCache(support *SupportServices) *ReplayCache {
 	// the entry TTL.
 	return &ReplayCache{
 		support: support,
-		cache: lrucache.NewWithLRU(
-			lrucache.NoExpiration,
-			REPLAY_CACHE_CLEANUP_INTERVAL,
-			REPLAY_CACHE_MAX_ENTRIES),
+		cache: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *replayParameters]{
+			DefaultTTL: lrucache.NoExpiration,
+			MaxEntries: REPLAY_CACHE_MAX_ENTRIES,
+		}),
 		metrics: &replayCacheMetrics{},
 	}
 }
@@ -231,10 +230,8 @@ func (r *ReplayCache) SetReplayParameters(
 
 	r.cache.Set(key, value, TTL)
 
-	// go-cache-lru is typically safe for concurrent access but explicit
-	// synchronization is required when accessing Items. Items may include
-	// entries that are expired but not yet purged.
-	cacheSize := int64(len(r.cache.Items()))
+	// This approximate count may include expired entries awaiting cleanup.
+	cacheSize := int64(r.cache.EstimatedSize())
 
 	if cacheSize > r.metrics.MaxCacheEntries {
 		r.metrics.MaxCacheEntries = cacheSize
@@ -305,9 +302,7 @@ func (r *ReplayCache) getReplayParameters(
 
 	r.metrics.GetReplayHitCount += 1
 
-	parameters, ok := value.(*replayParameters)
-
-	return parameters, ok
+	return value, true
 }
 
 // FailedReplayParameters increments the count of tunnels which failed to

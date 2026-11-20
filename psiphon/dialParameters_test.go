@@ -32,13 +32,13 @@ import (
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/transforms"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/values"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"golang.org/x/time/rate"
 )
 
@@ -170,7 +170,10 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	// Test: expected dial parameter fields set
 
-	steeringIPCache := lrucache.NewWithLRU(1*time.Hour, 1*time.Hour, 0)
+	steeringIPCache := lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, string]{
+		DefaultTTL: 1 * time.Hour,
+		MaxEntries: 0,
+	})
 
 	upstreamProxyErrorCallback := func(_ error) {}
 

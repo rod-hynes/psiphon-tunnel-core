@@ -32,10 +32,10 @@ import (
 	"time"
 
 	"filippo.io/edwards25519"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/flynn/noise"
 	"github.com/marusama/semaphore"
 	"golang.org/x/crypto/curve25519"
@@ -409,9 +409,14 @@ func (s *InitiatorSessions) RoundTrip(
 // ProxyAnnounce will block any additional ProxyAnnounce requests attempting
 // to share the same InitiatorSessions. In practice, an initial
 // ProxyAnnounce/ClientOffer request is expected to block only as long as
-// there is no match, so the impact of blocking other concurrent requests is
-// limited. See comment in InitiatorRoundTrip.Next for a related future
-// enhancement.
+// there is no match. See comment in InitiatorRoundTrip.Next for a related
+// future enhancement.
+//
+// TODO: Prevent session resets from delaying ProxyAnswer requests for
+// in-flight dials behind a session-establishing ProxyAnnounce. The
+// announcement may long-poll while client offer deadlines expire.
+// Consider disabling waitToShareSession for answers or completing the
+// handshake separately from the first application request.
 //
 // NewRoundTrip does not block or perform any session operations; the
 // operations begin on the first InitiatorRoundTrip.Next call. The content of
@@ -888,7 +893,7 @@ type ResponderSessions struct {
 	// TODO: Reduce session cache lock contention. Consider sharding the cache.
 
 	mutex    sync.RWMutex
-	sessions *lrucache.Cache
+	sessions *lrucache.LRUCache[string, *session]
 
 	concurrentNewSessions semaphore.Semaphore
 }
@@ -912,8 +917,11 @@ func NewResponderSessions(
 		receiveObfuscationSecret: receiveObfuscationSecret,
 		applyTTL:                 true,
 		obfuscationReplayHistory: newObfuscationReplayHistory(antiReplayHistorySize),
-		sessions:                 lrucache.NewWithLRU(sessionsTTL, 1*time.Minute, sessionsMaxSize),
-		concurrentNewSessions:    semaphore.New(maxResponderConcurrentNewSessions),
+		sessions: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *session]{
+			DefaultTTL: sessionsTTL,
+			MaxEntries: sessionsMaxSize,
+		}),
+		concurrentNewSessions: semaphore.New(maxResponderConcurrentNewSessions),
 	}, nil
 }
 
@@ -976,15 +984,13 @@ func (s *ResponderSessions) SetKnownInitiatorPublicKeys(
 	// Limitations:
 	// - Doesn't interrupt a concurrent request in progress which has already
 	//   called getSession
-	// - lrucache doesn't have iterator; Items creates a full copy of the
-	//   cache state
 
-	for sessionIDStr, entry := range s.sessions.Items() {
+	for sessionIDStr, entry := range s.sessions.All() {
 
 		// Each session.hasUnexpectedInitiatorPublicKey indirectly references
 		// s.expectedInitiatorPublicKeys, which was updated above with the
 		// new set of valid public keys.
-		if entry.Object.(*session).hasUnexpectedInitiatorPublicKey() {
+		if entry.hasUnexpectedInitiatorPublicKey() {
 			s.sessions.Delete(sessionIDStr)
 		}
 	}
@@ -1016,8 +1022,7 @@ func (s *ResponderSessions) GetEstablishedKnownInitiatorIDs() map[ID]struct{} {
 		return initiatorIDs
 	}
 
-	for _, entry := range s.sessions.Items() {
-		session := entry.Object.(*session)
+	for _, session := range s.sessions.All() {
 		initiatorID, err := session.getPeerID()
 		if err != nil {
 			// When getPeerID fails, the session is not yet established.
@@ -1284,7 +1289,7 @@ func (s *ResponderSessions) getSession(sessionID ID) (*session, error) {
 	// Concurrency: profiling indicates that holding the mutex lock here when
 	// calling newSession leads to high contention and blocking. Instead,
 	// release the lock after checking for an existing session, and then
-	// recheck -- using lrucache.Add, which fails if an entry exists -- when
+	// recheck -- using Add, which retains an existing entry -- when
 	// inserting.
 	//
 	// A read-only lock is obtained on the initial check, allowing for
@@ -1303,7 +1308,7 @@ func (s *ResponderSessions) getSession(sessionID ID) (*session, error) {
 	s.mutex.RUnlock()
 
 	if ok {
-		return entry.(*session), nil
+		return entry, nil
 	}
 
 	err := s.concurrentNewSessions.Acquire(context.Background(), 1)
@@ -1329,12 +1334,12 @@ func (s *ResponderSessions) getSession(sessionID ID) (*session, error) {
 	// When !s.applyTTL, touchSession removes the TTL only after the session
 	// is established.
 	s.mutex.Lock()
-	err = s.sessions.Add(
+	_, added := s.sessions.Add(
 		strSessionID, session, pendingSessionsTTL)
 	s.mutex.Unlock()
 
-	if err != nil {
-		return nil, errors.Trace(err)
+	if !added {
+		return nil, errors.TraceNew("session already exists")
 	}
 
 	return session, nil

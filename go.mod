@@ -30,7 +30,6 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.6.0
 	github.com/cespare/xxhash v1.1.0
 	github.com/cheekybits/genny v0.0.0-20170328200008-9127e812e1e9
-	github.com/cognusion/go-cache-lru v0.0.0-20170419142635-f73e2280ecea
 	github.com/dgraph-io/badger v1.5.4-0.20180815194500-3a87f6d9c273
 	github.com/elazarl/goproxy v0.0.0-20200809112317-0581fc3aee2d
 	github.com/elazarl/goproxy/ext v0.0.0-20200809112317-0581fc3aee2d
@@ -45,6 +44,7 @@ require (
 	github.com/huin/goupnp v1.3.0
 	github.com/marusama/semaphore v0.0.0-20171214154724-565ffd8e868a
 	github.com/mattn/go-sqlite3 v1.14.50
+	github.com/maypok86/otter/v2 v2.4.0
 	github.com/miekg/dns v1.1.56
 	github.com/minio/crc64nvme v1.1.1
 	github.com/mitchellh/panicwrap v0.0.0-20170106182340-fce601fe5557
@@ -64,7 +64,7 @@ require (
 	github.com/ryanuber/go-glob v0.0.0-20170128012129-256dc444b735
 	github.com/shirou/gopsutil/v4 v4.24.5
 	github.com/sirupsen/logrus v1.9.3
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.1
 	github.com/syndtr/gocapability v0.0.0-20170704070218-db04d3cc01c8
 	github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85
 	github.com/wlynxg/anet v0.0.5
@@ -88,7 +88,6 @@ require (
 	github.com/andybalholm/brotli v1.2.7 // indirect
 	github.com/bits-and-blooms/bitset v1.10.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dchest/siphash v1.2.3 // indirect
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da // indirect
 	github.com/dgryski/go-metro v0.0.0-20250106013310-edb8663e5e33 // indirect
@@ -121,7 +120,6 @@ require (
 	github.com/pion/transport/v2 v2.2.3 // indirect
 	github.com/pion/turn/v4 v4.1.4 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
 	github.com/quic-go/qpack v0.4.0 // indirect
 	github.com/refraction-networking/ed25519 v0.1.2 // indirect
@@ -139,9 +137,9 @@ require (
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib v1.5.0 // indirect
 	go.uber.org/mock v0.4.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/exp v0.0.0-20240110193028-0dcbfd608b1e // indirect
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/tools v0.51.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

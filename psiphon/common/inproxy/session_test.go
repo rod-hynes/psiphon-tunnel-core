@@ -275,8 +275,7 @@ func runTestSessions() error {
 			return errors.TraceNew("unexpected response")
 		}
 
-		for sessionID, item := range responderSessions.sessions.Items() {
-			cachedSession := item.Object.(*session)
+		for sessionID, cachedSession := range responderSessions.sessions.All() {
 			packet, err := wrapSessionPacket(
 				responderSessions.receiveObfuscationSecret, true,
 				&SessionPacket{SessionID: cachedSession.sessionID, Payload: []byte{0}})
@@ -339,7 +338,7 @@ func runTestSessions() error {
 	// The existing session should not be dropped as the original key remains valid.
 	responderSessions.SetKnownInitiatorPublicKeys([]SessionPublicKey{initiatorPublicKey})
 
-	if responderSessions.sessions.ItemCount() != 1 {
+	if responderSessions.sessions.EstimatedSize() != 1 {
 		return errors.TraceNew("unexpected session cache state")
 	}
 
@@ -355,7 +354,7 @@ func runTestSessions() error {
 	// The existing session should be dropped as the original key is not longer valid.
 	responderSessions.SetKnownInitiatorPublicKeys([]SessionPublicKey{otherKnownInitiatorPublicKey})
 
-	if responderSessions.sessions.ItemCount() != 0 {
+	if responderSessions.sessions.EstimatedSize() != 0 {
 		return errors.TraceNew("unexpected session cache state")
 	}
 
@@ -580,15 +579,18 @@ func (t *testSessionRoundTripper) RoundTrip(
 	} else {
 
 		if t.checkSessionExpiration {
-			items := t.sessions.sessions.Items()
-			if len(items) != 1 {
+			if t.sessions.sessions.EstimatedSize() != 1 {
 				return nil, errors.TraceNew("unexpected session cache state")
 			}
-			for _, item := range items {
-				if (item.Expiration == 0) != (isRequestRoundTrip && !t.sessions.applyTTL) {
+			for sessionID := range t.sessions.sessions.All() {
+				_, expiration, ok := t.sessions.sessions.GetWithExpiration(sessionID)
+				if !ok {
+					return nil, errors.TraceNew("missing session")
+				}
+				if expiration.IsZero() != (isRequestRoundTrip && !t.sessions.applyTTL) {
 					return nil, errors.TraceNew("unexpected session expiration")
 				}
-				if !isRequestRoundTrip && item.Expiration > time.Now().Add(pendingSessionsTTL).UnixNano() {
+				if !isRequestRoundTrip && expiration.After(time.Now().Add(pendingSessionsTTL)) {
 					return nil, errors.TraceNew("unexpected pending session expiration")
 				}
 			}

@@ -34,36 +34,34 @@ import (
 
 	tls "github.com/Psiphon-Labs/psiphon-tls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/obfuscator"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/proxyheader"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"golang.org/x/time/rate"
 )
 
 const (
 	LIGHT_PROTOCOL_TLS = "TLS"
 
-	obfuscationKeySize              = 32
-	defaultPreHeaderDeadlineMin     = 30 * time.Second
-	defaultPreHeaderDeadlineMax     = 120 * time.Second
-	preHeaderDeadlineStep           = 10 * time.Second
-	defaultInactivityTimeout        = 5 * time.Minute // Matches server.SSH_CONNECTION_READ_DEADLINE, the longer, post API handshake server inactivity timeout.
-	defaultUpstreamDialTimeout      = 5 * time.Second
-	defaultRelayBufferSize          = 8192
-	rateLimiterReapHistoryFrequency = 300 * time.Second
-	rateLimiterMaxCacheEntries      = 1000000
-	defaultPerIPRateLimitQuantity   = 100000
-	defaultPerIPRateLimitInterval   = 1 * time.Minute
-	defaultPerIPMaxConcurrent       = 50000
-	defaultMaxConcurrent            = 1000000
-	defaultDialFallbackDelay        = 300 * time.Millisecond
-	proxyActivityUpdatePeriod       = 1 * time.Second
-	defaultDNSResolverCacheMaxSize  = 256
-	defaultDNSResolverCacheTTL      = 10 * time.Second
-	dnsResolverCacheReapFrequency   = 1 * time.Minute
+	obfuscationKeySize             = 32
+	defaultPreHeaderDeadlineMin    = 30 * time.Second
+	defaultPreHeaderDeadlineMax    = 120 * time.Second
+	preHeaderDeadlineStep          = 10 * time.Second
+	defaultInactivityTimeout       = 5 * time.Minute // Matches server.SSH_CONNECTION_READ_DEADLINE, the longer, post API handshake server inactivity timeout.
+	defaultUpstreamDialTimeout     = 5 * time.Second
+	defaultRelayBufferSize         = 8192
+	rateLimiterMaxCacheEntries     = 1000000
+	defaultPerIPRateLimitQuantity  = 100000
+	defaultPerIPRateLimitInterval  = 1 * time.Minute
+	defaultPerIPMaxConcurrent      = 50000
+	defaultMaxConcurrent           = 1000000
+	defaultDialFallbackDelay       = 300 * time.Millisecond
+	proxyActivityUpdatePeriod      = 1 * time.Second
+	defaultDNSResolverCacheMaxSize = 256
+	defaultDNSResolverCacheTTL     = 10 * time.Second
 )
 
 // ProxyConfig specifies the configuration of a light proxy.
@@ -244,12 +242,12 @@ type Proxy struct {
 
 	limitsMutex                sync.Mutex
 	perIPConcurrentConnections map[string]int
-	rateLimiters               *lrucache.Cache
+	rateLimiters               *lrucache.LRUCache[string, *rate.Limiter]
 	proxyLimits                *common.ProxyLimits
 	proxyLimitKind             ProxyLimitKind
 
 	dnsResolver *net.Resolver
-	dnsCache    *lrucache.Cache
+	dnsCache    *lrucache.LRUCache[string, netTCPAddrs]
 
 	connectionNumber atomic.Int64
 	paused           atomic.Bool
@@ -512,12 +510,12 @@ func NewProxy(
 	// DNS cache.
 	dialer.Resolver = dnsResolver
 
-	var dnsCache *lrucache.Cache
+	var dnsCache *lrucache.LRUCache[string, netTCPAddrs]
 	if dnsResolverCacheMaxSize > 0 && dnsResolverCacheTTL > 0 {
-		dnsCache = lrucache.NewWithLRU(
-			dnsResolverCacheTTL,
-			dnsResolverCacheReapFrequency,
-			dnsResolverCacheMaxSize)
+		dnsCache = lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, netTCPAddrs]{
+			DefaultTTL: dnsResolverCacheTTL,
+			MaxEntries: dnsResolverCacheMaxSize,
+		})
 	}
 
 	host, _, err := net.SplitHostPort(config.DialAddressIPv4)
@@ -611,10 +609,10 @@ func NewProxy(
 		dialFallbackDelay:  dialFallbackDelay,
 
 		perIPConcurrentConnections: make(map[string]int),
-		rateLimiters: lrucache.NewWithLRU(
-			0,
-			rateLimiterReapHistoryFrequency,
-			rateLimiterMaxCacheEntries),
+		rateLimiters: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *rate.Limiter]{
+			DefaultTTL: 0,
+			MaxEntries: rateLimiterMaxCacheEntries,
+		}),
 		regionActivity: make(map[string]*regionActivity),
 	}
 
@@ -1367,7 +1365,7 @@ func (proxy *Proxy) applyRateLimit(limitIP string) error {
 
 	entry, ok := proxy.rateLimiters.Get(limitIP)
 	if ok {
-		rateLimiter = entry.(*rate.Limiter)
+		rateLimiter = entry
 	} else {
 		limit := float64(proxy.rateLimitQuantity) / proxy.rateLimitInterval.Seconds()
 		rateLimiter = rate.NewLimiter(rate.Limit(limit), proxy.rateLimitQuantity)
@@ -1449,7 +1447,7 @@ func (proxy *Proxy) resolve(
 
 		cachedAddrs, ok := proxy.dnsCache.Get(destinationAddress)
 		if ok {
-			addrs = cachedAddrs.(netTCPAddrs)
+			addrs = cachedAddrs
 			cached = true
 		}
 	}

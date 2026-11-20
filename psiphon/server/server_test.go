@@ -54,6 +54,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/accesscontrol"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/dsl"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
@@ -71,7 +72,6 @@ import (
 	pb "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/server/pb/psiphond"
 	pbr "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/server/pb/router"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/server/psinet"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/miekg/dns"
 	proxyproto "github.com/pires/go-proxyproto"
 	"golang.org/x/net/nettest"
@@ -3120,10 +3120,10 @@ func runServer(t *testing.T, runConfig *runServerConfig) {
 		steeringIPCacheField := controllerStruct.FieldByName("steeringIPCache")
 		steeringIPCacheField = reflect.NewAt(
 			steeringIPCacheField.Type(), unsafe.Pointer(steeringIPCacheField.UnsafeAddr())).Elem()
-		steeringIPCache := steeringIPCacheField.Interface().(*lrucache.Cache)
+		steeringIPCache := steeringIPCacheField.Interface().(*lrucache.LRUCache[string, string])
 
-		if steeringIPCache.ItemCount() != 1 {
-			t.Fatalf("unexpected steering IP cache size: %d", steeringIPCache.ItemCount())
+		if steeringIPCache.EstimatedSize() != 1 {
+			t.Fatalf("unexpected steering IP cache size: %d", steeringIPCache.EstimatedSize())
 		}
 
 		key := fmt.Sprintf(
@@ -3137,7 +3137,7 @@ func runServer(t *testing.T, runConfig *runServerConfig) {
 			t.Fatalf("no entry for steering IP cache key: %s", key)
 		}
 
-		if entry.(string) != testSteeringIP {
+		if entry != testSteeringIP {
 			t.Fatalf("unexpected cached steering IP: %v", entry)
 		}
 	}

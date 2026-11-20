@@ -36,18 +36,17 @@ import (
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/transforms"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/miekg/dns"
 	"golang.org/x/net/idna"
 )
 
 const (
 	resolverCacheDefaultTTL          = 1 * time.Minute
-	resolverCacheReapFrequency       = 1 * time.Minute
 	resolverCacheMaxEntries          = 10000
 	resolverServersUpdateTTL         = 5 * time.Second
 	resolverDefaultAttemptsPerServer = 2
@@ -298,7 +297,7 @@ type Resolver struct {
 	hasIPv6Route      bool
 	systemServers     []string
 	lastServersUpdate time.Time
-	cache             *lrucache.Cache
+	cache             *lrucache.LRUCache[string, []net.IP]
 	metrics           resolverMetrics
 }
 
@@ -1173,10 +1172,10 @@ func (r *Resolver) updateNetworkState(networkID string) {
 	// If r.cache is nil, this is the first update call in NewResolver. Create
 	// the cache and perform all updates.
 	if r.cache == nil {
-		r.cache = lrucache.NewWithLRU(
-			resolverCacheDefaultTTL,
-			resolverCacheReapFrequency,
-			resolverCacheMaxEntries)
+		r.cache = lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, []net.IP]{
+			DefaultTTL: resolverCacheDefaultTTL,
+			MaxEntries: resolverCacheMaxEntries,
+		})
 		updateAll = true
 	}
 
@@ -1348,7 +1347,7 @@ func (r *Resolver) getCache(hostname string) []net.IP {
 		return nil
 	}
 	r.metrics.cacheHits += 1
-	return entry.([]net.IP)
+	return entry
 }
 
 // newResolverConn creates a UDP socket that will send packets to serverAddr.

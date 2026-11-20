@@ -144,12 +144,6 @@ github.com/cespare/xxhash
 # github.com/cheekybits/genny v0.0.0-20170328200008-9127e812e1e9
 ## explicit
 github.com/cheekybits/genny/generic
-# github.com/cognusion/go-cache-lru v0.0.0-20170419142635-f73e2280ecea
-## explicit
-github.com/cognusion/go-cache-lru
-# github.com/davecgh/go-spew v1.1.1
-## explicit
-github.com/davecgh/go-spew/spew
 # github.com/dchest/siphash v1.2.3
 ## explicit; go 1.16
 github.com/dchest/siphash
@@ -274,6 +268,20 @@ github.com/marusama/semaphore
 # github.com/mattn/go-sqlite3 v1.14.50
 ## explicit; go 1.21
 github.com/mattn/go-sqlite3
+# github.com/maypok86/otter/v2 v2.4.0
+## explicit; go 1.24.0
+github.com/maypok86/otter/v2
+github.com/maypok86/otter/v2/internal/deque
+github.com/maypok86/otter/v2/internal/deque/queue
+github.com/maypok86/otter/v2/internal/expiration
+github.com/maypok86/otter/v2/internal/generated/node
+github.com/maypok86/otter/v2/internal/hashmap
+github.com/maypok86/otter/v2/internal/lossy
+github.com/maypok86/otter/v2/internal/xiter
+github.com/maypok86/otter/v2/internal/xmath
+github.com/maypok86/otter/v2/internal/xruntime
+github.com/maypok86/otter/v2/internal/xsync
+github.com/maypok86/otter/v2/stats
 # github.com/mdlayher/netlink v1.7.2
 ## explicit; go 1.18
 github.com/mdlayher/netlink
@@ -449,9 +457,6 @@ github.com/pires/go-proxyproto
 # github.com/pkg/errors v0.9.1
 ## explicit
 github.com/pkg/errors
-# github.com/pmezard/go-difflib v1.0.0
-## explicit
-github.com/pmezard/go-difflib/difflib
 # github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c
 ## explicit; go 1.14
 github.com/power-devops/perfstat
@@ -525,10 +530,12 @@ github.com/shoenig/go-m1cpu
 # github.com/sirupsen/logrus v1.9.3
 ## explicit; go 1.13
 github.com/sirupsen/logrus
-# github.com/stretchr/testify v1.11.1
+# github.com/stretchr/testify v1.12.1
 ## explicit; go 1.17
 github.com/stretchr/testify/assert
 github.com/stretchr/testify/assert/yaml
+github.com/stretchr/testify/internal/difflib
+github.com/stretchr/testify/internal/spew
 github.com/stretchr/testify/require
 github.com/stretchr/testify/suite
 # github.com/syndtr/gocapability v0.0.0-20170704070218-db04d3cc01c8
@@ -575,6 +582,9 @@ github.com/zeebo/blake3/internal/utils
 gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib
 # go.uber.org/mock v0.4.0
 ## explicit; go 1.20
+# go.yaml.in/yaml/v3 v3.0.5
+## explicit; go 1.16
+go.yaml.in/yaml/v3
 # golang.org/x/crypto v0.58.0
 ## explicit; go 1.26.0
 golang.org/x/crypto/blake2b
@@ -707,9 +717,6 @@ google.golang.org/protobuf/types/descriptorpb
 google.golang.org/protobuf/types/gofeaturespb
 google.golang.org/protobuf/types/known/anypb
 google.golang.org/protobuf/types/known/timestamppb
-# gopkg.in/yaml.v3 v3.0.1
-## explicit
-gopkg.in/yaml.v3
 # tailscale.com v1.58.2
 ## explicit; go 1.21
 tailscale.com/wgengine/winnet

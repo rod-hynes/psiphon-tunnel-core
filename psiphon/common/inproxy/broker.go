@@ -32,10 +32,10 @@ import (
 
 	"github.com/Psiphon-Labs/consistent"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/cespare/xxhash"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/fxamacker/cbor/v2"
 	"golang.org/x/time/rate"
 )
@@ -56,8 +56,7 @@ const (
 	brokerPendingServerReportsMaxSize = 100000
 	brokerMetricName                  = "inproxy_broker"
 
-	brokerRateLimiterReapHistoryFrequencySeconds = 300
-	brokerRateLimiterMaxCacheEntries             = 1000000
+	brokerRateLimiterMaxCacheEntries = 1000000
 )
 
 // LookupGeoIP is a callback for providing GeoIP lookup service.
@@ -99,7 +98,7 @@ type Broker struct {
 	initiatorSessions       *InitiatorSessions
 	responderSessions       *ResponderSessions
 	matcher                 *Matcher
-	pendingServerReports    *lrucache.Cache
+	pendingServerReports    *lrucache.LRUCache[string, *pendingServerReport]
 	proxyQualityState       *ProxyQualityState
 	knownServerInitiatorIDs sync.Map
 
@@ -117,7 +116,7 @@ type Broker struct {
 	enableProxyQualityMutex sync.Mutex
 	enableProxyQuality      atomic.Bool
 
-	dslRequestRateLimiters    *lrucache.Cache
+	dslRequestRateLimiters    *lrucache.LRUCache[string, *rate.Limiter]
 	dslRequestRateLimitParams atomic.Value
 }
 
@@ -345,16 +344,16 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 
 		proxyQualityState: proxyQuality,
 
-		dslRequestRateLimiters: lrucache.NewWithLRU(
-			0,
-			time.Duration(brokerRateLimiterReapHistoryFrequencySeconds)*time.Second,
-			brokerRateLimiterMaxCacheEntries),
+		dslRequestRateLimiters: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *rate.Limiter]{
+			DefaultTTL: 0,
+			MaxEntries: brokerRateLimiterMaxCacheEntries,
+		}),
 	}
 
-	b.pendingServerReports = lrucache.NewWithLRU(
-		common.ValueOrDefault(config.PendingServerReportsTTL, brokerPendingServerReportsTTL),
-		1*time.Minute,
-		brokerPendingServerReportsMaxSize)
+	b.pendingServerReports = lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *pendingServerReport]{
+		DefaultTTL: common.ValueOrDefault(config.PendingServerReportsTTL, brokerPendingServerReportsTTL),
+		MaxEntries: brokerPendingServerReportsMaxSize,
+	})
 
 	b.proxyAnnounceTimeout.Store(int64(config.ProxyAnnounceTimeout))
 	b.clientOfferTimeout.Store(int64(config.ClientOfferTimeout))
@@ -536,6 +535,13 @@ func (b *Broker) HandleSessionPacket(
 	// responderSessions.HandlePacket handles both session establishment and
 	// request unwrapping, and invokes handleUnwrappedRequest once a session
 	// is established and a valid request unwrapped.
+	//
+	// TODO: Separate responder session caches for proxies/servers and clients
+	// (including DSL), to protect the smaller proxy/server population from
+	// client session churn. Classification by request type in
+	// handleUnwrappedRequest is too late to select the responder for the initial
+	// handshake. This requires a transport hint or moving sessions between
+	// caches after classification.
 
 	handleUnwrappedRequest := func(initiatorID ID, unwrappedRequestPayload []byte) ([]byte, error) {
 
@@ -1752,7 +1758,7 @@ func (b *Broker) handleClientRelayedPacket(
 		// client should also abandon the dial.
 		return nil, errors.TraceNew("no pending report")
 	}
-	pendingServerReport := entry.(*pendingServerReport)
+	pendingServerReport := entry
 
 	serverID = pendingServerReport.serverID
 
@@ -2258,7 +2264,7 @@ type brokerRateLimitParams struct {
 }
 
 func brokerRateLimit(
-	rateLimiters *lrucache.Cache,
+	rateLimiters *lrucache.LRUCache[string, *rate.Limiter],
 	limitIP string,
 	quantity int,
 	interval time.Duration) error {
@@ -2271,7 +2277,7 @@ func brokerRateLimit(
 
 	entry, ok := rateLimiters.Get(limitIP)
 	if ok {
-		rateLimiter = entry.(*rate.Limiter)
+		rateLimiter = entry
 	} else {
 		limit := float64(quantity) / interval.Seconds()
 		rateLimiter = rate.NewLimiter(rate.Limit(limit), quantity)

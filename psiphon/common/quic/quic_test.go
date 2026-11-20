@@ -554,7 +554,7 @@ func checkDanglingGoroutines(
 				// This goroutine, created by Listener.clientRandomHistory,
 				// terminates nondeterministically, based on garbage
 				// collection. Skip it.
-				if strings.Contains(funcNames[i], "go-cache-lru.(*janitor).Run") {
+				if strings.Contains(funcNames[i], "v2.periodicCleanUp") {
 					skip = true
 					break
 				}

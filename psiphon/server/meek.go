@@ -42,6 +42,7 @@ import (
 
 	psiphon_tls "github.com/Psiphon-Labs/psiphon-tls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/monotime"
@@ -52,7 +53,6 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tactics"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/transforms"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/values"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/minio/crc64nvme"
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/time/rate"
@@ -136,7 +136,7 @@ type MeekServer struct {
 	sessions                        map[string]*meekSession
 	bufferPool                      *CachedResponseBufferPool
 	rateLimitLock                   sync.Mutex
-	rateLimitHistory                *lrucache.Cache
+	rateLimitHistory                *lrucache.LRUCache[string, *rate.Limiter]
 	rateLimitCount                  int
 	rateLimitSignalGC               chan struct{}
 	normalizer                      *transforms.HTTPNormalizerListener
@@ -225,13 +225,13 @@ func NewMeekServer(
 		bufferPoolClientLimit = support.Config.MeekCachedResponsePoolBufferClientLimit
 	}
 
-	_, thresholdSeconds, _, _, _, _, _, _, reapFrequencySeconds, maxEntries :=
+	_, thresholdSeconds, _, _, _, _, _, _, _, maxEntries :=
 		support.TrafficRulesSet.GetMeekRateLimiterConfig()
 
-	rateLimitHistory := lrucache.NewWithLRU(
-		time.Duration(thresholdSeconds)*time.Second,
-		time.Duration(reapFrequencySeconds)*time.Second,
-		maxEntries)
+	rateLimitHistory := lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *rate.Limiter]{
+		DefaultTTL: time.Duration(thresholdSeconds) * time.Second,
+		MaxEntries: maxEntries,
+	})
 
 	bufferPool := NewCachedResponseBufferPool(
 		bufferLength, bufferCount, bufferPoolClientLimit)
@@ -1442,16 +1442,14 @@ func (server *MeekServer) rateLimit(
 
 	rateLimitIP := common.GetRateLimitIP(clientIP)
 
-	// go-cache-lru is safe for concurrent access, but lacks an atomic
-	// compare-and-set type operations to check if an entry exists before
-	// adding a new one. This mutex ensures the Get and Add are atomic
-	// (as well as synchronizing access to rateLimitCount).
+	// This mutex protects rateLimitCount and the lookup and creation of
+	// rate limiters.
 	server.rateLimitLock.Lock()
 
 	var rateLimiter *rate.Limiter
 	entry, ok := server.rateLimitHistory.Get(rateLimitIP)
 	if ok {
-		rateLimiter = entry.(*rate.Limiter)
+		rateLimiter = entry
 	} else {
 
 		// Set bursts to 1, which is appropriate for new meek tunnels and

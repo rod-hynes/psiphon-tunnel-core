@@ -31,8 +31,8 @@ import (
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/florianl/go-nfqueue"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -93,7 +93,7 @@ type Manipulator struct {
 	nfqueue            *nfqueue.Nfqueue
 	compiledSpecsMutex sync.Mutex
 	compiledSpecs      map[string]*compiledSpec
-	appliedSpecCache   *lrucache.Cache
+	appliedSpecCache   *lrucache.LRUCache[string, appliedSpec]
 }
 
 // NewManipulator creates a new Manipulator.
@@ -113,10 +113,10 @@ func NewManipulator(config *Config) (*Manipulator, error) {
 	// To avoid memory exhaustion, do not retain unconsumed appliedSpecCache
 	// entries for a longer time than it may reasonably take to complete the TCP
 	// handshake.
-	m.appliedSpecCache = lrucache.NewWithLRU(
-		appliedSpecCacheTTL,
-		appliedSpecCacheTTL/2,
-		appliedSpecCacheMaxEntries)
+	m.appliedSpecCache = lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, appliedSpec]{
+		DefaultTTL: appliedSpecCacheTTL,
+		MaxEntries: appliedSpecCacheMaxEntries,
+	})
 
 	return m, nil
 }
@@ -428,7 +428,7 @@ func (m *Manipulator) GetAppliedSpecName(
 		return "", nil, errors.TraceNew("connection not found")
 	}
 
-	appliedSpec := value.(appliedSpec)
+	appliedSpec := value
 
 	m.appliedSpecCache.Delete(connID)
 

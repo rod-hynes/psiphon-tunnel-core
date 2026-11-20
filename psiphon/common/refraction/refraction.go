@@ -39,10 +39,10 @@ import (
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/armon/go-proxyproto"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/pion/sctp"
 	refraction_networking_assets "github.com/refraction-networking/conjure/pkg/client/assets"
 	refraction_networking_registration "github.com/refraction-networking/conjure/pkg/registrars/registration"
@@ -597,15 +597,15 @@ func DeleteCachedConjureRegistration(config *ConjureConfig) {
 type registrationCache struct {
 	mutex sync.Mutex
 	TTL   time.Duration
-	cache *lrucache.Cache
+	cache *lrucache.LRUCache[string, *refraction_networking_client.ConjureReg]
 }
 
 func newRegistrationCache() *registrationCache {
 	return &registrationCache{
-		cache: lrucache.NewWithLRU(
-			lrucache.NoExpiration,
-			1*time.Minute,
-			REGISTRATION_CACHE_MAX_ENTRIES),
+		cache: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *refraction_networking_client.ConjureReg]{
+			DefaultTTL: lrucache.NoExpiration,
+			MaxEntries: REGISTRATION_CACHE_MAX_ENTRIES,
+		}),
 	}
 }
 
@@ -618,9 +618,7 @@ func (c *registrationCache) put(
 	defer c.mutex.Unlock()
 
 	// Clear the entire cache if the configured TTL changes to avoid retaining
-	// items for too long. This is expected to be an infrequent event. The
-	// go-cache-lru API does not offer a mechanism to inspect and adjust the TTL
-	// of all existing items.
+	// items for too long. This is expected to be an infrequent event.
 	if c.TTL != config.RegistrationCacheTTL {
 		c.cache.Flush()
 		c.TTL = config.RegistrationCacheTTL
@@ -655,7 +653,7 @@ func (c *registrationCache) put(
 	config.Logger.WithTraceFields(
 		common.LogFields{
 			"diagnosticID": config.DiagnosticID,
-			"cacheSize":    c.cache.ItemCount(),
+			"cacheSize":    c.cache.EstimatedSize(),
 			"reason":       reason,
 		}).Info(
 		"put cached registration")
@@ -683,14 +681,14 @@ func (c *registrationCache) pop(
 	config.Logger.WithTraceFields(
 		common.LogFields{
 			"diagnosticID": config.DiagnosticID,
-			"cacheSize":    c.cache.ItemCount(),
+			"cacheSize":    c.cache.EstimatedSize(),
 			"found":        found,
 		}).Info(
 		"pop cached registration")
 
 	if found {
 		c.cache.Delete(config.RegistrationCacheKey)
-		return entry.(*refraction_networking_client.ConjureReg)
+		return entry
 	}
 
 	return nil

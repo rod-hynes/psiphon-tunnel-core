@@ -28,9 +28,9 @@ import (
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
-	lrucache "github.com/cognusion/go-cache-lru"
 )
 
 const (
@@ -53,13 +53,19 @@ type ProxyQualityState struct {
 	qualityTTL                 time.Duration
 	pendingFailedMatchDeadline time.Duration
 	failedMatchThreshold       int
-	entries                    *lrucache.Cache
-	pendingFailedMatches       *lrucache.Cache
+	entries                    *lrucache.LRUCache[string, *proxyQualityEntry]
+	pendingFailedMatches       *lrucache.LRUCache[string, pendingFailedMatch]
 }
 
 type proxyQualityEntry struct {
-	clientASNCounts  ProxyQualityASNCounts
-	failedMatchCount int
+	clientASNCounts   ProxyQualityASNCounts
+	failedMatchCount  int
+	qualityGeneration uint64
+}
+
+type pendingFailedMatch struct {
+	entry             *proxyQualityEntry
+	qualityGeneration uint64
 }
 
 // NewProxyQuality creates a new ProxyQualityState.
@@ -69,21 +75,22 @@ func NewProxyQuality() *ProxyQualityState {
 	// set to fixed values that are in line with other, indirectly related
 	// limits, such as matcherAnnouncementQueueMaxSize.
 
-	// TODO: lrucache.Cache.DeleteExpired is a linear scan; review the
-	// performance of scanning up to 10,000,000 entries every 1 minute.
-
 	q := &ProxyQualityState{
 		qualityTTL:                 proxyQualityTTL,
 		pendingFailedMatchDeadline: proxyQualityPendingFailedMatchDeadline,
 		failedMatchThreshold:       proxyQualityFailedMatchThreshold,
 
-		entries: lrucache.NewWithLRU(
-			0, 1*time.Minute, proxyQualityMaxEntries),
-		pendingFailedMatches: lrucache.NewWithLRU(
-			0, 1*time.Minute, proxyQualityMaxPendingFailedMatches),
+		entries: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *proxyQualityEntry]{
+			DefaultTTL: 0,
+			MaxEntries: proxyQualityMaxEntries,
+		}),
 	}
 
-	q.pendingFailedMatches.OnEvicted(q.addFailedMatch)
+	q.pendingFailedMatches = lrucache.NewLRUCache(
+		lrucache.LRUCacheConfig[string, pendingFailedMatch]{
+			MaxEntries: proxyQualityMaxPendingFailedMatches,
+			OnEvicted:  q.addFailedMatch,
+		})
 
 	return q
 }
@@ -133,7 +140,7 @@ func (q *ProxyQualityState) HasQuality(
 		return false
 	}
 
-	entry := entryValue.(*proxyQualityEntry)
+	entry := entryValue
 
 	// Currently, the actual count value is not used; any count > 0
 	// is "quality".
@@ -163,7 +170,7 @@ func (q *ProxyQualityState) AddQuality(
 
 	var entry *proxyQualityEntry
 	if ok {
-		entry = entryValue.(*proxyQualityEntry)
+		entry = entryValue
 	} else {
 		entry = &proxyQualityEntry{
 			clientASNCounts: make(ProxyQualityASNCounts),
@@ -172,6 +179,7 @@ func (q *ProxyQualityState) AddQuality(
 
 	// Reset the consecutive failed match count for existing entry.
 	entry.failedMatchCount = 0
+	entry.qualityGeneration++
 
 	// Add in counts.
 	for ASN, count := range counts {
@@ -184,15 +192,10 @@ func (q *ProxyQualityState) AddQuality(
 	// Delete any pending failed match. The actual pending match may still be
 	// in progress and may even fail, but the new quality event is considered
 	// sufficient to ignore that outcome.
-	//
-	// lrucache.Cache.Delete invokes OnEvicted, so OnEvicted is temporarily
-	// cleared to avoid incrementing the failed match count. In addition,
-	// avoiding OnEvicted here ensures that addFailedMatch can assume that
-	// the mutex lock is not held.
+	// The generation check in addFailedMatch also ignores notifications
+	// already queued before this success.
 
-	q.pendingFailedMatches.OnEvicted(nil)
 	q.pendingFailedMatches.Delete(strProxyKey)
-	q.pendingFailedMatches.OnEvicted(q.addFailedMatch)
 }
 
 // Matched reports that, for the specified proxy, defined by its ID and ASN, a
@@ -211,24 +214,24 @@ func (q *ProxyQualityState) Matched(proxyID ID, proxyASN string) {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
-	// This uses a lrucache.Cache and OnEvicted events as an implementation of
-	// the failed match deadline without requiring a timer or goroutine per
-	// pending match. When the cache entry expires due to TTL, the failed
-	// match deadline is met.
+	// Cache expiration supplies the failed match deadline without a timer
+	// per pending match. Capacity eviction also records a failed match.
 
 	proxyKey := MakeProxyQualityKey(proxyID, proxyASN)
 
 	strProxyKey := string(proxyKey[:])
 
-	_, ok := q.pendingFailedMatches.Get(strProxyKey)
-	if ok {
-		// When there's already a pending failed match, leave the existing
-		// deadline in place and don't extend it.
+	entry, ok := q.entries.Get(strProxyKey)
+	if !ok {
+		// There is no quality to remove if this match fails.
 		return
 	}
 
+	// Add leaves an existing deadline unchanged.
 	q.pendingFailedMatches.Add(
-		strProxyKey, struct{}{}, q.pendingFailedMatchDeadline)
+		strProxyKey,
+		pendingFailedMatch{entry: entry, qualityGeneration: entry.qualityGeneration},
+		q.pendingFailedMatchDeadline)
 }
 
 // Flush clears all quality state.
@@ -239,29 +242,24 @@ func (q *ProxyQualityState) Flush() {
 
 	q.entries.Flush()
 
-	q.pendingFailedMatches.OnEvicted(nil)
 	q.pendingFailedMatches.Flush()
-	q.pendingFailedMatches.OnEvicted(q.addFailedMatch)
 }
 
-// addFailedMatch is invoked when a pendingFailedMatches expires, increments
-// the failed match count, and removes a quality entry when the failed match
-// threshold count is exceeded.
-func (q *ProxyQualityState) addFailedMatch(strProxyKey string, _ interface{}) {
-
-	// Assumes pendingFailedMatches.OnEvicted is not invoked while already
-	// holding the mutex lock.
+// addFailedMatch records an expired or evicted pending match. Notifications
+// for quality state superseded by AddQuality or Flush are ignored.
+func (q *ProxyQualityState) addFailedMatch(
+	strProxyKey string, pending pendingFailedMatch, _ lrucache.EvictionReason) {
 
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
 	entryValue, ok := q.entries.Get(strProxyKey)
-	if !ok {
-		// No quality to remove.
+	if !ok || entryValue != pending.entry ||
+		entryValue.qualityGeneration != pending.qualityGeneration {
 		return
 	}
 
-	entry := entryValue.(*proxyQualityEntry)
+	entry := entryValue
 
 	entry.failedMatchCount += 1
 

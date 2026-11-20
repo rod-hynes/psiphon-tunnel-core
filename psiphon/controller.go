@@ -42,6 +42,7 @@ import (
 
 	tls "github.com/Psiphon-Labs/psiphon-tls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
@@ -53,7 +54,6 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
 	utls "github.com/Psiphon-Labs/utls"
 	"github.com/axiomhq/hyperloglog"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/fxamacker/cbor/v2"
 	"golang.org/x/time/rate"
 )
@@ -91,7 +91,7 @@ type Controller struct {
 	candidateServerEntries                  chan *candidateServerEntry
 	serverEntryIterator                     *ServerEntryIterator
 	untunneledDialConfig                    *DialConfig
-	untunneledSplitTunnelClassifications    *lrucache.Cache
+	untunneledSplitTunnelClassifications    *lrucache.LRUCache[string, bool]
 	signalFetchCommonRemoteServerList       chan struct{}
 	signalFetchObfuscatedServerLists        chan struct{}
 	signalUntunneledDSLFetch                chan struct{}
@@ -106,7 +106,7 @@ type Controller struct {
 	staggerMutex                            sync.Mutex
 	resolver                                *resolver.Resolver
 	splitResolver                           *resolver.Resolver
-	steeringIPCache                         *lrucache.Cache
+	steeringIPCache                         *lrucache.LRUCache[string, string]
 	tlsClientSessionCache                   utls.ClientSessionCache
 	quicTLSClientSessionCache               tls.ClientSessionCache
 	inproxyProxyBrokerClientManager         *InproxyBrokerClientManager
@@ -176,10 +176,10 @@ func NewController(config *Config) (controller *Controller, err error) {
 		establishedOnce:  false,
 		isEstablishing:   false,
 
-		untunneledSplitTunnelClassifications: lrucache.NewWithLRU(
-			splitTunnelClassificationTTL,
-			1*time.Minute,
-			splitTunnelClassificationMaxEntries),
+		untunneledSplitTunnelClassifications: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, bool]{
+			DefaultTTL: splitTunnelClassificationTTL,
+			MaxEntries: splitTunnelClassificationMaxEntries,
+		}),
 
 		// TODO: Add a buffer of 1 so we don't miss a signal while receiver is
 		// starting? Trade-off is potential back-to-back fetch remotes. As-is,
@@ -201,10 +201,10 @@ func NewController(config *Config) (controller *Controller, err error) {
 		// signal doesn't block and receiving won't miss a signal.
 		signalRestartEstablishing: make(chan struct{}, 1),
 
-		steeringIPCache: lrucache.NewWithLRU(
-			steeringIPCacheTTL,
-			1*time.Minute,
-			steeringIPCacheMaxEntries),
+		steeringIPCache: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, string]{
+			DefaultTTL: steeringIPCacheTTL,
+			MaxEntries: steeringIPCacheMaxEntries,
+		}),
 
 		tlsClientSessionCache:     utls.NewLRUClientSessionCache(0),
 		quicTLSClientSessionCache: tls.NewLRUClientSessionCache(0),

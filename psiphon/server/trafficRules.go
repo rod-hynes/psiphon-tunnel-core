@@ -136,14 +136,8 @@ type TrafficRulesSet struct {
 	// is used when MeekRateLimiterGarbageCollectionTriggerCount is 0.
 	MeekRateLimiterGarbageCollectionTriggerCount int
 
-	// MeekRateLimiterReapHistoryFrequencySeconds specifies a schedule for
-	// reaping old records from the rate limit history.
-	//
-	// A default of DEFAULT_MEEK_RATE_LIMITER_REAP_HISTORY_FREQUENCY_SECONDS
-	// is used when MeekRateLimiterReapHistoryFrequencySeconds is 0.
-	//
-	// MeekRateLimiterReapHistoryFrequencySeconds is not applied upon hot
-	// reload.
+	// MeekRateLimiterReapHistoryFrequencySeconds is retained for configuration
+	// compatibility. Cache maintenance now determines the cleanup schedule.
 	MeekRateLimiterReapHistoryFrequencySeconds int
 
 	// MeekRateLimiterMaxEntries specifies a maximum size for the rate limit
