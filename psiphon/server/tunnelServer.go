@@ -65,9 +65,22 @@ import (
 )
 
 const (
+
+	// SSH_CONNECTION_PRE_API_READ_DEADLINE is a shorter inactivity timeout
+	// for client tunnels that haven't fully established. It's intended to
+	// more aggressively prune resources for tunnels that stall early. The
+	// pre-API phase can include liveness test traffic, where upstream bytes
+	// are activity, and silent periods, including client hold-off (determined
+	// by HoldOff parameters), client-side waits for other tunnels to finish
+	// activation (potentially spanning multiple network latency
+	// scaled [Inproxy]PsiphonAPIRequestTimeout periods), and in-proxy broker
+	// relay round trip waits. Currently, clients do not send periodic SSH
+	// keep alives until activation completes.
+
 	SSH_AUTH_LOG_PERIOD                   = 30 * time.Minute
 	SSH_HANDSHAKE_TIMEOUT                 = 30 * time.Second
 	SSH_BEGIN_HANDSHAKE_TIMEOUT           = 1 * time.Second
+	SSH_CONNECTION_PRE_API_READ_DEADLINE  = 2 * time.Minute
 	SSH_CONNECTION_READ_DEADLINE          = 5 * time.Minute
 	SSH_TCP_PORT_FORWARD_COPY_BUFFER_SIZE = 8192
 	SSH_TCP_PORT_FORWARD_QUEUE_SIZE       = 1024
@@ -611,7 +624,7 @@ func newSSHServer(
 			ServerRootObfuscationSecret: inproxyObfuscationSecret,
 			BrokerRoundTripperMaker:     makeRoundTripper,
 			ProxyMetricsValidator:       getInproxyBrokerAPIParameterValidator(),
-			ProxyMetricsFormatter:       getInproxyBrokerAPIParameterLogFieldFormatter(),
+			ProxyMetricsFormatter:       getInproxyBrokerServerReportParameterLogFieldFormatter(),
 
 			// Prefix for proxy metrics log fields in server_tunnel
 			ProxyMetricsPrefix: "inproxy_proxy_",
@@ -1075,6 +1088,12 @@ func (sshServer *sshServer) unregisterAcceptedClient(tunnelProtocol, region stri
 // clients (for stopping at shutdown time).
 func (sshServer *sshServer) registerEstablishedClient(client *sshClient) bool {
 
+	// Preserve the initial GeoIP selection made in passwordCallback.
+	geoIPData := client.peerGeoIPData
+	if !client.isInproxyTunnelProtocol {
+		geoIPData = client.getClientGeoIPData()
+	}
+
 	sshServer.clientsMutex.Lock()
 
 	if sshServer.stoppingClients {
@@ -1164,6 +1183,9 @@ func (sshServer *sshServer) registerEstablishedClient(client *sshClient) bool {
 		return false
 	}
 
+	// Now that the client is registered, remove its GeoIP cache entry expiry;
+	// cleanup will restore expiry before unregistering.
+	sshServer.setGeoIPSessionCache(client.sessionID, geoIPData)
 	sshServer.clients[client.sessionID] = client
 
 	return true
@@ -2304,6 +2326,7 @@ type sshClient struct {
 	lightProxyID                         inproxy.ID
 	additionalTransportData              *additionalTransportData
 	sshConn                              ssh.Conn
+	activityConn                         *common.ActivityMonitoredConn
 	throttledConn                        *common.ThrottledConn
 	serverPacketManipulation             string
 	replayedServerPacketManipulation     bool
@@ -2778,10 +2801,10 @@ func (sshClient *sshClient) run(
 
 	// Wrap the base client connection with an ActivityMonitoredConn which will
 	// terminate the connection if no data is received before the deadline. This
-	// timeout is in effect for the entire duration of the SSH connection. Clients
-	// must actively use the connection or send SSH keep alive requests to keep
-	// the connection active. Writes are not considered reliable activity indicators
-	// due to buffering.
+	// timeout is shorter until the API handshake succeeds. Clients must actively
+	// use the connection or send SSH keep alive requests to keep the connection
+	// active. Writes are not considered reliable activity indicators due to
+	// buffering.
 
 	// getTunnelActivityUpdaters wires up updaters that act on tunnel duration
 	// and bytes transferred, including the in-proxy proxy quality tracker.
@@ -2791,9 +2814,14 @@ func (sshClient *sshClient) run(
 	// Limitation: wrapping at this point omits some obfuscation layer bytes,
 	// including MEEK and QUIC.
 
+	// Transport wrappers may restrict supported deadlines. For example,
+	// meek's SetDeadline requires a deadline beyond its configured session
+	// staleness (45 seconds by default). Keep the inactivity timeout
+	// compatible with these transport constraints.
+
 	activityConn, err := common.NewActivityMonitoredConn(
 		conn,
-		SSH_CONNECTION_READ_DEADLINE,
+		SSH_CONNECTION_PRE_API_READ_DEADLINE,
 		false,
 		nil,
 		sshClient.getTunnelActivityUpdaters()...)
@@ -2821,6 +2849,7 @@ func (sshClient *sshClient) run(
 
 	p, err := sshClient.sshServer.support.ServerTacticsParametersCache.Get(sshClient.peerGeoIPData)
 	if err != nil {
+		conn.Close()
 		log.WithTraceFields(LogFields{"error": errors.Trace(err)}).Warning(
 			"ServerTacticsParametersCache.Get failed")
 		return
@@ -3118,6 +3147,7 @@ func (sshClient *sshClient) run(
 
 	sshClient.Lock()
 	sshClient.sshConn = result.sshConn
+	sshClient.activityConn = activityConn
 	sshClient.throttledConn = throttledConn
 	sshClient.Unlock()
 
@@ -3313,7 +3343,11 @@ func (sshClient *sshClient) passwordCallback(conn ssh.ConnMetadata, password []b
 	if !sshClient.isInproxyTunnelProtocol {
 		geoIPData = sshClient.getClientGeoIPData()
 	}
-	sshClient.sshServer.setGeoIPSessionCache(sessionID, geoIPData)
+
+	// The SSH handshake can still fail after authentication. Avoid leaving
+	// permanent entries or overwriting an established session's cache entry.
+	_ = sshClient.sshServer.geoIPSessionCache.Add(
+		sessionID, geoIPData, cache.DefaultExpiration)
 
 	return nil, nil
 }
@@ -3820,6 +3854,12 @@ func (sshClient *sshClient) handleNewPacketTunnelChannel(
 		return
 	}
 
+	completed, _ := sshClient.getHandshaked()
+	if !completed {
+		sshClient.rejectNewChannel(newChannel, "packet tunnel not permitted before handshake")
+		return
+	}
+
 	// Accept this channel immediately. This channel will replace any
 	// previously existing packet tunnel channel for this client.
 
@@ -3931,13 +3971,17 @@ func (sshClient *sshClient) handleNewTCPPortForwardChannel(
 		sshClient.sshServer.support.Config.UDPInterceptUdpgwServerAddress ==
 			net.JoinHostPort(directTcpipExtraData.HostToConnect, strconv.Itoa(int(directTcpipExtraData.PortToConnect)))
 
-	if isUdpgwChannel {
+	// Port forwards are not permitted before the handshake completes. This
+	// check is made before any port forward work, including, for TCP port
+	// forwards, the dial queue and hostname resolution, which precede the
+	// isPortForwardPermitted handshake check.
+	completed, _ := sshClient.getHandshaked()
+	if !completed {
+		sshClient.rejectNewChannel(newChannel, "port forward not permitted")
+		return
+	}
 
-		completed, _ := sshClient.getHandshaked()
-		if !completed {
-			sshClient.rejectNewChannel(newChannel, "port forward not permitted")
-			return
-		}
+	if isUdpgwChannel {
 
 		// Dispatch immediately. handleUDPChannel runs the udpgw protocol in its
 		// own worker goroutine.
@@ -4435,9 +4479,12 @@ func (sshClient *sshClient) runAlertSender() {
 
 // enqueueAlertRequest enqueues an alert request to be sent to the client.
 // Only one request is sent per tunnel per protocol.AlertRequest value;
-// subsequent alerts with the same value are dropped. enqueueAlertRequest will
-// not block until the queue exceeds ALERT_REQUEST_QUEUE_BUFFER_SIZE.
+// subsequent alerts with the same value are dropped. Requests are also dropped
+// when the queue is full.
 func (sshClient *sshClient) enqueueAlertRequest(request protocol.AlertRequest) {
+	if !sshClient.supportsServerRequests {
+		return
+	}
 	sshClient.Lock()
 	if sshClient.sentAlertRequests[fmt.Sprintf("%+v", request)] {
 		sshClient.Unlock()
@@ -4447,6 +4494,9 @@ func (sshClient *sshClient) enqueueAlertRequest(request protocol.AlertRequest) {
 	select {
 	case <-sshClient.runCtx.Done():
 	case sshClient.sendAlertRequests <- request:
+	default:
+		// Blocking here can stall downstream delivery for all packet-tunnel
+		// clients; see Server.runDeviceDownstream in common/tun/tun.go.
 	}
 }
 
@@ -4553,7 +4603,8 @@ func (sshClient *sshClient) setHandshakeState(
 
 	// TODO: defer setting completed to true until all checks pass. Otherwise
 	// rejected handshakes are logged as completed and may permit port
-	// forwards before asynchronous shutdown.
+	// forwards before asynchronous shutdown. Port forwards may also be admitted
+	// under pre-handshake traffic rules.
 
 	sshClient.Lock()
 	completed := sshClient.handshakeState.completed
@@ -4773,6 +4824,12 @@ func (sshClient *sshClient) setHandshakeState(
 			})
 
 		sshClient.Unlock()
+	}
+
+	// All checks have passed. Extend the inactivity timeout.
+	err := sshClient.activityConn.SetInactivityTimeout(SSH_CONNECTION_READ_DEADLINE)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
 
 	upstreamBytesPerSecond, downstreamBytesPerSecond := sshClient.setTrafficRules()
@@ -5275,7 +5332,7 @@ func (sshClient *sshClient) isPortForwardPermitted(
 	remoteIP net.IP,
 	port int) bool {
 
-	// Disallow connection to bogons.
+	// Disallow connections to bogons and the server's configured public IP.
 	//
 	// As a security measure, this is a failsafe. The server should be run on a
 	// host with correctly configured firewall rules.
@@ -5283,7 +5340,9 @@ func (sshClient *sshClient) isPortForwardPermitted(
 	// This check also avoids spurious disallowed traffic alerts for destinations
 	// that are impossible to reach.
 
-	if !sshClient.sshServer.support.Config.AllowBogons && common.IsBogon(remoteIP) {
+	if !sshClient.sshServer.support.Config.AllowBogons &&
+		(common.IsBogon(remoteIP) ||
+			remoteIP.Equal(net.ParseIP(sshClient.sshServer.support.Config.ServerIPAddress))) {
 		return false
 	}
 

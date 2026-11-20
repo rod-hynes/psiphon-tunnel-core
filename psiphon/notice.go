@@ -714,6 +714,11 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 			for name, value := range metrics {
 				args = append(args, name, value)
 			}
+			if brokerDialParams := dialParams.inproxyBrokerDialParameters.Load(); brokerDialParams != nil {
+				args = append(args,
+					"inproxy_broker_client_id",
+					brokerDialParams.brokerClientID)
+			}
 		}
 
 		if protocol.TunnelProtocolUsesLight(dialParams.TunnelProtocol) {
@@ -1178,10 +1183,9 @@ func NoticeSkipServerEntry(format string, args ...interface{}) {
 		"SkipServerEntry", 0, "reason", reason)
 }
 
-// NoticeInproxyMustUpgrade reports that an in-proxy component requires an app
-// upgrade. Currently this includes running a proxy; and running a client in
-// personal pairing mode. The receiver should alert the user to upgrade the
-// app.
+// NoticeInproxyMustUpgrade reports that a broker requires an app upgrade.
+// It is emitted when either proxy type is enabled or the client uses in-proxy
+// personal pairing. The receiver should alert the user to upgrade the app.
 //
 // There is at most one InproxyMustUpgrade notice emitted per controller run,
 // and an InproxyMustUpgrade notice is followed by a tunnel-core shutdown.

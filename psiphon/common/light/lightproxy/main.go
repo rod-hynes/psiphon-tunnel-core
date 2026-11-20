@@ -717,9 +717,9 @@ func (r *proxyEventReceiver) Activity(stats *light.ActivityStats) {
 func (r *proxyEventReceiver) Connection(stats *light.ConnectionStats) {
 	const connectionFormat = `[Connection] proxyID: %s, ` +
 		`proxyConnectionNum: %d, sponsorID: %s, platform: %s, ` +
-		`buildRev: %s, deviceRegion: %s, sessionID: %s, ` +
+		`buildRev: %s, deviceRegion: %q, sessionID: %s, ` +
 		`tracker: %d, networkType: %s, clientConnectionNum: %d, ` +
-		`destination: %s, protocol: %s, tlsProfile: %s, quicVersion: %s, sni: %s, ` +
+		`destination: %q, protocol: %s, tlsProfile: %s, quicVersion: %s, sni: %q, ` +
 		`tlsClientHelloFragmented: %t, tlsClientHelloPadding: %d, ` +
 		`tlsDidResume: %t, ` +
 		`clientTCPDuration: %s, clientTLSDuration: %s, clientQUICDuration: %s, ` +
@@ -728,7 +728,7 @@ func (r *proxyEventReceiver) Connection(stats *light.ConnectionStats) {
 		`completedUpstreamTLS: %s, completedUpstreamQUIC: %s, upstreamDNSCached: %v, ` +
 		`proxyProtocolHeaderAdded: %t, proxyProtocolHeaderReplaced: %t, ` +
 		`bytesRead: %d, bytesWritten: %d, ` +
-		`failure: %s, matchedPersonalCompartments: %t` + "\n"
+		`failure: %q, matchedPersonalCompartments: %t` + "\n"
 
 	r.logf(
 		connectionFormat,
@@ -775,23 +775,25 @@ func (r *proxyEventReceiver) IrregularConnection(
 	_ common.GeoIPData,
 	irregularity string,
 ) {
-	r.logf("[IrregularConnection] %s\n", irregularity)
+	r.logf("[IrregularConnection] %q\n", irregularity)
 }
 
 func (r *proxyEventReceiver) DebugLog(_ string, message string) {
-	r.logf("[DebugLog] %s\n", message)
+	r.logf("[DebugLog] %q\n", message)
 }
 
 func (r *proxyEventReceiver) InfoLog(_ string, message string) {
-	r.logf("[InfoLog] %s\n", message)
+	r.logf("[InfoLog] %q\n", message)
 }
 
 func (r *proxyEventReceiver) WarningLog(_ string, message string) {
-	r.logf("[WarningLog] %s\n", message)
+	// Warning messages include connection failure errors, which may include
+	// client-supplied values; escape to prevent forged log lines.
+	r.logf("[WarningLog] %q\n", message)
 }
 
 func (r *proxyEventReceiver) ErrorLog(_ string, message string) {
-	r.logf("[ErrorLog] %s\n", message)
+	r.logf("[ErrorLog] %q\n", message)
 }
 
 type stringListFlag []string

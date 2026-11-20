@@ -983,9 +983,20 @@ func newWebRTCConn(
 		// candidates are ignored in this check since they could be private
 		// IPs in personal pairing mode, or public IPv6 which may not be
 		// dialable by the peer.
+		//
+		// When the local NAT is known to be strictly limited, any STUN candidate
+		// is unlikely to work unless the peer's NAT is unlimited, so also await
+		// a port mapping in this case.
+		//
+		// Unknown is classified as strictly limited, but is excluded here; this
+		// case only applies when NAT discovery has run.
 
-		awaitPortMapping := !doSTUN
-		if iceCompleted && portMappingExternalAddr == "" && doPortMapping && doSTUN {
+		natType := config.WebRTCDialCoordinator.NATType()
+		hasStrictlyLimitedNAT := natType != NATTypeUnknown &&
+			natType.Traversal() == NATTraversalStrictlyLimited
+
+		awaitPortMapping := !doSTUN || hasStrictlyLimitedNAT
+		if iceCompleted && portMappingExternalAddr == "" && doPortMapping && !awaitPortMapping {
 
 			// Check for no STUN candidates. This prepareSDPAddresses call is
 			// potentially, but not always, a duplicate with the one below,
@@ -3107,7 +3118,7 @@ func processSDPAddresses(
 				// In personal pairing mode, mismatching GeoIP candidates are
 				// allowed and peers are trusted to not misdirect each other
 				// to arbitrary destinations. This enables modes such as
-				// InproxyProxySplitUpstreamInterfaceName and broker
+				// ProxySplitUpstreamInterfaceName and broker
 				// tunneling that cannot relay the original client IP.
 
 				if lookupGeoIP != nil {

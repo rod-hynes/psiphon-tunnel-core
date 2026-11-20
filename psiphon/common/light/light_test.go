@@ -313,6 +313,7 @@ func runTestLightProxy(
 		expectedTLSClientHelloPadding,
 		addProxyHeader,
 		testClientRegion)
+	receiver.expectedDeviceRegion = testDeviceRegion
 
 	maxConcurrent := numClients * numConnectionsPerClient * 2
 	if sharedProxyLimits {
@@ -3085,6 +3086,7 @@ type testProxyEventReceiver struct {
 	expectedTLSClientHelloPadding    int
 	expectedProxyProtocolHeaderAdded bool
 	expectedActivityRegion           string
+	expectedDeviceRegion             string
 	activityRegionSeen               chan struct{}
 	activityRegionSeenOnce           sync.Once
 	connectionStats                  chan *ConnectionStats
@@ -3256,6 +3258,11 @@ func (r *testProxyEventReceiver) checkConnectionStats(stats *ConnectionStats) {
 
 	if stats.ProxyCompletedUpstreamTCP.IsZero() == stats.ProxyCompletedUpstreamQUIC.IsZero() {
 		r.statsErr = errors.TraceNew("expected exactly one upstream TCP or QUIC completion time")
+		return
+	}
+
+	if r.expectedDeviceRegion != "" && stats.DeviceRegion != r.expectedDeviceRegion {
+		r.statsErr = errors.TraceNew("unexpected DeviceRegion")
 		return
 	}
 

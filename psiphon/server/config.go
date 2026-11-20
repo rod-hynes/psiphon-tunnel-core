@@ -320,7 +320,8 @@ type Config struct {
 	MeekSkipExtendedTurnAroundThresholdBytes *int `json:",omitempty"`
 
 	// MeekMaxSessionStalenessMilliseconds specifies the TTL for meek sessions.
-	// The default is MEEK_DEFAULT_MAX_SESSION_STALENESS.
+	// The default is MEEK_DEFAULT_MAX_SESSION_STALENESS. When meek tunnels
+	// are enabled, this must be less than SSH_CONNECTION_PRE_API_READ_DEADLINE.
 	MeekMaxSessionStalenessMilliseconds *int `json:",omitempty"`
 
 	// MeekHTTPClientIOTimeoutMilliseconds specifies meek HTTP server I/O
@@ -529,8 +530,8 @@ type Config struct {
 	// addition to logging events.
 	BlocklistActive bool `json:",omitempty"`
 
-	// AllowBogons disables port forward bogon checks. This should be used only
-	// for testing.
+	// AllowBogons disables port forward bogon and server IP address checks.
+	// This should be used only for testing.
 	AllowBogons bool `json:",omitempty"`
 
 	// EnableSteeringIPs enables meek server steering IP support.
@@ -984,6 +985,21 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 				return nil, errors.Tracef(
 					"Tunnel protocol %s requires MeekCookieEncryptionPrivateKey, MeekObfuscatedKey",
 					tunnelProtocol)
+			}
+		}
+		if protocol.TunnelProtocolUsesMeek(tunnelProtocol) {
+			// meekConn.SetDeadline only accepts deadlines beyond the session
+			// staleness. The margin covers the clock reads between setting
+			// and checking the deadline.
+			maxSessionStalenessMilliseconds := int(MEEK_DEFAULT_MAX_SESSION_STALENESS / time.Millisecond)
+			if config.MeekMaxSessionStalenessMilliseconds != nil {
+				maxSessionStalenessMilliseconds = *config.MeekMaxSessionStalenessMilliseconds
+			}
+			maxMilliseconds := int((SSH_CONNECTION_PRE_API_READ_DEADLINE - time.Second) / time.Millisecond)
+			if maxSessionStalenessMilliseconds <= 0 || maxSessionStalenessMilliseconds > maxMilliseconds {
+				return nil, errors.Tracef(
+					"Tunnel protocol %s requires MeekMaxSessionStalenessMilliseconds in the range 1 to %d",
+					tunnelProtocol, maxMilliseconds)
 			}
 		}
 
@@ -1520,7 +1536,7 @@ func GenerateConfig(params *GenerateConfigParams) ([]byte, []byte, []byte, []byt
 		LightPrivateKey:                    lightPrivateKey,
 		LightRootObfuscationSecret:         lightRootObfuscationSecret,
 		DNSResolverIPAddress:               "8.8.8.8",
-		UDPInterceptUdpgwServerAddress:     "127.0.0.1:7300",
+		UDPInterceptUdpgwServerAddress:     protocol.DEFAULT_UDPGW_INTERCEPT_ADDRESS,
 		MeekCookieEncryptionPrivateKey:     meekCookieEncryptionPrivateKey,
 		MeekObfuscatedKey:                  meekObfuscatedKey,
 		MeekProhibitedHeaders:              nil,

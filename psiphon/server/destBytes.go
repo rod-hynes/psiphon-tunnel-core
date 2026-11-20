@@ -191,9 +191,9 @@ func (d *destBytesLogger) addLogFields(
 	if bucket.isUntrustedClientGeoIP {
 		logFields["is_untrusted_client_geoip"] = true
 	}
-	logFields["sponsor_id"] = bucket.sponsorID
-	logFields["client_platform"] = bucket.clientPlatform
-	logFields["device_region"] = bucket.deviceRegion
+	logFields["sponsor_id"] = common.TruncateUTF8String(bucket.sponsorID, MAX_API_PARAM_STRING_LENGTH)
+	logFields["client_platform"] = common.TruncateUTF8String(bucket.clientPlatform, MAX_API_PARAM_STRING_LENGTH)
+	logFields["device_region"] = common.TruncateUTF8String(bucket.deviceRegion, MAX_API_PARAM_STRING_LENGTH)
 
 	logFields["bytes_tcp"] = counters.TCP
 	logFields["bytes_udp"] = counters.UDP

@@ -29,13 +29,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -210,6 +208,11 @@ type Config struct {
 	// DisableLocalHTTPProxy disables running the local HTTP proxy.
 	DisableLocalHTTPProxy bool `json:",omitempty"`
 
+	// EnableLocalHTTPProxyDirect enables the local HTTP proxy's /direct/ URL
+	// relay, which connects to origins without using a Psiphon tunnel. The
+	// endpoint is disabled by default.
+	EnableLocalHTTPProxyDirect bool `json:",omitempty"`
+
 	// UseUnixDomainSockets indicates that the local SOCKS and HTTP proxies
 	// should listen on Unix domain sockets instead of TCP. When enabled, the
 	// TCP listeners are not created and LocalSocksProxyPort/LocalHttpProxyPort
@@ -218,6 +221,17 @@ type Config struct {
 	// the same UID, or iOS app extensions that share an App Group container).
 	// When enabled, LocalSocksProxyUnixPath and LocalHttpProxyUnixPath must be
 	// set for each proxy that is not disabled.
+	//
+	// The library creates the listeners but does not authenticate peer
+	// credentials. The host app must restrict access to the socket paths:
+	// - Android: use an app-private directory accessible to the intended
+	//   same-UID processes. Abstract sockets rely on SELinux policy, which
+	//   varies with the Android version and target SDK.
+	// - iOS: use the app's private container, or an App Group container shared
+	//   only with trusted apps and extensions.
+	// - Linux: create an owned directory with mode 0700 before starting;
+	//   same-UID processes can still connect. Abstract sockets have no
+	//   filesystem access controls; use them only with other peer isolation.
 	//
 	// Note: the HTTP proxy's URL proxy M3U8 rewrite feature is not supported
 	// when listening on a Unix domain socket, as it requires an IP:port to
@@ -228,14 +242,16 @@ type Config struct {
 	// local SOCKS proxy, used when UseUnixDomainSockets is enabled. The path
 	// must be an absolute path that all participating processes can access. On
 	// Android and Linux, a path with a leading "@" specifies a socket in the
-	// abstract namespace, which has no filesystem entry.
+	// abstract namespace, which has no filesystem entry. See
+	// UseUnixDomainSockets for access-control requirements.
 	LocalSocksProxyUnixPath string `json:",omitempty"`
 
 	// LocalHttpProxyUnixPath specifies the Unix domain socket path for the
 	// local HTTP proxy, used when UseUnixDomainSockets is enabled. The path
 	// must be an absolute path that all participating processes can access. On
 	// Android and Linux, a path with a leading "@" specifies a socket in the
-	// abstract namespace, which has no filesystem entry.
+	// abstract namespace, which has no filesystem entry. See
+	// UseUnixDomainSockets for access-control requirements.
 	LocalHttpProxyUnixPath string `json:",omitempty"`
 
 	// NetworkLatencyMultiplier is a multiplier that is to be applied to
@@ -634,69 +650,22 @@ type Config struct {
 	// Required for the exchange functionality.
 	ExchangeObfuscationKey string `json:",omitempty"`
 
-	// MigrateHomepageNoticesFilename migrates a homepage file from the path
-	// previously configured with setNoticeFiles to the new path for homepage
-	// files under the data root directory. The file specified by this config
-	// value will be moved to config.GetHomePageFilename().
-	//
-	// Note: see comment for config.Commit() for a description of how file
-	// migrations are performed.
-	//
-	// If not set, no migration operation will be performed.
+	// Deprecated: ignored.
 	MigrateHomepageNoticesFilename string `json:",omitempty"`
 
-	// MigrateRotatingNoticesFilename migrates notice files from the path
-	// previously configured with setNoticeFiles to the new path for notice
-	// files under the data root directory.
-	//
-	// MigrateRotatingNoticesFilename will be moved to
-	// config.GetNoticesFilename().
-	//
-	// MigrateRotatingNoticesFilename.1 will be moved to
-	// config.GetOldNoticesFilename().
-	//
-	// Note: see comment for config.Commit() for a description of how file
-	// migrations are performed.
-	//
-	// If not set, no migration operation will be performed.
+	// Deprecated: ignored.
 	MigrateRotatingNoticesFilename string `json:",omitempty"`
 
-	// MigrateDataStoreDirectory indicates the location of the datastore
-	// directory, as previously configured with the deprecated
-	// DataStoreDirectory config field. Datastore files found in the specified
-	// directory will be moved under the data root directory.
-	//
-	// Note: see comment for config.Commit() for a description of how file
-	// migrations are performed.
+	// Deprecated: ignored.
 	MigrateDataStoreDirectory string `json:",omitempty"`
 
-	// MigrateRemoteServerListDownloadFilename indicates the location of
-	// remote server list download files. The remote server list files found at
-	// the specified path will be moved under the data root directory.
-	//
-	// Note: see comment for config.Commit() for a description of how file
-	// migrations are performed.
+	// Deprecated: ignored.
 	MigrateRemoteServerListDownloadFilename string `json:",omitempty"`
 
-	// MigrateObfuscatedServerListDownloadDirectory indicates the location of
-	// the obfuscated server list downloads directory, as previously configured
-	// with ObfuscatedServerListDownloadDirectory. Obfuscated server list
-	// download files found in the specified directory will be moved under the
-	// data root directory.
-	//
-	// Warning: if the directory is empty after obfuscated server
-	// list files are moved, then it will be deleted.
-	//
-	// Note: see comment for config.Commit() for a description of how file
-	// migrations are performed.
+	// Deprecated: ignored.
 	MigrateObfuscatedServerListDownloadDirectory string `json:",omitempty"`
 
-	// MigrateUpgradeDownloadFilename indicates the location of downloaded
-	// application upgrade files. Downloaded upgrade files found at the
-	// specified path will be moved under the data root directory.
-	//
-	// Note: see comment for config.Commit() for a description of how file
-	// migrations are performed.
+	// Deprecated: ignored.
 	MigrateUpgradeDownloadFilename string `json:",omitempty"`
 
 	// DisableTunnels disables establishing a client tunnel. Set
@@ -707,9 +676,12 @@ type Config struct {
 	InproxyEnableProxy bool `json:",omitempty"`
 
 	// ProxySessionPrivateKey specifies the base64-encoded private key shared
-	// by in-proxy and Light proxies. Their tunnel proxy ID is derived from this key.
-	// When blank, a temporary key is generated per Controller session.
-	// Controller.GetLightProxyID returns the ID to include in Light proxy entries.
+	// by in-proxy and Light proxies. Their proxy ID is derived from this key.
+	// When blank, NewController generates an ephemeral key for its lifetime,
+	// including across network changes and broker client resets, so that
+	// concurrent broker clients and the Light proxy present one proxy ID.
+	// Controller.GetLightProxyID returns the ID to include in Light proxy
+	// entries.
 	ProxySessionPrivateKey string `json:",omitempty"`
 
 	// ProxySplitUpstreamInterfaceName specifies a network interface
@@ -950,7 +922,8 @@ type Config struct {
 	// It requires a configured ProxySessionPrivateKey.
 	LightProxyTrustedProxyAuthorization string `json:",omitempty"`
 
-	// LightProxyAllowBogons permits upstream connections to bogon addresses.
+	// LightProxyAllowBogons permits upstream connections to bogon addresses
+	// and configured proxy IPs.
 	LightProxyAllowBogons bool `json:",omitempty"`
 
 	// LightProxyLookupGeoIP is an optional callback providing GeoIP lookup for
@@ -1029,59 +1002,16 @@ type Config struct {
 	// Deprecated: Use ProxyPersonalCompartmentID. Ignored when that field is set.
 	InproxyProxyPersonalCompartmentID string `json:",omitempty"`
 
-	// DataStoreDirectory is the directory in which to store the persistent
-	// database, which contains information such as server entries. By
-	// default, current working directory.
-	//
-	// Deprecated:
-	// Use MigrateDataStoreDirectory. When MigrateDataStoreDirectory
-	// is set, this parameter is ignored.
-	//
-	// DataStoreDirectory has been subsumed by the new data root directory,
-	// which is configured with DataRootDirectory. If set, datastore files
-	// found in the specified directory will be moved under the data root
-	// directory.
+	// Deprecated: ignored. Use DataRootDirectory.
 	DataStoreDirectory string `json:",omitempty"`
 
-	// RemoteServerListDownloadFilename specifies a target filename for
-	// storing the remote server list download. Data is stored in co-located
-	// files (RemoteServerListDownloadFilename.part*) to allow for resumable
-	// downloading.
-	//
-	// Deprecated:
-	// Use MigrateRemoteServerListDownloadFilename. When
-	// MigrateRemoteServerListDownloadFilename is set, this parameter is
-	// ignored.
-	//
-	// If set, remote server list download files found at the specified path
-	// will be moved under the data root directory.
+	// Deprecated: ignored. Use DataRootDirectory.
 	RemoteServerListDownloadFilename string `json:",omitempty"`
 
-	// ObfuscatedServerListDownloadDirectory specifies a target directory for
-	// storing the obfuscated remote server list downloads. Data is stored in
-	// co-located files (<OSL filename>.part*) to allow for resumable
-	// downloading.
-	//
-	// Deprecated:
-	// Use MigrateObfuscatedServerListDownloadDirectory. When
-	// MigrateObfuscatedServerListDownloadDirectory is set, this parameter is
-	// ignored.
-	//
-	// If set, obfuscated server list download files found at the specified path
-	// will be moved under the data root directory.
+	// Deprecated: ignored. Use DataRootDirectory.
 	ObfuscatedServerListDownloadDirectory string `json:",omitempty"`
 
-	// UpgradeDownloadFilename is the local target filename for an upgrade
-	// download. This parameter is required when UpgradeDownloadURLs (or
-	// UpgradeDownloadUrl) is specified. Data is stored in co-located files
-	// (UpgradeDownloadFilename.part*) to allow for resumable downloading.
-	//
-	// Deprecated:
-	// Use MigrateUpgradeDownloadFilename. When MigrateUpgradeDownloadFilename
-	// is set, this parameter is ignored.
-	//
-	// If set, upgrade download files found at the specified path will be moved
-	// under the data root directory.
+	// Deprecated: ignored. Use DataRootDirectory.
 	UpgradeDownloadFilename string `json:",omitempty"`
 
 	// TunnelProtocol indicates which protocol to use. For the default, "",
@@ -1420,8 +1350,6 @@ type Config struct {
 	InproxyProxyAnswerRequestTimeoutMilliseconds            *int                                             `json:",omitempty"`
 	InproxyClientOfferRequestTimeoutMilliseconds            *int                                             `json:",omitempty"`
 	InproxyClientOfferRequestPersonalTimeoutMilliseconds    *int                                             `json:",omitempty"`
-	InproxyClientOfferRetryDelayMilliseconds                *int                                             `json:",omitempty"`
-	InproxyClientOfferRetryJitter                           *float64                                         `json:",omitempty"`
 	InproxyClientRelayedPacketRequestTimeoutMilliseconds    *int                                             `json:",omitempty"`
 	InproxyDTLSRandomizationProbability                     *float64                                         `json:",omitempty"`
 	InproxyWebRTCMediaStreamsProbability                    *float64                                         `json:",omitempty"`
@@ -1465,6 +1393,12 @@ type Config struct {
 	InproxyClientNoMatchFailoverPersonalProbability         *float64                                         `json:",omitempty"`
 	InproxyFrontingProviderClientMaxRequestTimeouts         map[string]string                                `json:",omitempty"`
 	InproxyProxyOnBrokerClientFailedRetryPeriodMilliseconds *int                                             `json:",omitempty"`
+	InproxyClientMaxBrokerClients                           *int                                             `json:",omitempty"`
+	InproxyProxyMaxBrokerClients                            *int                                             `json:",omitempty"`
+	InproxyClientBrokerClientIdleTimeoutSeconds             *int                                             `json:",omitempty"`
+	InproxyClientShareBrokerClientTransportProbability      *float64                                         `json:",omitempty"`
+	InproxyProxyShareBrokerClientTransportProbability       *float64                                         `json:",omitempty"`
+	InproxyProxyPersonalReturnHomePeriodSeconds             *int                                             `json:",omitempty"`
 	InproxyProxyIncompatibleNetworkTypes                    []string                                         `json:",omitempty"`
 	InproxyClientIncompatibleNetworkTypes                   []string                                         `json:",omitempty"`
 	InproxyReplayRetainFailedProbability                    *float64                                         `json:",omitempty"`
@@ -1566,7 +1500,7 @@ type Config struct {
 
 	signalComponentFailure atomic.Value
 
-	inproxyMustUpgradePosted int32
+	inproxyMustUpgrade int32
 
 	serverEntryIterationMetricsUpdater atomic.Value
 
@@ -1628,43 +1562,13 @@ func (config *Config) IsCommitted() bool {
 	return config.committed
 }
 
-// Commit validates Config fields finalizes initialization.
+// Commit validates Config fields and finalizes initialization.
 //
-// Config fields should not be set after calling Config, as any changes may
+// Config fields should not be set after calling Commit, as any changes may
 // not be reflected in internal data structures.
 //
-// If migrateFromLegacyFields is set to true, then an attempt to migrate from
-// legacy fields is made.
-//
-// Migration from legacy fields:
-// Config fields of the naming Migrate* (e.g. MigrateDataStoreDirectory) specify
-// a file migration operation which should be performed. These fields correspond
-// to deprecated fields, which previously could be used to specify where Psiphon
-// stored different sets of persistent files (e.g. MigrateDataStoreDirectory
-// corresponds to the deprecated field DataStoreDirectory).
-//
-// Psiphon now stores all persistent data under the configurable
-// DataRootDirectory (see Config.DataRootDirectory). The deprecated fields, and
-// corresponding Migrate* fields, are now used to specify the file or directory
-// path where, or under which, persistent files and directories created by
-// previous versions of Psiphon exist, so they can be moved under the
-// DataRootDirectory.
-//
-// For each migration operation:
-//   - In the case of directories that could have defaulted to the current working
-//     directory, persistent files and directories created by Psiphon are
-//     precisely targeted to avoid moving files which were not created by Psiphon.
-//   - If no file is found at the specified path, or an error is encountered while
-//     migrating the file, then an error is logged and execution continues
-//     normally.
-//
-// A sentinel file which signals that file migration has been completed, and
-// should not be attempted again, is created under DataRootDirectory after one
-// full pass through Commit(), regardless of whether file migration succeeds or
-// fails. It is better to not endlessly retry file migrations on each Commit()
-// because file system errors are expected to be rare and persistent files will
-// be re-populated over time.
-func (config *Config) Commit(migrateFromLegacyFields bool) error {
+// The boolean argument is ignored and retained for compatibility.
+func (config *Config) Commit(_ bool) error {
 	// Apply any additional parameters first
 	additionalParametersInfoMsgs, err := config.applyAdditionalParameters()
 	if err != nil {
@@ -1678,7 +1582,7 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 			true, config.EmitDiagnosticNetworkParameters)
 	}
 
-	// Migrate and set notice files before any operations that may emit an
+	// Set notice files before any operations that may emit an
 	// error. This is to ensure config file errors are written to file when
 	// notice files are configured with config.UseNoticeFiles.
 	//
@@ -1698,7 +1602,7 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 	// Create root directory
 	dataDirectoryPath := config.GetPsiphonDataDirectory()
 	if !common.FileExists(dataDirectoryPath) {
-		err := os.Mkdir(dataDirectoryPath, os.ModePerm)
+		err := os.Mkdir(dataDirectoryPath, 0700)
 		if err != nil {
 			return errors.Tracef(
 				"failed to create datastore directory with error: %s",
@@ -1706,51 +1610,10 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		}
 	}
 
-	// Check if the migration from legacy config fields has already been
-	// completed. See the Migrate* config fields for more details.
-	migrationCompleteFilePath := filepath.Join(config.GetPsiphonDataDirectory(), "migration_complete")
-	needMigration := !common.FileExists(migrationCompleteFilePath)
-
-	// Collect notices to emit them after notice files are set
-	var noticeMigrationAlertMsgs []string
-	var noticeMigrationInfoMsgs []string
-
-	// Migrate notices first to ensure notice files are used for notices if
-	// UseNoticeFiles is set.
-	homepageFilePath := config.GetHomePageFilename()
-	noticesFilePath := config.GetNoticesFilename()
-
-	if migrateFromLegacyFields {
-		if needMigration {
-
-			// Move notice files that exist at legacy file paths under the data root
-			// directory.
-
-			noticeMigrationInfoMsgs = append(noticeMigrationInfoMsgs, "Config migration: need migration")
-			noticeMigrations := migrationsFromLegacyNoticeFilePaths(config)
-
-			successfulMigrations := 0
-
-			for _, migration := range noticeMigrations {
-				err := DoFileMigration(migration)
-				if err != nil {
-					alertMsg := fmt.Sprintf("Config migration: %s", errors.Trace(err))
-					noticeMigrationAlertMsgs = append(noticeMigrationAlertMsgs, alertMsg)
-				} else {
-					successfulMigrations += 1
-				}
-			}
-			infoMsg := fmt.Sprintf("Config migration: %d/%d notice files successfully migrated", successfulMigrations, len(noticeMigrations))
-			noticeMigrationInfoMsgs = append(noticeMigrationInfoMsgs, infoMsg)
-		} else {
-			noticeMigrationInfoMsgs = append(noticeMigrationInfoMsgs, "Config migration: migration already completed")
-		}
-	}
-
 	if config.UseNoticeFiles != nil {
 		err := setNoticeFiles(
-			homepageFilePath,
-			noticesFilePath,
+			config.GetHomePageFilename(),
+			config.GetNoticesFilename(),
 			config.UseNoticeFiles.RotatingFileSize,
 			config.UseNoticeFiles.RotatingSyncFrequency)
 		if err != nil {
@@ -1760,12 +1623,6 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 
 	// Emit notices now that notice files are set if configured
 	for _, msg := range additionalParametersInfoMsgs {
-		NoticeInfo(msg)
-	}
-	for _, msg := range noticeMigrationAlertMsgs {
-		NoticeWarning(msg)
-	}
-	for _, msg := range noticeMigrationInfoMsgs {
 		NoticeInfo(msg)
 	}
 
@@ -1790,22 +1647,6 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 
 	if config.TunnelProtocol != "" && len(config.LimitTunnelProtocols) == 0 {
 		config.LimitTunnelProtocols = []string{config.TunnelProtocol}
-	}
-
-	if config.DataStoreDirectory != "" && config.MigrateDataStoreDirectory == "" {
-		config.MigrateDataStoreDirectory = config.DataStoreDirectory
-	}
-
-	if config.RemoteServerListDownloadFilename != "" && config.MigrateRemoteServerListDownloadFilename == "" {
-		config.MigrateRemoteServerListDownloadFilename = config.RemoteServerListDownloadFilename
-	}
-
-	if config.ObfuscatedServerListDownloadDirectory != "" && config.MigrateObfuscatedServerListDownloadDirectory == "" {
-		config.MigrateObfuscatedServerListDownloadDirectory = config.ObfuscatedServerListDownloadDirectory
-	}
-
-	if config.UpgradeDownloadFilename != "" && config.MigrateUpgradeDownloadFilename == "" {
-		config.MigrateUpgradeDownloadFilename = config.UpgradeDownloadFilename
 	}
 
 	if config.InproxyMaxClients != 0 && config.InproxyMaxCommonClients == 0 {
@@ -1847,7 +1688,7 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 	// Create datastore directory.
 	dataStoreDirectoryPath := config.GetDataStoreDirectory()
 	if !common.FileExists(dataStoreDirectoryPath) {
-		err := os.Mkdir(dataStoreDirectoryPath, os.ModePerm)
+		err := os.Mkdir(dataStoreDirectoryPath, 0700)
 		if err != nil {
 			return errors.Tracef(
 				"failed to create datastore directory with error: %s",
@@ -1858,7 +1699,7 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 	// Create OSL directory.
 	oslDirectoryPath := config.GetObfuscatedServerListDownloadDirectory()
 	if !common.FileExists(oslDirectoryPath) {
-		err := os.Mkdir(oslDirectoryPath, os.ModePerm)
+		err := os.Mkdir(oslDirectoryPath, 0700)
 		if err != nil {
 			return errors.Tracef(
 				"failed to create osl directory with error: %s",
@@ -2471,72 +2312,6 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		config.clientFeatures = append(config.clientFeatures, feature)
 	}
 
-	// Migrate from old config fields. This results in files being moved under
-	// a config specified data root directory.
-	if migrateFromLegacyFields && needMigration {
-
-		// If unset, set MigrateDataStoreDirectory to the previous default value for
-		// DataStoreDirectory to ensure that datastore files are migrated.
-		if config.MigrateDataStoreDirectory == "" {
-			wd, err := os.Getwd()
-			if err != nil {
-				return errors.Trace(err)
-			}
-			NoticeInfo("MigrateDataStoreDirectory unset, using working directory")
-			config.MigrateDataStoreDirectory = wd
-		}
-
-		// Move files that exist at legacy file paths under the data root
-		// directory.
-
-		migrations, err := migrationsFromLegacyFilePaths(config)
-		if err != nil {
-			return errors.Trace(err)
-		}
-
-		// Do migrations
-
-		successfulMigrations := 0
-		for _, migration := range migrations {
-			err := DoFileMigration(migration)
-			if err != nil {
-				NoticeWarning("Config migration: %s", errors.Trace(err))
-			} else {
-				successfulMigrations += 1
-			}
-		}
-		NoticeInfo(fmt.Sprintf(
-			"Config migration: %d/%d legacy files successfully migrated",
-			successfulMigrations, len(migrations)))
-
-		// Remove OSL directory if empty
-		if config.MigrateObfuscatedServerListDownloadDirectory != "" {
-			files, err := ioutil.ReadDir(config.MigrateObfuscatedServerListDownloadDirectory)
-			if err != nil {
-				NoticeWarning(
-					"Error reading OSL directory: %s",
-					errors.Trace(common.RedactFilePathsError(err, config.MigrateObfuscatedServerListDownloadDirectory)))
-			} else if len(files) == 0 {
-				err := os.Remove(config.MigrateObfuscatedServerListDownloadDirectory)
-				if err != nil {
-					NoticeWarning(
-						"Error deleting empty OSL directory: %s",
-						errors.Trace(common.RedactFilePathsError(err, config.MigrateObfuscatedServerListDownloadDirectory)))
-				}
-			}
-		}
-
-		f, err := os.Create(migrationCompleteFilePath)
-		if err != nil {
-			NoticeWarning(
-				"Config migration: failed to create migration completed file with error %s",
-				errors.Trace(common.RedactFilePathsError(err, migrationCompleteFilePath)))
-		} else {
-			NoticeInfo("Config migration: completed")
-			f.Close()
-		}
-	}
-
 	disableForcedGarbageCollection.Store(config.DisableForcedGarbageCollection)
 
 	config.committed = true
@@ -2970,22 +2745,43 @@ func (config *Config) IsInproxyProxyPersonalPairingMode() bool {
 	return len(config.ProxyPersonalCompartmentID) > 0
 }
 
-// OnInproxyMustUpgrade is invoked when the in-proxy broker returns the
-// MustUpgrade response. When either running a proxy, or when running a
-// client in in-proxy personal pairing mode, it initiates shutdown after
-// emitting the InproxyMustUpgrade notice. This also applies when Light
-// protocols are enabled.
+// OnInproxyMustUpgrade handles a broker's MustUpgrade response. When either
+// proxy type is enabled, or the client uses in-proxy personal pairing, it
+// emits InproxyMustUpgrade once and initiates controller shutdown. Shutdown
+// stops both hosted proxy types: this emergency compatibility signal also
+// applies to Light, regardless of which broker request received it.
+//
+// Limitation: a Light-only host making no broker requests cannot receive
+// MustUpgrade. Light has no broker exchange of its own.
+//
+// Other clients stop selecting in-proxy tunnel protocols without emitting
+// InproxyMustUpgrade. An initial limit phase already in progress may still
+// select in-proxy when no alternative remains for a candidate, bounded by
+// its candidate count; see protocolSelectionConstraints.selectProtocol.
+// A hard limit allowing only in-proxy instead causes shutdown without
+// the notice.
 func (config *Config) OnInproxyMustUpgrade() {
-	// TODO: check if LimitTunnelProtocols is set to allow only INPROXY tunnel
-	// protocols; this is another case where in-proxy functionality is
-	// required.
+	first := atomic.CompareAndSwapInt32(&config.inproxyMustUpgrade, 0, 1)
 
-	if config.InproxyEnableProxy || config.IsInproxyClientPersonalPairingMode() {
-		if atomic.CompareAndSwapInt32(&config.inproxyMustUpgradePosted, 0, 1) {
+	if config.InproxyEnableProxy ||
+		config.EnableRunningLightProxy ||
+		config.IsInproxyClientPersonalPairingMode() {
+		if first {
 			NoticeInproxyMustUpgrade()
 		}
 		config.signalComponentFailure.Load().(func())()
+		return
 	}
+
+	if first {
+		NoticeWarning("in-proxy must upgrade: in-proxy tunnel protocols disabled")
+	}
+}
+
+// isInproxyMustUpgrade indicates whether an in-proxy broker has returned the
+// MustUpgrade response.
+func (config *Config) isInproxyMustUpgrade() bool {
+	return atomic.LoadInt32(&config.inproxyMustUpgrade) == 1
 }
 
 func (config *Config) SetServerEntryIterationMetricsUpdater(
@@ -3905,14 +3701,6 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 		applyParameters[parameters.InproxyClientOfferRequestPersonalTimeout] = fmt.Sprintf("%dms", *config.InproxyClientOfferRequestPersonalTimeoutMilliseconds)
 	}
 
-	if config.InproxyClientOfferRetryDelayMilliseconds != nil {
-		applyParameters[parameters.InproxyClientOfferRetryDelay] = fmt.Sprintf("%dms", *config.InproxyClientOfferRetryDelayMilliseconds)
-	}
-
-	if config.InproxyClientOfferRetryJitter != nil {
-		applyParameters[parameters.InproxyClientOfferRetryJitter] = *config.InproxyClientOfferRetryJitter
-	}
-
 	if config.InproxyClientRelayedPacketRequestTimeoutMilliseconds != nil {
 		applyParameters[parameters.InproxyClientRelayedPacketRequestTimeout] = fmt.Sprintf("%dms", *config.InproxyClientRelayedPacketRequestTimeoutMilliseconds)
 	}
@@ -4083,6 +3871,30 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 
 	if config.InproxyProxyOnBrokerClientFailedRetryPeriodMilliseconds != nil {
 		applyParameters[parameters.InproxyProxyOnBrokerClientFailedRetryPeriod] = fmt.Sprintf("%dms", *config.InproxyProxyOnBrokerClientFailedRetryPeriodMilliseconds)
+	}
+
+	if config.InproxyClientMaxBrokerClients != nil {
+		applyParameters[parameters.InproxyClientMaxBrokerClients] = *config.InproxyClientMaxBrokerClients
+	}
+
+	if config.InproxyProxyMaxBrokerClients != nil {
+		applyParameters[parameters.InproxyProxyMaxBrokerClients] = *config.InproxyProxyMaxBrokerClients
+	}
+
+	if config.InproxyClientBrokerClientIdleTimeoutSeconds != nil {
+		applyParameters[parameters.InproxyClientBrokerClientIdleTimeout] = fmt.Sprintf("%ds", *config.InproxyClientBrokerClientIdleTimeoutSeconds)
+	}
+
+	if config.InproxyClientShareBrokerClientTransportProbability != nil {
+		applyParameters[parameters.InproxyClientShareBrokerClientTransportProbability] = *config.InproxyClientShareBrokerClientTransportProbability
+	}
+
+	if config.InproxyProxyShareBrokerClientTransportProbability != nil {
+		applyParameters[parameters.InproxyProxyShareBrokerClientTransportProbability] = *config.InproxyProxyShareBrokerClientTransportProbability
+	}
+
+	if config.InproxyProxyPersonalReturnHomePeriodSeconds != nil {
+		applyParameters[parameters.InproxyProxyPersonalReturnHomePeriod] = fmt.Sprintf("%ds", *config.InproxyProxyPersonalReturnHomePeriodSeconds)
 	}
 
 	if len(config.InproxyProxyIncompatibleNetworkTypes) > 0 {
@@ -5631,158 +5443,4 @@ func (n *cachingNetworkIDGetter) FlushCache() {
 
 	n.cachedNetworkID = ""
 	n.cacheExpiry = time.Time{}
-}
-
-// migrationsFromLegacyNoticeFilePaths returns the file migrations which must be
-// performed to move notice files from legacy file paths, which were configured
-// with the legacy config fields HomepageNoticesFilename and
-// RotatingNoticesFilename, to the new file paths used by Psiphon which exist
-// under the data root directory.
-func migrationsFromLegacyNoticeFilePaths(config *Config) []FileMigration {
-	var noticeMigrations []FileMigration
-
-	if config.MigrateHomepageNoticesFilename != "" {
-		noticeMigrations = append(noticeMigrations, FileMigration{
-			Name:    "hompage",
-			OldPath: config.MigrateHomepageNoticesFilename,
-			NewPath: config.GetHomePageFilename(),
-		})
-	}
-
-	if config.MigrateRotatingNoticesFilename != "" {
-		migrations := []FileMigration{
-			{
-				Name:    "notices",
-				OldPath: config.MigrateRotatingNoticesFilename,
-				NewPath: config.GetNoticesFilename(),
-				IsDir:   false,
-			},
-			{
-				Name:    "notices.1",
-				OldPath: config.MigrateRotatingNoticesFilename + ".1",
-				NewPath: config.GetNoticesFilename() + ".1",
-			},
-		}
-		noticeMigrations = append(noticeMigrations, migrations...)
-	}
-
-	return noticeMigrations
-}
-
-// migrationsFromLegacyFilePaths returns the file migrations which must be
-// performed to move files from legacy file paths, which were configured with
-// legacy config fields, to the new file paths used by Psiphon which exist
-// under the data root directory.
-// Note: an attempt is made to redact any file paths from the returned error.
-func migrationsFromLegacyFilePaths(config *Config) ([]FileMigration, error) {
-
-	migrations := []FileMigration{
-		{
-			Name:    "psiphon.boltdb",
-			OldPath: filepath.Join(config.MigrateDataStoreDirectory, "psiphon.boltdb"),
-			NewPath: filepath.Join(config.GetDataStoreDirectory(), "psiphon.boltdb"),
-		},
-		{
-			Name:    "psiphon.boltdb.lock",
-			OldPath: filepath.Join(config.MigrateDataStoreDirectory, "psiphon.boltdb.lock"),
-			NewPath: filepath.Join(config.GetDataStoreDirectory(), "psiphon.boltdb.lock"),
-		},
-	}
-
-	if config.MigrateRemoteServerListDownloadFilename != "" {
-
-		// Migrate remote server list files
-
-		rslMigrations := []FileMigration{
-			{
-				Name:    "remote_server_list",
-				OldPath: config.MigrateRemoteServerListDownloadFilename,
-				NewPath: config.GetRemoteServerListDownloadFilename(),
-			},
-			{
-				Name:    "remote_server_list.part",
-				OldPath: config.MigrateRemoteServerListDownloadFilename + ".part",
-				NewPath: config.GetRemoteServerListDownloadFilename() + ".part",
-			},
-			{
-				Name:    "remote_server_list.part.etag",
-				OldPath: config.MigrateRemoteServerListDownloadFilename + ".part.etag",
-				NewPath: config.GetRemoteServerListDownloadFilename() + ".part.etag",
-			},
-		}
-
-		migrations = append(migrations, rslMigrations...)
-	}
-
-	if config.MigrateObfuscatedServerListDownloadDirectory != "" {
-
-		// Migrate OSL registry file and downloads
-
-		oslFileRegex, err := regexp.Compile(`^osl-.+$`)
-		if err != nil {
-			return nil, errors.TraceMsg(err, "failed to compile regex for osl files")
-		}
-
-		files, err := ioutil.ReadDir(config.MigrateObfuscatedServerListDownloadDirectory)
-		if err != nil {
-			NoticeWarning(
-				"Migration: failed to read OSL download directory with error %s",
-				common.RedactFilePathsError(err, config.MigrateObfuscatedServerListDownloadDirectory))
-		} else {
-			for _, file := range files {
-				if oslFileRegex.MatchString(file.Name()) {
-					fileMigration := FileMigration{
-						Name:    "osl",
-						OldPath: filepath.Join(config.MigrateObfuscatedServerListDownloadDirectory, file.Name()),
-						NewPath: filepath.Join(config.GetObfuscatedServerListDownloadDirectory(), file.Name()),
-					}
-					migrations = append(migrations, fileMigration)
-				}
-			}
-		}
-	}
-
-	if config.MigrateUpgradeDownloadFilename != "" {
-
-		// Migrate downloaded upgrade files
-
-		oldUpgradeDownloadFilename := filepath.Base(config.MigrateUpgradeDownloadFilename)
-
-		// Create regex for:
-		// <old_upgrade_download_filename>
-		// <old_upgrade_download_filename>.<client_version_number>
-		// <old_upgrade_download_filename>.<client_version_number>.part
-		// <old_upgrade_download_filename>.<client_version_number>.part.etag
-		upgradeDownloadFileRegex, err := regexp.Compile(`^` + oldUpgradeDownloadFilename + `(\.\d+(\.part(\.etag)?)?)?$`)
-		if err != nil {
-			return nil, errors.TraceMsg(err, "failed to compile regex for upgrade files")
-		}
-
-		upgradeDownloadDir := filepath.Dir(config.MigrateUpgradeDownloadFilename)
-
-		files, err := ioutil.ReadDir(upgradeDownloadDir)
-		if err != nil {
-			NoticeWarning(
-				"Migration: failed to read upgrade download directory with error %s",
-				common.RedactFilePathsError(err, upgradeDownloadDir))
-		} else {
-
-			for _, file := range files {
-
-				if upgradeDownloadFileRegex.MatchString(file.Name()) {
-
-					oldFileSuffix := strings.TrimPrefix(file.Name(), oldUpgradeDownloadFilename)
-
-					fileMigration := FileMigration{
-						Name:    "upgrade",
-						OldPath: filepath.Join(upgradeDownloadDir, file.Name()),
-						NewPath: config.GetUpgradeDownloadFilename() + oldFileSuffix,
-					}
-					migrations = append(migrations, fileMigration)
-				}
-			}
-		}
-	}
-
-	return migrations, nil
 }

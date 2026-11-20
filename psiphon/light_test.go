@@ -1276,6 +1276,87 @@ func runTestLightProxyTLSDialer() error {
 	return nil
 }
 
+func TestInproxyMustUpgradeLightProtocolSelection(t *testing.T) {
+	if !inproxy.Enabled() {
+		t.Skip("in-proxy is not enabled")
+	}
+	config := &Config{
+		DataRootDirectory:    t.TempDir(),
+		PropagationChannelId: "0",
+		SponsorId:            "0000000000000000",
+		NetworkID:            "WIFI-test",
+	}
+	if err := config.Commit(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := OpenDataStore(config); err != nil {
+		t.Fatal(err)
+	}
+	defer CloseDataStore()
+	iterator, err := NewCommonLightTunnelProxyEntryIterator(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	inproxyProtocol := protocol.TunnelProtocolPlusInproxyWebRTC(
+		protocol.TUNNEL_PROTOCOL_OBFUSCATED_SSH)
+	lightProtocol := protocol.TUNNEL_PROTOCOL_LIGHT_TLS_TLS_SSH
+	serverEntry := makeMockServerEntries(
+		protocol.TUNNEL_PROTOCOL_OBFUSCATED_SSH, "", "", "", 1)[0]
+	serverEntry.InproxyOSSHPort = 443
+	serverEntry.LightTlsSSHPort = 443
+	serverEntry.LightDialAuthorization = []byte{1}
+	serverEntry.Capabilities = append(serverEntry.Capabilities,
+		protocol.GetCapability(inproxyProtocol), protocol.GetCapability(lightProtocol))
+	constraints := &protocolSelectionConstraints{
+		config:                                    config,
+		lightTunnelProxyEntryIterator:             iterator,
+		initialLimitTunnelProtocols:               protocol.TunnelProtocols{inproxyProtocol, lightProtocol},
+		initialLimitTunnelProtocolsCandidateCount: 2,
+		limitTunnelProtocols:                      protocol.TunnelProtocols{protocol.TUNNEL_PROTOCOL_OBFUSCATED_SSH},
+	}
+	config.OnInproxyMustUpgrade()
+	checkSelection := func(count int, expected string) {
+		t.Helper()
+		selected, _, ok := constraints.selectProtocol(
+			count, false, personalPairingProtocolNone, true, inproxyProtocol, serverEntry)
+		if !ok || selected != expected {
+			t.Fatalf("candidate %d: selected %q, want %q", count, selected, expected)
+		}
+	}
+
+	// With no usable Light proxy, the existing initial phase must still
+	// advance to the direct protocol despite the in-proxy preference/hint.
+	for count := 0; count < 2; count++ {
+		checkSelection(count, inproxyProtocol)
+	}
+	checkSelection(2, protocol.TUNNEL_PROTOCOL_OBFUSCATED_SSH)
+
+	entry, err := protocol.CBOREncoding.Marshal(&light.SignedProxyEntry{
+		ProxyEntry: light.ProxyEntry{
+			ProxyID: base64.RawStdEncoding.EncodeToString(prng.Bytes(32)),
+			DialAddresses: []light.ProxyAddress{
+				{IPAddress: "127.0.0.1", Port: 443, Protocol: light.LIGHT_PROTOCOL_TLS},
+			},
+			ObfuscationKey: prng.Bytes(32),
+			VerifyPin:      prng.Bytes(32),
+			TTLSeconds:     3600,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := StoreCommonLightTunnelProxyEntry(entry, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := iterator.Reset(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// When Light is available, it replaces in-proxy even during the initial
+	// phase, and the normal direct protocol remains available afterward.
+	checkSelection(0, lightProtocol)
+	checkSelection(2, protocol.TUNNEL_PROTOCOL_OBFUSCATED_SSH)
+}
+
 func TestPersonalPairingProtocolSelection(t *testing.T) {
 	if !inproxy.Enabled() {
 		t.Skip("inproxy is not enabled")

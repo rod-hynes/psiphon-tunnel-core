@@ -20,10 +20,13 @@
 package psiphon
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -324,4 +327,269 @@ func runRemoteTestUntunneledUpgradeHTTPClientFactory() error {
 	}
 
 	return nil
+}
+
+// TestResumeDownloadRestartOnOK checks that when a resumed download gets a
+// 200 response with the whole resource, the partial data is discarded and
+// the download completes in the same call.
+func TestResumeDownloadRestartOnOK(t *testing.T) {
+
+	content := bytes.Repeat([]byte("0123456789abcdef"), 256)
+	etag := `"test-etag"`
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(content)
+		}))
+	defer server.Close()
+
+	downloadFilename := filepath.Join(t.TempDir(), "download")
+	partialFilename := downloadFilename + ".part"
+	partialETagFilename := downloadFilename + ".part.etag"
+
+	err := os.WriteFile(partialFilename, content[:1000], 0600)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	err = os.WriteFile(partialETagFilename, []byte(etag), 0600)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	ctx, cancelFunc := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelFunc()
+
+	n, responseETag, err := ResumeDownload(
+		ctx, server.Client(), server.URL, "", downloadFilename, "")
+	if err != nil {
+		t.Fatalf("ResumeDownload failed: %v", err)
+	}
+	if n != int64(len(content)) {
+		t.Fatalf("unexpected bytes downloaded: %d", n)
+	}
+	if responseETag != etag {
+		t.Fatalf("unexpected ETag: %s", responseETag)
+	}
+
+	downloaded, err := os.ReadFile(downloadFilename)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if !bytes.Equal(downloaded, content) {
+		t.Fatalf("unexpected download content: %d bytes", len(downloaded))
+	}
+	for _, filename := range []string{partialFilename, partialETagFilename} {
+		_, err := os.Stat(filename)
+		if !os.IsNotExist(err) {
+			t.Fatalf("unexpected file: %s", filename)
+		}
+	}
+}
+
+// TestResumeDownloadRangeNotSatisfiable checks the case where a resumed
+// download requests a range starting at or past the end of the resource and
+// the server responds with 416. The 416 response body is an error message
+// and must not be appended to the download.
+func TestResumeDownloadRangeNotSatisfiable(t *testing.T) {
+
+	content := bytes.Repeat([]byte("0123456789abcdef"), 256)
+	etag := `"test-etag"`
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("ETag", etag)
+			http.ServeContent(
+				w, r, "download", time.Time{}, bytes.NewReader(content))
+		}))
+	defer server.Close()
+
+	testCases := []struct {
+		description    string
+		partialContent []byte
+		expectComplete bool
+	}{
+		{"partial download is complete", content, true},
+		{"partial download exceeds resource size", append(content[:len(content):len(content)], "extra"...), false},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.description, func(t *testing.T) {
+
+			downloadFilename := filepath.Join(t.TempDir(), "download")
+			partialFilename := downloadFilename + ".part"
+			partialETagFilename := downloadFilename + ".part.etag"
+
+			err := os.WriteFile(partialFilename, testCase.partialContent, 0600)
+			if err != nil {
+				t.Fatalf("WriteFile failed: %v", err)
+			}
+			err = os.WriteFile(partialETagFilename, []byte(etag), 0600)
+			if err != nil {
+				t.Fatalf("WriteFile failed: %v", err)
+			}
+
+			ctx, cancelFunc := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelFunc()
+
+			n, responseETag, err := ResumeDownload(
+				ctx, server.Client(), server.URL, "", downloadFilename, "")
+
+			if !testCase.expectComplete {
+
+				if err == nil {
+					t.Fatalf("unexpected success")
+				}
+				for _, filename := range []string{
+					downloadFilename, partialFilename, partialETagFilename} {
+					_, err := os.Stat(filename)
+					if !os.IsNotExist(err) {
+						t.Fatalf("unexpected file: %s", filename)
+					}
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ResumeDownload failed: %v", err)
+			}
+			if n != 0 {
+				t.Fatalf("unexpected bytes downloaded: %d", n)
+			}
+			if responseETag != etag {
+				t.Fatalf("unexpected ETag: %s", responseETag)
+			}
+			downloaded, err := os.ReadFile(downloadFilename)
+			if err != nil {
+				t.Fatalf("ReadFile failed: %v", err)
+			}
+			if !bytes.Equal(downloaded, content) {
+				t.Fatalf("unexpected download content: %d bytes", len(downloaded))
+			}
+			for _, filename := range []string{partialFilename, partialETagFilename} {
+				_, err := os.Stat(filename)
+				if !os.IsNotExist(err) {
+					t.Fatalf("unexpected file: %s", filename)
+				}
+			}
+		})
+	}
+}
+
+// TestResumeDownloadRangeIgnored checks resuming a download from a server
+// that ignores Range and responds 200 with the whole resource: the completed
+// download must be the resource, not the partial data followed by it.
+func TestResumeDownloadRangeIgnored(t *testing.T) {
+
+	content := bytes.Repeat([]byte("0123456789abcdef"), 256)
+	etag := `"test-etag"`
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(content)
+		}))
+	defer server.Close()
+
+	downloadFilename := filepath.Join(t.TempDir(), "download")
+	partialFilename := downloadFilename + ".part"
+	partialETagFilename := downloadFilename + ".part.etag"
+
+	err := os.WriteFile(partialFilename, content[:1000], 0600)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	err = os.WriteFile(partialETagFilename, []byte(etag), 0600)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	ctx, cancelFunc := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelFunc()
+
+	_, _, err = ResumeDownload(
+		ctx, server.Client(), server.URL, "", downloadFilename, "")
+	if err != nil {
+		// The partial download may be discarded, leaving the download to be
+		// retried.
+		_, _, err = ResumeDownload(
+			ctx, server.Client(), server.URL, "", downloadFilename, "")
+	}
+	if err != nil {
+		t.Fatalf("ResumeDownload failed: %v", err)
+	}
+
+	downloaded, err := os.ReadFile(downloadFilename)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if !bytes.Equal(downloaded, content) {
+		t.Fatalf("unexpected download content: %d bytes", len(downloaded))
+	}
+	for _, filename := range []string{partialFilename, partialETagFilename} {
+		_, err := os.Stat(filename)
+		if !os.IsNotExist(err) {
+			t.Fatalf("unexpected file: %s", filename)
+		}
+	}
+}
+
+// TestResumeDownloadPartialContent checks resuming a download from a server
+// that responds 206 with the remainder of the resource.
+func TestResumeDownloadPartialContent(t *testing.T) {
+
+	content := bytes.Repeat([]byte("0123456789abcdef"), 256)
+	etag := `"test-etag"`
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("ETag", etag)
+			http.ServeContent(
+				w, r, "download", time.Time{}, bytes.NewReader(content))
+		}))
+	defer server.Close()
+
+	downloadFilename := filepath.Join(t.TempDir(), "download")
+	partialFilename := downloadFilename + ".part"
+	partialETagFilename := downloadFilename + ".part.etag"
+
+	err := os.WriteFile(partialFilename, content[:1000], 0600)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	err = os.WriteFile(partialETagFilename, []byte(etag), 0600)
+	if err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	ctx, cancelFunc := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelFunc()
+
+	n, responseETag, err := ResumeDownload(
+		ctx, server.Client(), server.URL, "", downloadFilename, "")
+	if err != nil {
+		t.Fatalf("ResumeDownload failed: %v", err)
+	}
+	if n != int64(len(content)-1000) {
+		t.Fatalf("unexpected bytes downloaded: %d", n)
+	}
+	if responseETag != etag {
+		t.Fatalf("unexpected ETag: %s", responseETag)
+	}
+
+	downloaded, err := os.ReadFile(downloadFilename)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if !bytes.Equal(downloaded, content) {
+		t.Fatalf("unexpected download content: %d bytes", len(downloaded))
+	}
+	for _, filename := range []string{partialFilename, partialETagFilename} {
+		_, err := os.Stat(filename)
+		if !os.IsNotExist(err) {
+			t.Fatalf("unexpected file: %s", filename)
+		}
+	}
 }

@@ -58,7 +58,7 @@ const (
 	defaultPreHeaderDeadlineMin     = 30 * time.Second
 	defaultPreHeaderDeadlineMax     = 120 * time.Second
 	preHeaderDeadlineStep           = 10 * time.Second
-	defaultInactivityTimeout        = 5 * time.Minute // Matches server.SSH_CONNECTION_READ_DEADLINE
+	defaultInactivityTimeout        = 5 * time.Minute // Matches server.SSH_CONNECTION_READ_DEADLINE, the longer, post API handshake server inactivity timeout.
 	defaultUpstreamDialTimeout      = 5 * time.Second
 	defaultRelayBufferSize          = 8192
 	rateLimiterReapHistoryFrequency = 300 * time.Second
@@ -259,7 +259,8 @@ type ProxyConfig struct {
 	// LogDestinationAddresses includes upstream addresses in statistics.
 	LogDestinationAddresses bool `json:",omitempty"`
 
-	// AllowBogons permits upstream connections to bogon addresses.
+	// AllowBogons permits upstream connections to bogon addresses and the
+	// proxy's configured public IPs in both fallback and tunnel modes.
 	AllowBogons bool `json:",omitempty"`
 
 	// EmitActivity enables periodic activity callbacks.
@@ -443,6 +444,7 @@ type Proxy struct {
 	eventReceiver                    ProxyEventReceiver
 	ID                               string
 	proxyGeoIPData                   []common.GeoIPData
+	proxyIPs                         []net.IP
 	tlsConfig                        *tls.Config
 	listenAddresses                  []ProxyAddress
 	obfuscatorSeedHistory            *obfuscator.SeedHistory
@@ -820,8 +822,10 @@ func NewProxy(
 	}
 
 	proxyGeoIPData := make([]common.GeoIPData, len(listenAddresses))
+	proxyIPs := make([]net.IP, len(config.DialAddresses))
 	for i, address := range config.DialAddresses {
 		proxyGeoIPData[i] = lookupGeoIP(address.IPAddress)
+		proxyIPs[i] = net.ParseIP(address.IPAddress)
 	}
 
 	tlsCertificate, err := tls.X509KeyPair(
@@ -852,6 +856,7 @@ func NewProxy(
 		eventReceiver:              newRedactingProxyEventReceiver(eventReceiver),
 		ID:                         proxyID,
 		proxyGeoIPData:             proxyGeoIPData,
+		proxyIPs:                   proxyIPs,
 		tlsConfig:                  tlsConfig,
 		listenAddresses:            listenAddresses,
 		obfuscatorSeedHistory:      obfuscator.NewSeedHistory(nil),
@@ -1636,6 +1641,9 @@ func (proxy *Proxy) handleConn(
 	// observe limits.
 	//
 	// Limitation: per-IP limits are shared by common and personal clients.
+	//
+	// TCP handshakes and pre-header connections are outside these limits.
+	// Deployments should use host-based ingress rate and connection limits.
 
 	limitIP := common.GetRateLimitIP(clientIP)
 	err = proxy.applyRateLimit(limitIP)
@@ -1676,12 +1684,13 @@ func (proxy *Proxy) handleConn(
 			err = common.RedactNetError(err)
 			return errors.Trace(err)
 		}
-
 	} else {
 		normalizedDestinationAddress, err =
 			normalizeDestinationAddress(header.DestinationAddress)
 		if err != nil {
-			return errors.Trace(err)
+			// The parser error can include the client-supplied destination,
+			// even when LogDestinationAddresses is disabled.
+			return errors.TraceNew("invalid destination address")
 		}
 		if proxy.allowedDestinations.Len() > 0 &&
 			!proxy.allowedDestinations.Contains(
@@ -1694,8 +1703,10 @@ func (proxy *Proxy) handleConn(
 			ctx, proxy.upstreamDialTimeout)
 		defer dialCancel()
 
-		// In addition to resolving domains, proxy.resolve also enforces the
-		// IsBogon check against direct or indirect (resolved) bogon IP dials.
+		// In addition to resolving domains, proxy.resolve rejects bogons and
+		// the proxy's configured IPs, including resolved destinations.
+		// Limitation: with NAT64, these checks see only the IPv6 destination;
+		// the gateway must restrict destinations after translation.
 
 		upstreamAddrs, cached, err := proxy.resolve(
 			dialCtx, normalizedDestinationAddress)
@@ -1742,6 +1753,8 @@ func (proxy *Proxy) handleConn(
 	})
 	defer unassociateAfter()
 
+	// The client-reported sponsor ID selects the sponsor MAC key;
+	// it does not convey an entitlement.
 	proxyProtocolHeaderConfig, addProxyProtocolHeader :=
 		proxy.proxyProtocolHeaderConfigs[sponsorID]
 	if proxy.config.TunnelMode {
@@ -1915,10 +1928,9 @@ func (proxy *Proxy) dialTunnelServer(
 	}
 
 	// The destination is the IP address in the dial authorization.
-	if !proxy.config.AllowBogons &&
-		common.IsBogon(net.IP(authorization.IPAddress)) {
+	if proxy.isDisallowedIP(net.IP(authorization.IPAddress)) {
 
-		return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.TraceNew("IP is bogon")
+		return nil, destinationAddress, completedTCP, completedTLS, completedQUIC, errors.TraceNew("IP is bogon or proxy address")
 	}
 
 	var exporter []byte
@@ -2424,6 +2436,25 @@ func (proxy *Proxy) replacePerIPMaxConcurrent(limitIP string) {
 	}
 }
 
+func (proxy *Proxy) isDisallowedIP(IP net.IP) bool {
+	if proxy.config.AllowBogons {
+		return false
+	}
+	if common.IsBogon(IP) {
+		return true
+	}
+
+	// TODO: Revisit self-IP rejection for co-hosted Light proxies and servers.
+	// It blocks all ports on a configured proxy IP, including destinations with
+	// a valid tunnel dial authorization.
+	for _, proxyIP := range proxy.proxyIPs {
+		if IP.Equal(proxyIP) {
+			return true
+		}
+	}
+	return false
+}
+
 func (proxy *Proxy) resolve(
 	ctx context.Context,
 	destinationAddress string) (netTCPAddrs, bool, error) {
@@ -2438,14 +2469,14 @@ func (proxy *Proxy) resolve(
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return addrs, false, errors.Trace(err)
+		return addrs, false, errors.TraceNew("invalid destination port")
 	}
 
 	IP := net.ParseIP(host)
 	if IP != nil {
 
-		if !proxy.config.AllowBogons && common.IsBogon(IP) {
-			return addrs, false, errors.TraceNew("IP is bogon")
+		if proxy.isDisallowedIP(IP) {
+			return addrs, false, errors.TraceNew("IP is bogon or proxy address")
 		}
 
 		return netIPAddrs(IP, port), false, nil
@@ -2477,12 +2508,12 @@ func (proxy *Proxy) resolve(
 			return addrs, false, errors.Trace(err)
 		}
 
-		// Perform the bogon check here so it doesn't need to be repeated for
-		// cached values.
+		// Perform the bogon and proxy IP checks here so they don't need to be
+		// repeated for cached values.
 
 		for _, ipAddr := range ipAddrs {
-			if !proxy.config.AllowBogons && common.IsBogon(ipAddr.IP) {
-				return addrs, false, errors.TraceNew("IP is bogon")
+			if proxy.isDisallowedIP(ipAddr.IP) {
+				return addrs, false, errors.TraceNew("IP is bogon or proxy address")
 			}
 		}
 
@@ -2521,6 +2552,13 @@ func makeBindToDeviceControl(interfaceName string) func(string, string, syscall.
 
 // redactingProxyEventReceiver is a ProxyEventReceiver which redacts IP addresses from
 // log messages and ConnectionStats.Failure errors.
+//
+// redactingProxyEventReceiver also limits the size of log messages and of
+// ConnectionStats values which are, or may include, client-supplied light
+// header values. The light header is limited only by its 64K wire size, so
+// without this limit an individual client could produce oversized logs.
+// Values are not otherwise sanitized; receivers which write line-oriented
+// logs must escape these values.
 type redactingProxyEventReceiver struct {
 	ProxyEventReceiver
 }
@@ -2532,22 +2570,36 @@ func newRedactingProxyEventReceiver(
 }
 
 func (r *redactingProxyEventReceiver) Connection(stats *ConnectionStats) {
-	stats.Failure = common.RedactIPAddressesString(stats.Failure)
+	stats.SponsorID = limitLogString(stats.SponsorID)
+	stats.ClientBuildRev = limitLogString(stats.ClientBuildRev)
+	stats.DeviceRegion = limitLogString(stats.DeviceRegion)
+	stats.SessionID = limitLogString(stats.SessionID)
+	stats.DestinationAddress = limitLogString(stats.DestinationAddress)
+	stats.SNI = limitLogString(stats.SNI)
+	stats.Failure = redactAndLimitLogString(stats.Failure)
 	r.ProxyEventReceiver.Connection(stats)
 }
 
 func (r *redactingProxyEventReceiver) DebugLog(proxyID string, message string) {
-	r.ProxyEventReceiver.DebugLog(proxyID, common.RedactIPAddressesString(message))
+	r.ProxyEventReceiver.DebugLog(proxyID, redactAndLimitLogString(message))
 }
 
 func (r *redactingProxyEventReceiver) InfoLog(proxyID string, message string) {
-	r.ProxyEventReceiver.InfoLog(proxyID, common.RedactIPAddressesString(message))
+	r.ProxyEventReceiver.InfoLog(proxyID, redactAndLimitLogString(message))
 }
 
 func (r *redactingProxyEventReceiver) WarningLog(proxyID string, message string) {
-	r.ProxyEventReceiver.WarningLog(proxyID, common.RedactIPAddressesString(message))
+	r.ProxyEventReceiver.WarningLog(proxyID, redactAndLimitLogString(message))
 }
 
 func (r *redactingProxyEventReceiver) ErrorLog(proxyID string, message string) {
-	r.ProxyEventReceiver.ErrorLog(proxyID, common.RedactIPAddressesString(message))
+	r.ProxyEventReceiver.ErrorLog(proxyID, redactAndLimitLogString(message))
+}
+
+func limitLogString(value string) string {
+	return common.TruncateUTF8String(value, maxLogStringLength)
+}
+
+func redactAndLimitLogString(value string) string {
+	return limitLogString(common.RedactIPAddressesString(value))
 }

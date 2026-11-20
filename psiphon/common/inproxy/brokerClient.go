@@ -57,8 +57,10 @@ const (
 // properties for replay.
 //
 // When the BrokerDialCoordinator BrokerClientRoundTripperFailed call back is
-// invoked, the RoundTripper provider should clear any replay state and also
-// create a new RoundTripper to be returned from BrokerClientRoundTripper.
+// invoked, the provider may clear replay for the RoundTripper's dial
+// parameters and stop sharing this BrokerClient, without closing or
+// replacing the RoundTripper while requests are in flight; see
+// BrokerDialCoordinator.BrokerClientRoundTripperFailed.
 //
 // BrokerClient does not have a Close operation. The user should close the
 // provided RoundTripper as appropriate.
@@ -75,10 +77,9 @@ type BrokerClient struct {
 // BrokerDialCoordinator.
 func NewBrokerClient(coordinator BrokerDialCoordinator) (*BrokerClient, error) {
 
-	// A client is expected to use an ephemeral key, and can return a
-	// zero-value private key. Each proxy should use a persistent key, as the
-	// corresponding public key is the proxy ID, which is used to credit the
-	// proxy for its service.
+	// A zero-value private key requests an ephemeral key for this broker
+	// client. Proxies supply a stable key; see
+	// BrokerDialCoordinator.BrokerClientPrivateKey.
 
 	privateKey := coordinator.BrokerClientPrivateKey()
 	if privateKey.IsZero() {
@@ -116,7 +117,7 @@ func (b *BrokerClient) ProxyAnnounce(
 		b.coordinator.AnnounceRequestTimeout(),
 		proxyAnnounceRequestTimeout)
 
-	responsePayload, _, err := b.roundTrip(
+	responsePayload, roundTripper, err := b.roundTrip(
 		ctx, requestDelay, requestTimeout, requestPayload)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -125,6 +126,10 @@ func (b *BrokerClient) ProxyAnnounce(
 	response, err := UnmarshalProxyAnnounceResponse(responsePayload)
 	if err != nil {
 		return nil, errors.Trace(err)
+	}
+
+	if !response.MustUpgrade {
+		b.coordinator.BrokerClientResponseReceived(roundTripper, false)
 	}
 
 	return response, nil
@@ -163,13 +168,10 @@ func (b *BrokerClient) ClientOffer(
 		return nil, errors.Trace(err)
 	}
 
-	if response.NoMatch {
-
-		// Signal the no match event, which may trigger broker rotation. As
-		// with BrokerClientRoundTripperSucceeded/Failed callbacks, the
-		// RoundTripper used is passed in to ensure the correct broker client
-		// is reset.
-		b.coordinator.BrokerClientNoMatch(roundTripper)
+	if !response.MustUpgrade {
+		retryableNoMatch := response.NoMatch && !response.Limited
+		b.coordinator.BrokerClientResponseReceived(
+			roundTripper, retryableNoMatch)
 	}
 
 	return response, nil
@@ -218,7 +220,7 @@ func (b *BrokerClient) ClientRelayedPacket(
 		b.coordinator.RelayedPacketRequestTimeout(),
 		clientRelayedPacketRequestTimeout)
 
-	responsePayload, _, err := b.roundTrip(
+	responsePayload, roundTripper, err := b.roundTrip(
 		ctx, 0, requestTimeout, requestPayload)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -228,6 +230,7 @@ func (b *BrokerClient) ClientRelayedPacket(
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	b.coordinator.BrokerClientResponseReceived(roundTripper, false)
 
 	return response, nil
 }
@@ -246,7 +249,7 @@ func (b *BrokerClient) ClientDSL(
 		b.coordinator.DSLRequestTimeout(),
 		clientDSLRequestTimeout)
 
-	responsePayload, _, err := b.roundTrip(
+	responsePayload, roundTripper, err := b.roundTrip(
 		ctx, 0, requestTimeout, requestPayload)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -256,6 +259,7 @@ func (b *BrokerClient) ClientDSL(
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	b.coordinator.BrokerClientResponseReceived(roundTripper, false)
 
 	return response, nil
 }
@@ -333,14 +337,11 @@ func (b *BrokerClient) roundTrip(
 		failed := std_errors.As(err, &failedError)
 
 		if failed {
-			// The BrokerDialCoordinator provider should close the existing
-			// BrokerClientRoundTripper and create a new RoundTripper to return
-			// in the next BrokerClientRoundTripper call.
-			//
 			// The session will be closed, if necessary, by InitiatorSessions.
-			// It's possible that the session remains valid and only the
-			// RoundTripper transport layer needs to be reset.
-			b.coordinator.BrokerClientRoundTripperFailed(roundTripper)
+			// An established session stays valid for callers still using
+			// this BrokerClient, but is not carried over: a broker client
+			// acquired after this failure performs its own Noise handshake.
+			b.coordinator.BrokerClientRoundTripperFailed(roundTripper, err)
 		}
 
 		return nil, nil, errors.Trace(err)
