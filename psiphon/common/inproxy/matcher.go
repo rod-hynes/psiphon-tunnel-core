@@ -28,8 +28,9 @@ import (
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
-	lrucache "github.com/cognusion/go-cache-lru"
+	"golang.org/x/time/rate"
 )
 
 // TTLs should be aligned with STUN hole punch lifetimes.
@@ -90,7 +91,7 @@ type Matcher struct {
 	announcementQueueMutex          sync.Mutex
 	announcementQueue               *announcementMultiQueue
 	announcementQueueEntryCountByIP map[string]int
-	announcementQueueRateLimiters   *lrucache.Cache
+	announcementQueueRateLimiters   *lrucache.LRUCache[string, *rate.Limiter]
 	announcementLimitEntryCount     int
 	announcementRateLimitQuantity   int
 	announcementRateLimitInterval   time.Duration
@@ -104,7 +105,7 @@ type Matcher struct {
 	offerQueueMutex          sync.Mutex
 	offerQueue               *list.List
 	offerQueueEntryCountByIP map[string]int
-	offerQueueRateLimiters   *lrucache.Cache
+	offerQueueRateLimiters   *lrucache.LRUCache[string, *rate.Limiter]
 	offerLimitEntryCount     int
 	offerRateLimitQuantity   int
 	offerRateLimitInterval   time.Duration
@@ -114,7 +115,7 @@ type Matcher struct {
 
 	matchSignal chan struct{}
 
-	pendingAnswers *lrucache.Cache
+	pendingAnswers *lrucache.LRUCache[string, *pendingAnswer]
 
 	metricsMutex sync.Mutex
 	metrics      MatcherMetrics
@@ -379,17 +380,17 @@ func NewMatcher(config *MatcherConfig) *Matcher {
 
 		announcementQueue:               newAnnouncementMultiQueue(),
 		announcementQueueEntryCountByIP: make(map[string]int),
-		announcementQueueRateLimiters: lrucache.NewWithLRU(
-			0,
-			time.Duration(brokerRateLimiterReapHistoryFrequencySeconds)*time.Second,
-			brokerRateLimiterMaxCacheEntries),
+		announcementQueueRateLimiters: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *rate.Limiter]{
+			DefaultTTL: 0,
+			MaxEntries: brokerRateLimiterMaxCacheEntries,
+		}),
 
 		offerQueue:               list.New(),
 		offerQueueEntryCountByIP: make(map[string]int),
-		offerQueueRateLimiters: lrucache.NewWithLRU(
-			0,
-			time.Duration(brokerRateLimiterReapHistoryFrequencySeconds)*time.Second,
-			brokerRateLimiterMaxCacheEntries),
+		offerQueueRateLimiters: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *rate.Limiter]{
+			DefaultTTL: 0,
+			MaxEntries: brokerRateLimiterMaxCacheEntries,
+		}),
 
 		matchSignal: make(chan struct{}, 1),
 
@@ -397,10 +398,10 @@ func NewMatcher(config *MatcherConfig) *Matcher {
 		// that is expected to be ignored when each entry's TTL is set to the
 		// Offer ctx timeout.
 
-		pendingAnswers: lrucache.NewWithLRU(
-			matcherPendingAnswersTTL,
-			1*time.Minute,
-			matcherPendingAnswersMaxSize),
+		pendingAnswers: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *pendingAnswer]{
+			DefaultTTL: matcherPendingAnswersTTL,
+			MaxEntries: matcherPendingAnswersMaxSize,
+		}),
 	}
 
 	m.SetLimits(
@@ -724,7 +725,7 @@ func (m *Matcher) AnnouncementHasPersonalCompartmentIDs(
 		return false, errors.Trace(errNoPendingAnswer)
 	}
 
-	pendingAnswer := pendingAnswerValue.(*pendingAnswer)
+	pendingAnswer := pendingAnswerValue
 	offerEntry := pendingAnswer.offerEntry
 	offerEntry.answerMutex.Lock()
 
@@ -760,7 +761,7 @@ func (m *Matcher) Answer(
 		return errors.Trace(errNoPendingAnswer)
 	}
 
-	pendingAnswer := pendingAnswerValue.(*pendingAnswer)
+	pendingAnswer := pendingAnswerValue
 	if !m.completeOffer(pendingAnswer.offerEntry, &answerInfo{
 		announcement: pendingAnswer.announcement,
 		answer:       proxyAnswer,
@@ -786,7 +787,7 @@ func (m *Matcher) AnswerError(proxyID ID, connectionID ID) {
 		return
 	}
 
-	m.completeOffer(pendingAnswerValue.(*pendingAnswer).offerEntry, nil)
+	m.completeOffer(pendingAnswerValue.offerEntry, nil)
 }
 
 // matchWorker is the matching worker goroutine. It idles until signaled that
@@ -941,7 +942,7 @@ func (m *Matcher) matchAllOffers() {
 			OfferQueueSize:         m.offerQueue.Len(),
 			AnnouncementMatchIndex: announcementMatchIndex,
 			AnnouncementQueueSize:  m.announcementQueue.getLen(),
-			PendingAnswersSize:     m.pendingAnswers.ItemCount(),
+			PendingAnswersSize:     m.pendingAnswers.EstimatedSize(),
 			MatchDuration:          time.Since(startTime),
 			MatchHasQuality:        matchHasQuality,
 		}
@@ -1303,7 +1304,7 @@ func (m *Matcher) applyIPLimits(
 	// Assumes m.announcementQueueMutex or m.offerQueueMutex is locked.
 
 	var entryCountByIP map[string]int
-	var queueRateLimiters *lrucache.Cache
+	var queueRateLimiters *lrucache.LRUCache[string, *rate.Limiter]
 	var limitEntryCount int
 	var quantity int
 	var interval time.Duration

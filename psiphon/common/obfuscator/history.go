@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
-	lrucache "github.com/cognusion/go-cache-lru"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 )
 
 const (
@@ -46,9 +46,8 @@ const (
 // duration -- long enough to cover meek retries without retaining client
 // IPs in memory long past a client connection lifetime.
 type SeedHistory struct {
-	seedTTL        time.Duration
-	seedToTime     *lrucache.Cache
-	seedToClientIP *lrucache.Cache
+	seedToTime     *lrucache.LRUCache[string, time.Time]
+	seedToClientIP *lrucache.LRUCache[string, string]
 }
 
 type SeedHistoryConfig struct {
@@ -67,11 +66,8 @@ func NewSeedHistory(config *SeedHistoryConfig) *SeedHistory {
 	// smaller memory footprint, we wish to avoid the associated risk of false
 	// positives.
 	//
-	// Limitation: As go-cache-lru does not currently support iterating over all
-	// items (without making a full copy of the entire cache), the client IP with
-	// shorter TTL is stored in a second, smaller cache instead of the same cache
-	// with a a pruner. This incurs some additional overhead, as the seed key is
-	// stored twice, once in each cache.
+	// Client IPs use a separate, smaller cache with a shorter TTL so they can
+	// be discarded while retaining the seeds for replay detection.
 
 	useConfig := SeedHistoryConfig{
 		SeedTTL:            HISTORY_SEED_TTL,
@@ -95,18 +91,19 @@ func NewSeedHistory(config *SeedHistoryConfig) *SeedHistory {
 		}
 	}
 
+	// Seeds are written once and read only when a duplicate arrives, so
+	// when a cache is full, the oldest seeds are evicted first.
+
 	return &SeedHistory{
-		seedTTL: useConfig.SeedTTL,
+		seedToTime: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, time.Time]{
+			DefaultTTL: useConfig.SeedTTL,
+			MaxEntries: useConfig.SeedMaxEntries,
+		}),
 
-		seedToTime: lrucache.NewWithLRU(
-			useConfig.SeedTTL,
-			1*time.Minute,
-			useConfig.SeedMaxEntries),
-
-		seedToClientIP: lrucache.NewWithLRU(
-			useConfig.ClientIPTTL,
-			30*time.Second,
-			useConfig.ClientIPMaxEntries),
+		seedToClientIP: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, string]{
+			DefaultTTL: useConfig.ClientIPTTL,
+			MaxEntries: useConfig.ClientIPMaxEntries,
+		}),
 	}
 }
 
@@ -139,35 +136,25 @@ func (h *SeedHistory) AddNewWithTTL(
 
 	key := string(seed)
 
-	// Limitation: go-cache-lru does not currently support atomically setting if
-	// a key is unset and otherwise _returning the corresponding value_. There is
-	// an unlikely possibility that this Add and the following Get don't see the
-	// same existing key/value state.
-
 	now := time.Now()
 
-	if h.seedToTime.Add(key, now, TTL) == nil {
+	previousTime, added := h.seedToTime.Add(key, now, TTL)
+	if added {
 		// Seed was not already in cache
 		// TODO: if TTL < SeedHistory.ClientIPTTL, use the shorter TTL here
 		h.seedToClientIP.Set(key, clientIP, lrucache.DefaultExpiration)
 		return true, nil
 	}
 
-	previousTime, ok := h.seedToTime.Get(key)
-	if !ok {
-		// Inconsistent Add/Get state: assume cache item just expired.
-		previousTime = now.Add(-h.seedTTL)
-	}
-
 	logFields := common.LogFields{
 		"duplicate_seed":            hex.EncodeToString(seed),
 		"duplicate_seed_type":       seedType,
-		"duplicate_elapsed_time_ms": int64(time.Since(previousTime.(time.Time)) / time.Millisecond),
+		"duplicate_elapsed_time_ms": int64(time.Since(previousTime) / time.Millisecond),
 	}
 
 	previousClientIP, ok := h.seedToClientIP.Get(key)
 	if ok {
-		if clientIP == previousClientIP.(string) {
+		if clientIP == previousClientIP {
 			logFields["duplicate_client_ip"] = "equal"
 			return !strictMode, &logFields
 		} else {

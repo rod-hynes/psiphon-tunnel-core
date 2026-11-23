@@ -30,7 +30,6 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.6.0
 	github.com/cespare/xxhash v1.1.0
 	github.com/cheekybits/genny v0.0.0-20170328200008-9127e812e1e9
-	github.com/cognusion/go-cache-lru v0.0.0-20170419142635-f73e2280ecea
 	github.com/dgraph-io/badger v1.5.4-0.20180815194500-3a87f6d9c273
 	github.com/elazarl/goproxy v0.0.0-20200809112317-0581fc3aee2d
 	github.com/elazarl/goproxy/ext v0.0.0-20200809112317-0581fc3aee2d

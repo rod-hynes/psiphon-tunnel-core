@@ -103,6 +103,7 @@ jobs:
           cd ${{ github.workspace }}/go/src/github.com/Psiphon-Labs/psiphon-tunnel-core
           go test -v -race ./psiphon/common
           go test -v -race ./psiphon/common/accesscontrol
+          go test -v -race ./psiphon/common/cache
           go test -v -race ./psiphon/common/crypto/ssh
           go test -v -race ./psiphon/common/deviceregion
           go test -v -race ./psiphon/common/dsl
@@ -145,6 +146,7 @@ jobs:
           cd ${{ github.workspace }}/go/src/github.com/Psiphon-Labs/psiphon-tunnel-core
           go test -v -covermode=count -coverprofile=common.coverprofile ./psiphon/common
           go test -v -covermode=count -coverprofile=accesscontrol.coverprofile ./psiphon/common/accesscontrol
+          go test -v -covermode=count -coverprofile=cache.coverprofile ./psiphon/common/cache
           go test -v -covermode=count -coverprofile=ssh.coverprofile ./psiphon/common/crypto/ssh
           go test -v -covermode=count -coverprofile=deviceregion.coverprofile ./psiphon/common/deviceregion
           go test -v -covermode=count -coverprofile=fragmentor.coverprofile ./psiphon/common/fragmentor

@@ -24,9 +24,9 @@ import (
 	"testing"
 	"time"
 
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/internal/testutils"
-	lrucache "github.com/cognusion/go-cache-lru"
 )
 
 func TestProxyQualityState(t *testing.T) {
@@ -43,6 +43,91 @@ func TestProxyQualityReporter(t *testing.T) {
 	}
 }
 
+func TestProxyQualityDelayedFailure(t *testing.T) {
+	for _, flush := range []bool{false, true} {
+		t.Run(fmt.Sprintf("flush=%t", flush), func(t *testing.T) {
+			q := NewProxyQuality()
+			q.SetParameters(time.Hour, time.Millisecond, 1)
+			ready := make(chan struct{})
+			release := make(chan struct{})
+			done := make(chan struct{})
+			q.pendingFailedMatches = lrucache.NewLRUCache(
+				lrucache.LRUCacheConfig[string, pendingFailedMatch]{
+					MaxEntries: proxyQualityMaxPendingFailedMatches,
+					OnEvicted: func(key string, pending pendingFailedMatch, reason lrucache.EvictionReason) {
+						close(ready)
+						<-release
+						q.addFailedMatch(key, pending, reason)
+						close(done)
+					},
+				})
+			defer q.pendingFailedMatches.Flush()
+			defer close(release)
+
+			proxyID, err := MakeID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxyASN := "65537"
+			proxyKey := MakeProxyQualityKey(proxyID, proxyASN)
+			counts := ProxyQualityASNCounts{"65538": 1}
+			q.AddQuality(proxyKey, counts)
+			q.Matched(proxyID, proxyASN)
+			select {
+			case <-ready:
+			case <-time.After(5 * time.Second):
+				t.Fatal("expiration callback did not start")
+			}
+
+			if flush {
+				q.Flush()
+			}
+			q.AddQuality(proxyKey, counts)
+			q.SetParameters(time.Hour, time.Hour, 1)
+			q.Matched(proxyID, proxyASN)
+			// Release the callback without closing the channel until cleanup.
+			release <- struct{}{}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("expiration callback did not finish")
+			}
+			if !q.HasQuality(proxyID, proxyASN, "") {
+				t.Fatal("old failure removed newer quality")
+			}
+			if _, ok := q.pendingFailedMatches.Get(string(proxyKey[:])); !ok {
+				t.Fatal("old failure removed newer pending match")
+			}
+		})
+	}
+}
+
+func TestProxyQualityMatchPreservesDeadline(t *testing.T) {
+	q := NewProxyQuality()
+	proxyID, err := MakeID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyASN := "65537"
+	proxyKey := MakeProxyQualityKey(proxyID, proxyASN)
+	q.AddQuality(proxyKey, ProxyQualityASNCounts{"65538": 1})
+	q.Matched(proxyID, proxyASN)
+	_, original, ok := q.pendingFailedMatches.GetWithExpiration(string(proxyKey[:]))
+	if !ok || original.IsZero() {
+		t.Fatal("missing pending match deadline")
+	}
+	q.SetParameters(time.Hour, time.Hour, 1)
+	q.Matched(proxyID, proxyASN)
+	_, expiration, ok := q.pendingFailedMatches.GetWithExpiration(string(proxyKey[:]))
+	if !ok || !expiration.Equal(original) {
+		t.Fatal("matching again changed the pending deadline")
+	}
+	q.AddQuality(proxyKey, ProxyQualityASNCounts{"65538": 1})
+	if _, ok := q.pendingFailedMatches.Get(string(proxyKey[:])); ok {
+		t.Fatal("quality did not cancel the pending failure")
+	}
+}
+
 func runTestProxyQualityState() error {
 
 	qualityTTL := 100 * time.Millisecond
@@ -51,10 +136,15 @@ func runTestProxyQualityState() error {
 
 	q := NewProxyQuality()
 
-	// Substitute a cache with a much shorter janitor interval, to ensure
-	// evictions happen within the artificially short test intervals.
-	q.pendingFailedMatches = lrucache.NewWithLRU(0, 1*time.Millisecond, proxyQualityMaxPendingFailedMatches)
-	q.pendingFailedMatches.OnEvicted(q.addFailedMatch)
+	failedMatch := make(chan struct{}, 1)
+	q.pendingFailedMatches = lrucache.NewLRUCache(
+		lrucache.LRUCacheConfig[string, pendingFailedMatch]{
+			MaxEntries: proxyQualityMaxPendingFailedMatches,
+			OnEvicted: func(key string, pending pendingFailedMatch, reason lrucache.EvictionReason) {
+				q.addFailedMatch(key, pending, reason)
+				failedMatch <- struct{}{}
+			},
+		})
 
 	q.SetParameters(
 		qualityTTL, pendingFailedMatchDeadline, failedMatchThreshold)
@@ -120,7 +210,11 @@ func runTestProxyQualityState() error {
 
 		q.Matched(proxyID, testProxyASN)
 
-		time.Sleep(pendingFailedMatchDeadline + 10*time.Millisecond)
+		select {
+		case <-failedMatch:
+		case <-time.After(5 * time.Second):
+			return errors.TraceNew("failed match deadline was not processed")
+		}
 
 		expectQuality := i < failedMatchThreshold-1
 

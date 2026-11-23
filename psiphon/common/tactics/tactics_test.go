@@ -354,9 +354,9 @@ func TestTactics(t *testing.T) {
 
 	checkServerCache := func(cacheEntryFilterMatches ...[]bool) {
 
-		cacheItems := server.cachedTacticsData.Items()
-		if len(cacheItems) != len(cacheEntryFilterMatches) {
-			t.Fatalf("Unexpected cachedTacticsData size: %v", len(cacheItems))
+		cacheSize := server.cachedTacticsData.EstimatedSize()
+		if cacheSize != len(cacheEntryFilterMatches) {
+			t.Fatalf("Unexpected cachedTacticsData size: %v", cacheSize)
 		}
 
 		for _, filterMatches := range cacheEntryFilterMatches {
@@ -414,9 +414,9 @@ func TestTactics(t *testing.T) {
 			expectedFilterMatches := []bool{
 				true, testCase.expectedMatch, false, false, false, false,
 			}
-			cacheItems := server.cachedTacticsData.Items()
-			if len(cacheItems) != 1 {
-				t.Fatalf("unexpected cachedTacticsData size: %d", len(cacheItems))
+			cacheSize := server.cachedTacticsData.EstimatedSize()
+			if cacheSize != 1 {
+				t.Fatalf("unexpected cachedTacticsData size: %d", cacheSize)
 			}
 			cacheKey := getCacheKey(false, true, expectedFilterMatches)
 			if _, ok := server.cachedTacticsData.Get(cacheKey); !ok {

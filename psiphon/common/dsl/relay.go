@@ -33,9 +33,9 @@ import (
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -103,10 +103,10 @@ type Relay struct {
 	httpClient              *http.Client
 	requestTimeout          time.Duration
 	requestRetryCount       int
-	serverEntryCache        *lrucache.Cache
+	serverEntryCache        *lrucache.LRUCache[string, *SourcedServerEntry]
 	serverEntryCacheTTL     time.Duration
 	serverEntryCacheMaxSize int
-	oslFileSpecCache        *lrucache.Cache
+	oslFileSpecCache        *lrucache.LRUCache[string, OSLFileSpec]
 	oslFileSpecCacheTTL     time.Duration
 	oslFileSpecCacheMaxSize int
 
@@ -355,10 +355,10 @@ func (r *Relay) SetCacheParameters(
 
 		if r.serverEntryCacheTTL > 0 {
 
-			r.serverEntryCache = lrucache.NewWithLRU(
-				r.serverEntryCacheTTL,
-				1*time.Minute,
-				r.serverEntryCacheMaxSize)
+			r.serverEntryCache = lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *SourcedServerEntry]{
+				DefaultTTL: r.serverEntryCacheTTL,
+				MaxEntries: r.serverEntryCacheMaxSize,
+			})
 
 		} else {
 
@@ -379,10 +379,10 @@ func (r *Relay) SetCacheParameters(
 
 		if r.oslFileSpecCacheTTL > 0 {
 
-			r.oslFileSpecCache = lrucache.NewWithLRU(
-				r.oslFileSpecCacheTTL,
-				1*time.Minute,
-				r.oslFileSpecCacheMaxSize)
+			r.oslFileSpecCache = lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, OSLFileSpec]{
+				DefaultTTL: r.oslFileSpecCacheTTL,
+				MaxEntries: r.oslFileSpecCacheMaxSize,
+			})
 
 		} else {
 
@@ -757,7 +757,7 @@ func (r *Relay) getCachedGetServerEntriesResponse(
 
 		// The cached entry's TTL is not extended on a hit.
 
-		response.SourcedServerEntries[i] = cacheEntry.(*SourcedServerEntry)
+		response.SourcedServerEntries[i] = cacheEntry
 	}
 
 	cborResponse, err := protocol.CBOREncoding.Marshal(&response)
@@ -882,7 +882,7 @@ func (r *Relay) getCachedGetOSLFileSpecsResponse(
 			return nil, nil
 		}
 
-		response.OSLFileSpecs[i] = cacheEntry.(OSLFileSpec)
+		response.OSLFileSpecs[i] = cacheEntry
 	}
 
 	cborResponse, err := protocol.CBOREncoding.Marshal(&response)

@@ -163,12 +163,12 @@ import (
 	"time"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/obfuscator"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/fxamacker/cbor/v2"
 	"golang.org/x/crypto/nacl/box"
 )
@@ -258,7 +258,7 @@ type Server struct {
 	logFieldFormatter     common.APIParameterLogFieldFormatter
 	apiParameterValidator common.APIParameterValidator
 
-	cachedTacticsData *lrucache.Cache
+	cachedTacticsData *lrucache.LRUCache[string, *tacticsData]
 	filterMatches     *sync.Pool
 }
 
@@ -472,8 +472,10 @@ func NewServer(
 		logger:                logger,
 		logFieldFormatter:     logFieldFormatter,
 		apiParameterValidator: apiParameterValidator,
-		cachedTacticsData: lrucache.NewWithLRU(
-			lrucache.NoExpiration, 1*time.Minute, PAYLOAD_CACHE_SIZE),
+		cachedTacticsData: lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, *tacticsData]{
+			DefaultTTL: lrucache.NoExpiration,
+			MaxEntries: PAYLOAD_CACHE_SIZE,
+		}),
 	}
 
 	server.ReloadableFile = common.NewReloadableFile(
@@ -1085,7 +1087,7 @@ func (server *Server) getTactics(
 
 	cacheValue, ok := server.cachedTacticsData.Get(cacheKey)
 	if ok {
-		return cacheValue.(*tacticsData), nil
+		return cacheValue, nil
 	}
 
 	tactics := server.DefaultTactics.clone(includeServerSideOnly)

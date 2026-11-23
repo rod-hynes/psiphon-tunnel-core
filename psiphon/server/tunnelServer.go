@@ -41,6 +41,7 @@ import (
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/accesscontrol"
+	lrucache "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/cache"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/crypto/ssh"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
@@ -57,7 +58,6 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tactics"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/transforms"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
-	lrucache "github.com/cognusion/go-cache-lru"
 	"github.com/marusama/semaphore"
 	cache "github.com/patrickmn/go-cache"
 )
@@ -2163,7 +2163,7 @@ type sshClient struct {
 	destinationBytesMetrics              *common.StringValueLookup[*protocolDestinationBytesMetrics]
 	inproxyProxyQualityTracker           *inproxyProxyQualityTracker
 	dnsResolver                          *net.Resolver
-	dnsCache                             *lrucache.Cache
+	dnsCache                             *lrucache.LRUCache[string, []net.IPAddr]
 	requestCheckServerEntryTags          int
 	checkedServerEntryTags               int
 	invalidServerEntryTags               int
@@ -5608,7 +5608,7 @@ func (sshClient *sshClient) handleTCPChannel(
 		if dnsCache != nil {
 			cachedIPs, ok := dnsCache.Get(hostToConnect)
 			if ok {
-				IPs = cachedIPs.([]net.IPAddr)
+				IPs = cachedIPs
 			}
 		}
 
@@ -5927,7 +5927,7 @@ func (sshClient *sshClient) handleTCPChannel(
 	}
 }
 
-func (sshClient *sshClient) getDNSResolver() (*net.Resolver, *lrucache.Cache) {
+func (sshClient *sshClient) getDNSResolver() (*net.Resolver, *lrucache.LRUCache[string, []net.IPAddr]) {
 
 	// Initialize the DNS resolver and cache used by handleTCPChannel in cases
 	// where the client sends unresolved domains through to psiphond. The
@@ -6001,7 +6001,10 @@ func (sshClient *sshClient) getDNSResolver() (*net.Resolver, *lrucache.Cache) {
 		return sshClient.dnsResolver, nil
 	}
 
-	sshClient.dnsCache = lrucache.NewWithLRU(TTL, 1*time.Minute, maxSize)
+	sshClient.dnsCache = lrucache.NewLRUCache(lrucache.LRUCacheConfig[string, []net.IPAddr]{
+		DefaultTTL: TTL,
+		MaxEntries: maxSize,
+	})
 
 	return sshClient.dnsResolver, sshClient.dnsCache
 }
